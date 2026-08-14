@@ -8,16 +8,21 @@
 #
 # One-time setup: `codersync --setup <ssh-target> [remote-dir]` records
 # which remote box to use.
-#   <ssh-target>  anything you'd pass to `ssh` directly -- a plain
-#                 hostname, `user@host`, or an alias from your own
-#                 ~/.ssh/config. This also becomes the label used to
-#                 prefix session names (see below) -- any `@`, `:`, `.`,
-#                 or `/` in it are replaced with `-`, since tmux's own
-#                 -t target syntax uses `.` (and `:`) as separators and
+#   <ssh-target>  a plain hostname, `user@host`, or an alias from your
+#                 own ~/.ssh/config -- restricted to letters, digits, and
+#                 . _ - @ (narrower than everything `ssh` itself accepts;
+#                 see validate_ssh_target() below for why). Forms like
+#                 `host:2222` or a bracketed IPv6 address aren't accepted
+#                 directly -- put those in a ~/.ssh/config Host alias and
+#                 pass the alias here instead. This also becomes the
+#                 label used to prefix session names (see below) -- any
+#                 `@`, `.`, or `/` in it are replaced with `-`, since
+#                 tmux's own -t target syntax uses `.` as a separator and
 #                 a literal one in a session name breaks lookups.
 #   [remote-dir]  where claude/codex start (default: ~/repos)
-# Setup checks the box is reachable over SSH and has tmux installed
-# before saving anything. Config lives at ~/.config/codersync/config.
+# Setup checks the box is reachable over SSH, has tmux, bash, and base64
+# installed, and that [remote-dir] actually exists there -- before
+# saving anything. Config lives at ~/.config/codersync/config.
 #
 # codersync has no dependency on any specific remote/cloud-dev provider
 # -- it works with any box reachable over plain SSH that has tmux. As an
@@ -26,8 +31,10 @@
 # locally, setup will offer to run `coder config-ssh` for you first, in
 # case that alias doesn't exist yet (you'll be asked to confirm).
 #
-# Normal usage: `codersync <session-name>` opens a NEW iTerm2 tab and does
-# all its work there, leaving whatever tab you ran it from untouched. The
+# Normal usage: `codersync <session-name>` opens a new tab and does all
+# its work there, leaving whatever tab you ran it from untouched -- via
+# iTerm2 when it's installed, or by printing the attach command for you
+# to run yourself otherwise (see the --split-mode note below). The
 # configured ssh-target (sanitized as above) is folded into the session
 # name by default (e.g. `codersync foo` on target `devbox.example.com`
 # becomes session `devbox-example-com-foo`), so names/tabs/tmux sessions
@@ -38,8 +45,10 @@
 # server-side (`tmux split-window`) -- both left as plain idle shells at
 # creation, only started AFTER a real client attaches (see below). The
 # local side then only needs to open a tab and run a single attach
-# command -- no local split at all -- so this works from any terminal
-# with plain tmux, no iTerm2 dependency.
+# command -- no local SPLIT at all. It still uses iTerm2 to open that tab
+# automatically when iTerm2 is installed, but doesn't require it: without
+# iTerm2, this mode prints the attach command instead of failing, so it
+# works from any terminal you paste that command into.
 #
 # `--split-mode iterm` is the alternative: two separate tmux sessions
 # (`claude-<session-name>`, `codex-<session-name>`) instead of one,
@@ -110,9 +119,10 @@
 # a shell comment remotely). Always pass such remote commands as ONE
 # pre-quoted string argument instead.
 #
-# Requires: tmux on the remote box. iTerm2 is only required for
-# `--split-mode iterm`. `coder` CLI is only used opportunistically during
-# setup, if applicable -- see above.
+# Requires: tmux, bash, and base64 on the remote box (all checked by
+# --setup). iTerm2 is only required for `--split-mode iterm`. `coder`
+# CLI is only used opportunistically during setup, if applicable -- see
+# above.
 
 set -euo pipefail
 
@@ -132,12 +142,32 @@ NEXT_ID_FILE="$CONFIG_DIR/next_id"
 # is far more robust than trying to out-escape arbitrary input through
 # the several nested quoting layers these values pass through (that
 # approach has already produced multiple real bugs in this codebase).
+# A flat character-class check (any mix of the allowed characters, any
+# order) still let through values that are safe-charset but not a
+# plausible host: a leading `-` (which ssh/scp can interpret as an
+# OPTION rather than a hostname -- confirmed live, `ssh -- -oProxyCommand=...`
+# style values reach ssh unquoted further down), `@` or `...` alone, and
+# `user@@host` (two `@`s). This requires an optional `user@` part (itself
+# starting and ending with an alphanumeric) followed by a host part that
+# also starts and ends with an alphanumeric -- so a bare `-`, leading/
+# trailing `.`/`-`, and a doubled `@` are all rejected, while normal
+# hostnames, IPs, and user@host forms (including internal dots/dashes)
+# still pass.
 validate_ssh_target() {
-  [[ "$1" =~ ^[A-Za-z0-9@._-]+$ ]]
+  [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?@)?[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ ]]
 }
 
+# Rejects a LEADING dash specifically (dashes elsewhere are still fine,
+# e.g. "my-project-dir") -- without this, a value like "-", "-P", or
+# "--" passed the flat character check, then reached `cd ${remote_dir}`
+# unquoted in setup()'s existence check, where a leading dash is read
+# by `cd` itself as an OPTION (`-P`, `--`, or the special `cd -` form)
+# rather than a literal directory -- so the check could report success
+# without ever actually proving anything about a real path, undermining
+# the whole point of that check for exactly the malformed input it's
+# meant to catch.
 validate_remote_dir() {
-  [[ "$1" =~ ^[A-Za-z0-9_./~-]+$ ]]
+  [[ "$1" =~ ^[A-Za-z0-9_./~][A-Za-z0-9_./~-]*$ ]]
 }
 
 # Deliberately excludes `.` too, even though it might look path-safe,
@@ -145,8 +175,16 @@ validate_remote_dir() {
 # separator (see sanitize_label() above) -- a literal one breaks tmux
 # target resolution the same way regardless of whether it came from the
 # ssh-target or a user-supplied session name.
+#
+# Also rejects a LEADING dash specifically (dashes elsewhere are still
+# fine, e.g. "my-feature") -- without this, `codersync --typo` or
+# `codersync --safe-mode` (a real flag, just missing its session-name
+# argument) silently fell through to being treated as a literal session
+# name instead of an unrecognized/malformed invocation, since nothing
+# else in the dispatch distinguishes "meant as a flag" from "meant as a
+# name" besides this character check.
 validate_session_name() {
-  [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]]
+  [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]]
 }
 
 setup() {
@@ -187,18 +225,69 @@ setup() {
     exit 1
   fi
 
+  # remote_setup/remote_setup_tmux_mode/remote_kill_session all run
+  # `ssh ... -- bash -s <<EOF` to create/kill sessions -- checked here,
+  # not just tmux, since a box with tmux but no bash (unusual, but not
+  # impossible on a minimal image) would otherwise fail opaquely on the
+  # very first `codersync <name>` invocation instead of during setup.
+  echo "Checking bash is available on ${target}..."
+  if ! ssh "$target" -- command -v bash >/dev/null 2>&1; then
+    echo "bash isn't installed on ${target}. Install it there and re-run setup." >&2
+    exit 1
+  fi
+
+  # remote_setup/remote_setup_tmux_mode/remote_kill_session also pipe
+  # through `base64 -d` remotely (see b64()'s comment for why -- it's
+  # how a resolved --tools command or a session name survives the
+  # several nested shell-quoting layers between here and the remote
+  # pane) -- checked for the same reason as bash above: fail here, not
+  # opaquely on the first real invocation. Actually round-trips a value
+  # through encode+decode rather than just `command -v base64`: a
+  # binary NAMED base64 existing doesn't guarantee it supports the
+  # specific `-d` decode form this tool relies on (a non-GNU/minimal
+  # one could accept different flags, or none at all).
+  echo "Checking base64 is available on ${target}..."
+  if ! ssh "$target" -- 'test "$(printf codersync | base64 | base64 -d)" = codersync' 2>/dev/null; then
+    echo "base64 on ${target} doesn't support the 'base64 -d' decode form codersync needs (or isn't installed at all). Install a compatible base64 (e.g. GNU coreutils) and re-run setup." >&2
+    exit 1
+  fi
+
+  # `tmux new-session -c <bad-dir>` doesn't actually fail on a
+  # nonexistent/inaccessible directory -- confirmed live, it silently
+  # falls back to a default directory instead -- so a typo'd
+  # [remote-dir] (e.g. "~/repoz") would otherwise pass setup cleanly and
+  # only surface later as agents quietly starting in the wrong place,
+  # with no error anywhere. `cd` is the actual right test for "does
+  # this exist and is it accessible" -- unlike tmux, it fails properly.
+  # remote_dir is embedded UNQUOTED-locally into one pre-quoted string
+  # (see the ssh gotcha note near the top of this file) specifically so
+  # a literal `~` in it -- the default value -- survives to be expanded
+  # by the REMOTE shell against the remote user's home, not by this one.
+  # `cd --` (not bare `cd`): validate_remote_dir already rejects a
+  # leading dash, but `--` is cheap defense-in-depth regardless -- `cd`
+  # itself reads an unquoted leading-dash argument as an OPTION (`-P`,
+  # `--`, the special `cd -` form) rather than a literal path, which
+  # would make this check pass without proving anything about a real
+  # directory. `--` forces `cd` to treat what follows as positional no
+  # matter what; it doesn't affect the shell's own tilde-expansion of it.
+  echo "Checking ${remote_dir} exists on ${target}..."
+  if ! ssh "$target" -- "cd -- ${remote_dir}" 2>/dev/null; then
+    echo "${remote_dir} doesn't exist (or isn't accessible) on ${target}. Create it there, or pass a different [remote-dir], and re-run setup." >&2
+    exit 1
+  fi
+
   mkdir -p "$CONFIG_DIR"
-  # printf %q, not naive quoting: load_config() sources this file, and
-  # (a) bash tilde-expands an unquoted `~` in a VAR=~/path assignment
-  # even when single-quoted -- that silently turned REMOTE_DIR into a
-  # local, nonexistent path on the remote box, which fell back to $HOME
-  # there without ever erroring (confirmed live); %q escapes the `~`
-  # itself so it stays literal on source. (b) naive single-quoting
-  # breaks -- or with a crafted value, injects -- if the value contains
-  # its own single quote (e.g. a real path like /home/o'brien/repos);
-  # %q handles that correctly too. validate_ssh_target/validate_remote_dir
-  # above already reject quote characters, so this is defense in depth,
-  # not the only thing standing between untrusted input and this file.
+  # printf %q, not naive quoting: load_config() parses this file itself
+  # (see its own comment for why it no longer sources it), but %q is
+  # still the right way to write it for two reasons. (a) A REMOTE_DIR
+  # value starting with `~` needs to stay literal here so the REMOTE
+  # shell -- not this one -- is what expands it later; %q escapes the
+  # `~` for exactly that. (b) A naive quoting scheme breaks, or with a
+  # crafted value injects, if the value contains its own quote character
+  # (e.g. a real path like /home/o'brien/repos); %q handles that
+  # correctly too. validate_ssh_target/validate_remote_dir above already
+  # reject quote characters, so this is defense in depth, not the only
+  # thing standing between untrusted input and this file.
   {
     printf 'SSH_TARGET=%q\n' "$target"
     printf 'REMOTE_DIR=%q\n' "$remote_dir"
@@ -218,15 +307,54 @@ sanitize_label() {
   echo "${s//[@:.\/]/-}"
 }
 
+# Validates and canonicalizes a numeric session-ID string into its
+# base-10 form. Shared by every place a raw digit string needs to become
+# a real, arithmetic-safe ID -- next_session_id (the counter file),
+# parse_kill_spec (--kill's argument), parse_numbered_session (live tmux
+# names and registry entries), and find_or_assign_id (reused registry
+# IDs) -- so all of them reject/canonicalize the exact same way instead
+# of each reimplementing this with slightly different edge cases.
+# Capped at 15 digits: bash integers are signed 64-bit (~19 digits), and
+# no real ID is anywhere close to that many, so this keeps a
+# pathological value (a 21-digit live tmux name, a poisoned registry
+# entry, a corrupted counter file) out of `printf %d`/`(( ))` arithmetic
+# entirely rather than letting it crash or silently wrap negative there
+# (confirmed live: "08: invalid octal number" from printf, "Result too
+# large" from a 21-digit value, a 44-digit value wrapping to a large
+# negative number in arithmetic). A leading-zero numeral (e.g. "08") is
+# also otherwise treated by bash arithmetic as octal -- "08"/"09" are a
+# hard crash (8/9 aren't valid octal digits) and "010" silently means 8
+# in decimal -- so the explicit `10#` base prefix forces plain base-10
+# reading instead, canonicalizing away the leading zero too. 0 itself is
+# rejected: next_session_id never assigns it. Prints the canonical value
+# on stdout and returns 0 if valid; prints nothing and returns 1
+# otherwise.
+canonicalize_session_id() {
+  local raw="$1"
+  [[ "$raw" =~ ^[0-9]{1,15}$ ]] || return 1
+  local canon=$((10#$raw))
+  ((canon == 0)) && return 1
+  printf '%s' "$canon"
+}
+
 # Returns the next session ID and persists the increment to
 # ~/.config/codersync/next_id. Global (not per-target) so IDs stay
 # unique across boxes even if you switch --setup targets later -- with
 # per-target counters, --list-all/--kill would have to disambiguate
 # "ID 1 on box A" from "ID 1 on box B" instead of just "ID 1".
 next_session_id() {
-  local id
+  local id raw
   if [[ -f "$NEXT_ID_FILE" ]]; then
-    id="$(cat "$NEXT_ID_FILE")"
+    raw="$(cat "$NEXT_ID_FILE")"
+    # A non-numeric, negative, zero, leading-zero, or pathologically long
+    # value here (hand-edited, truncated by a crash mid-write, whatever)
+    # used to either crash outright or silently produce a wrong/negative
+    # ID -- see canonicalize_session_id's comment for the specifics.
+    # Resetting with a clear warning is safer than guessing at intent.
+    if ! id="$(canonicalize_session_id "$raw")"; then
+      echo "codersync: ${NEXT_ID_FILE} contained an invalid value ('${raw}') -- resetting the session-ID counter to 1." >&2
+      id=1
+    fi
   else
     id=1
   fi
@@ -237,15 +365,24 @@ next_session_id() {
 
 # Parses a live tmux session name like "claude-<id>-<rest>" into
 # PARSED_ID/PARSED_REST globals. `prefix` is "claude-", "codex-", or
-# "pair-". Sessions created before numbering existed have no numeric
-# leading segment -- PARSED_ID is left empty in that case (not "0" or
-# some other sentinel) so callers can cleanly test for its absence.
+# "pair-" (pass "" to parse a bare registry entry name, which has no
+# agent prefix). Sessions created before numbering existed have no
+# numeric leading segment -- PARSED_ID is left empty in that case (not
+# "0" or some other sentinel) so callers can cleanly test for its
+# absence. An ID-shaped-but-INVALID segment (fails
+# canonicalize_session_id -- too many digits, or literally "0"/"000")
+# is treated the same as "no ID" rather than crashing downstream: a live
+# session or registry entry with a broken ID segment used to reach
+# printf/arithmetic as-is and crash there instead (confirmed live:
+# "pair-08-host-foo" and a 21-digit ID). PARSED_ID is always the
+# canonical decimal form (no leading zeros) when present.
 parse_numbered_session() {
   local prefix="$1"
   local full="$2"
   local rest="${full#"$prefix"}"
-  if [[ "$rest" =~ ^([0-9]+)-(.*)$ ]]; then
-    PARSED_ID="${BASH_REMATCH[1]}"
+  local canon
+  if [[ "$rest" =~ ^([0-9]+)-(.*)$ ]] && canon="$(canonicalize_session_id "${BASH_REMATCH[1]}")"; then
+    PARSED_ID="$canon"
     PARSED_REST="${BASH_REMATCH[2]}"
   else
     PARSED_ID=""
@@ -280,17 +417,41 @@ parse_registry_line() {
 find_or_assign_id() {
   local target="$1" suffix="$2"
   touch "$REGISTRY"
-  local line
+  local line canon
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     parse_registry_line "$line"
     [[ "$ENTRY_TARGET" != "$target" ]] && continue
     if [[ "$ENTRY_NAME" =~ ^([0-9]+)-(.*)$ ]] && [[ "${BASH_REMATCH[2]}" == "$suffix" ]]; then
-      echo "${BASH_REMATCH[1]}"
-      return 0
+      # A poisoned/corrupted entry (e.g. "08-...", "0-...", or a
+      # pathologically long ID) is never reused -- next_session_id
+      # itself would reject that exact value, so blindly returning it
+      # here would let it right back out as a real session ID. Keep
+      # scanning in case another (valid) entry matches this suffix;
+      # otherwise fall through to minting a fresh one below.
+      if canon="$(canonicalize_session_id "${BASH_REMATCH[1]}")"; then
+        echo "$canon"
+        return 0
+      fi
     fi
   done < "$REGISTRY"
   next_session_id
+}
+
+# Strips one matching pair of surrounding single quotes, if present.
+# Before %q-quoting was introduced, setup() wrote config values wrapped
+# in a literal, hardcoded pair of single quotes (`SSH_TARGET='devbox.example.com'`)
+# regardless of content. The current format never wraps a value that
+# already passes validation, so stripping this unconditionally is safe
+# either way -- it's a no-op for anything written by the current
+# setup(), and lets a config from before this parser existed keep
+# working without forcing --setup again.
+strip_legacy_config_quotes() {
+  local v="$1"
+  if [[ "$v" == \'*\' && "${#v}" -ge 2 ]]; then
+    v="${v:1:${#v}-2}"
+  fi
+  printf '%s' "$v"
 }
 
 load_config() {
@@ -298,13 +459,63 @@ load_config() {
     echo "codersync isn't set up yet. Run: codersync --setup <ssh-target> [remote-dir]" >&2
     exit 1
   fi
-  # shellcheck disable=SC1090
-  source "$CONFIG_FILE"
-  if [[ -z "${SSH_TARGET:-}" ]]; then
+  # Deliberately NOT `source`d. setup() validates before writing, but the
+  # file on disk isn't necessarily what setup() wrote -- it could be
+  # hand-edited, or left over from a version of this script that wrote it
+  # without validation at all. `source` runs the file as a bash script,
+  # so ANY line in it executes immediately, before there's any value to
+  # even check -- confirmed live, a config containing a line like
+  # `touch /some/file` created that file even though the SSH_TARGET check
+  # right after correctly rejected the resulting (empty) value. Reading
+  # the file with plain `read`/regex instead never executes its content
+  # at all, so a malicious line just fails to match either expected key
+  # and gets rejected outright instead of running.
+  local raw_target="" raw_dir="" saw_target=0 saw_dir=0 line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    if [[ "$line" =~ ^SSH_TARGET=(.*)$ ]]; then
+      raw_target="${BASH_REMATCH[1]}"
+      saw_target=1
+    elif [[ "$line" =~ ^REMOTE_DIR=(.*)$ ]]; then
+      raw_dir="${BASH_REMATCH[1]}"
+      saw_dir=1
+    else
+      echo "Config at $CONFIG_FILE has an unrecognized line: '${line}'. Re-run: codersync --setup <ssh-target> [remote-dir]" >&2
+      exit 1
+    fi
+  done < "$CONFIG_FILE"
+
+  if [[ "$saw_target" != 1 || -z "$raw_target" ]]; then
     echo "Config at $CONFIG_FILE is incomplete. Re-run: codersync --setup <ssh-target> [remote-dir]" >&2
     exit 1
   fi
-  REMOTE_DIR="${REMOTE_DIR:-~/repos}"
+  SSH_TARGET="$(strip_legacy_config_quotes "$raw_target")"
+  if ! validate_ssh_target "$SSH_TARGET"; then
+    echo "Config at $CONFIG_FILE has an invalid SSH_TARGET ('${SSH_TARGET}'). Re-run: codersync --setup <ssh-target> [remote-dir]" >&2
+    exit 1
+  fi
+
+  if [[ "$saw_dir" == 1 && -n "$raw_dir" ]]; then
+    # setup() writes this value via `printf '%q'`, which backslash-
+    # escapes a leading `~` specifically so a naive `source` wouldn't
+    # tilde-expand it against THIS machine's home dir. This parser never
+    # sources the file, so that protection isn't needed here -- strip the
+    # one leading backslash %q would have added, to recover the literal
+    # value (still containing a real `~`, which remote_setup's heredocs
+    # rely on the REMOTE shell to tilde-expand correctly). Legacy-quote
+    # stripping happens first since an old-format value was never
+    # backslash-escaped in the first place -- only wrapped in quotes.
+    raw_dir="$(strip_legacy_config_quotes "$raw_dir")"
+    REMOTE_DIR="${raw_dir#\\}"
+  else
+    # shellcheck disable=SC2088 # intentional: literal `~`, expanded
+    # later by the REMOTE shell, not by this one.
+    REMOTE_DIR="~/repos"
+  fi
+  if ! validate_remote_dir "$REMOTE_DIR"; then
+    echo "Config at $CONFIG_FILE has an invalid REMOTE_DIR ('${REMOTE_DIR}'). Re-run: codersync --setup <ssh-target> [remote-dir]" >&2
+    exit 1
+  fi
   TARGET_LABEL="$(sanitize_label "$SSH_TARGET")"
 }
 
@@ -366,7 +577,21 @@ as_escape() {
 # Writing the resolved command to a remote file and having send-keys
 # invoke that file (a plain, quote-free path) sidesteps the problem
 # entirely instead of trying to out-escape it.
-b64() { printf '%s' "$1" | base64; }
+#
+# `tr -d '\n'` strips whatever line-wrapping the LOCAL `base64` decides
+# to apply -- every call site embeds this output directly into a remote
+# heredoc as one bare token (e.g. `echo ${cmd1_b64} | base64 -d`), which
+# requires it to stay on one line. macOS's own BSD `base64` doesn't wrap
+# by default, but a GNU coreutils `base64` earlier in PATH (a common
+# Homebrew setup) wraps at 76 characters -- a long enough resolved
+# command (a long session name, a long literal --tools value) would
+# otherwise split across multiple `echo` arguments/lines in the
+# generated remote script and fail to decode correctly. Stripping
+# newlines here makes the encoded form unwrapped regardless of which
+# `base64` produced it; the DECODED value is unaffected either way,
+# since base64 decoding already ignores embedded whitespace by
+# convention.
+b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
 
 # A short random alphanumeric string for use in a remote temp-file name.
 # Deterministic /tmp paths are a real risk on a shared/multi-user remote
@@ -388,30 +613,66 @@ random_suffix() {
 # a sorted, de-duplicated list of IDs, one per line. Pure parsing, no
 # I/O -- kill_sessions() below does the actual remote work. Pulled out
 # as its own function so it's unit-testable in isolation.
+#
+# Collects into a plain (possibly duplicate-containing) array and lets
+# `sort -n -u` handle both sorting and de-duplication at the end, rather
+# than an associative array -- macOS ships bash 3.2 as `/bin/bash`
+# (frozen there for licensing reasons; `env bash` resolves to it unless
+# a newer bash is installed AND earlier in PATH), and 3.2 doesn't support
+# `local -A`/`declare -A` at all. `sort -u`'s de-dup is unambiguous here
+# since every element is a single bare number with no other trailing
+# fields on the line for it to disagree with.
 parse_kill_spec() {
   local spec="$1"
-  local -A seen=()
-  local token start end i
+  local -a ids=()
+  local token start end i canon_id
+  # A single codersync session is created by hand, one at a time -- a
+  # range spanning more than this many IDs is almost certainly a typo
+  # (e.g. an extra digit turning "1-4" into "1-999999999"), not a real
+  # request, and expanding it anyway would build a huge in-memory array
+  # before any remote work even starts. The {1,15}-digit cap on both
+  # regexes below is a second, independent guard: it keeps a pathological
+  # value (way more digits than any real ID) out of the `(( ))` arithmetic
+  # entirely, rather than letting bash's own integer-overflow error crash
+  # the script uncaught.
+  local max_range_size=1000
   IFS=',' read -ra tokens <<<"$spec"
   for token in "${tokens[@]}"; do
-    if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-      start="${BASH_REMATCH[1]}"
-      end="${BASH_REMATCH[2]}"
+    if [[ "$token" =~ ^([0-9]{1,15})-([0-9]{1,15})$ ]]; then
+      # canonicalize_session_id rejects 0 and normalizes away a
+      # leading-zero numeral (e.g. "08") -- see its own comment for why.
+      # At this point in the range case, its only possible failure is a
+      # 0 boundary (the {1,15}-digit regex above already rules out the
+      # overflow case), so one message covers both start/end failing.
+      start="$(canonicalize_session_id "${BASH_REMATCH[1]}")" || start=""
+      end="$(canonicalize_session_id "${BASH_REMATCH[2]}")" || end=""
+      if [[ -z "$start" || -z "$end" ]]; then
+        echo "Invalid range '$token': IDs start at 1, 0 is never assigned" >&2
+        return 1
+      fi
       if ((start > end)); then
         echo "Invalid range '$token': start must be <= end" >&2
         return 1
       fi
+      if ((end - start + 1 > max_range_size)); then
+        echo "Invalid range '$token': spans more than ${max_range_size} IDs -- did you mean something narrower?" >&2
+        return 1
+      fi
       for ((i = start; i <= end; i++)); do
-        seen["$i"]=1
+        ids+=("$i")
       done
-    elif [[ "$token" =~ ^[0-9]+$ ]]; then
-      seen["$token"]=1
+    elif [[ "$token" =~ ^[0-9]{1,15}$ ]]; then
+      if ! canon_id="$(canonicalize_session_id "$token")"; then
+        echo "Invalid --kill token: '$token' -- IDs start at 1, 0 is never assigned" >&2
+        return 1
+      fi
+      ids+=("$canon_id")
     else
       echo "Invalid --kill token: '$token' (expected a number or a range like 1-4)" >&2
       return 1
     fi
   done
-  printf '%s\n' "${!seen[@]}" | sort -n
+  printf '%s\n' "${ids[@]}" | sort -n -u
 }
 
 # True if iTerm2 is actually installed/controllable via AppleScript.
@@ -423,7 +684,15 @@ parse_kill_spec() {
 # the tool at least degrades gracefully instead of just failing.
 iterm2_available() {
   command -v osascript >/dev/null 2>&1 || return 1
-  [[ "$(osascript -e 'exists application "iTerm2"' 2>/dev/null)" == "true" ]]
+  [[ "$(osascript -e 'exists application "iTerm2"' 2>/dev/null)" == "true" ]] || return 1
+  # `exists application` alone doesn't prove osascript can actually
+  # CONTROL iTerm2 -- that's a Finder-level lookup, not an Apple Event
+  # sent to iTerm2 itself, so it still reports true even with
+  # Automation permission denied. `count windows` is a real (if
+  # harmless -- no window is created or changed) Apple Event; it fails
+  # if that permission is missing, which is exactly the other half of
+  # what open_tab()/open_tab_tmux_mode() need to actually work later.
+  osascript -e 'tell application "iTerm2" to count windows' >/dev/null 2>&1
 }
 
 # Create both detached tmux sessions on the remote box. Idempotent: if a
@@ -445,6 +714,53 @@ iterm2_available() {
 # tmux's status bar is turned off for both sessions: it isn't used for
 # anything here, and its bottom row is a second thing (besides the app
 # itself) that has to survive a resize cleanly.
+#
+# `umask 077` before writing the launch scripts: without it, they inherit
+# the remote user's default umask (commonly 022), which makes a resolved
+# --tools command containing its own secret (an API token as a raw
+# literal command, say) world-readable in /tmp until cleaned up. Random
+# filenames + `set -C` stop another user from planting/clobbering the
+# file, but neither stops one from just reading it once it exists.
+#
+# There was also no cleanup path at all before this: nothing ever removed
+# these files, so a secret in a --tools command persisted in /tmp
+# indefinitely. Each script's own first line is now `rm -f -- "$0"` --
+# self-deleting the instant the pane actually runs it (`bash <script>`
+# keeps a valid read on the already-open file even after its directory
+# entry is unlinked, so this doesn't affect the real command that
+# follows on the next line). This narrows the window during which the
+# file is on disk at all to "between creation and the pane's first
+# attach" -- sessions are created idle and don't run their launch script
+# until a client actually attaches (see below), so that gap can still be
+# arbitrarily long if nobody attaches right away; there's no way to
+# delete a file before something has read it.
+#
+# `tmux new-session -c ${REMOTE_DIR}` runs BEFORE writing the script,
+# not after -- so the session already exists (and is killable, to clean
+# up any script via remote_kill_session's glob) before anything that
+# could still fail runs. (`-c` on a bad/inaccessible directory doesn't
+# actually make `tmux new-session` itself fail, in practice -- it just
+# silently falls back to a default directory instead -- so this ordering
+# is defense-in-depth for OTHER failures after creation, not that
+# specific one.)
+#
+# Each session's whole setup (from `new-session` through the hook) is
+# also wrapped in its own remote `trap ... EXIT`, armed right after
+# creation and disarmed right before the block's last command. Without
+# it, ANY failure in between -- `set -C` colliding with a pre-existing
+# path, a decode error, `tmux set-hook` itself failing -- left a live,
+# fully-registered session that was idle and never going to run
+# anything: future invocations see `has-session` succeed and skip setup
+# entirely, so the agent silently never launches, with no error shown
+# on the failed run OR any later one (confirmed live by forcing
+# `set-hook` to fail after a real `new-session`). The trap kills that
+# same session and removes its script(s) so the failure is visible
+# immediately and a retry starts clean instead of silently limping along
+# with half a setup. It's scoped to ONE session at a time (not the whole
+# script) deliberately: if creating one side of an iterm-split pair
+# fails after the other already succeeded, only the failed one should
+# roll back -- the other is already correctly set up and shouldn't be
+# torn down just to keep the operation "atomic".
 remote_setup() {
   local session="$1"
   local tool1="${2:-claude}"
@@ -470,16 +786,26 @@ remote_setup() {
   bin2_b64="$(b64 "$bin2")"
   script1="/tmp/codersync-${claude_tmux}-$(random_suffix).sh"
   script2="/tmp/codersync-${codex_tmux}-$(random_suffix).sh"
-  # Tool existence is checked remotely, but ONLY when actually about to
-  # create a session (guarded by `has-session`) -- not on every call.
-  # restore_all always passes placeholder "claude"/"codex" regardless of
-  # what a session was originally started with (it doesn't track that),
-  # so checking unconditionally would wrongly block restoring an
-  # already-running session over an irrelevant "claude not found" when
-  # the box only has e.g. agy/aider installed. Without this check at
-  # all, a missing tool failed completely silently on fresh creation --
-  # the local script exited 0 with no output, and the only trace was a
-  # "command not found" line inside the pane itself (confirmed live).
+  # Tool existence is checked remotely, but ONLY for whichever session(s)
+  # actually need creating (guarded by `has-session`) -- not on every
+  # call. restore_all always passes placeholder "claude"/"codex"
+  # regardless of what a session was originally started with (it
+  # doesn't track that), so checking unconditionally would wrongly block
+  # restoring an already-running session over an irrelevant "claude not
+  # found" when the box only has e.g. agy/aider installed. Without this
+  # check at all, a missing tool failed completely silently on fresh
+  # creation -- the local script exited 0 with no output, and the only
+  # trace was a "command not found" line inside the pane itself
+  # (confirmed live).
+  #
+  # BOTH tools are checked before creating EITHER session, not tool1
+  # checked/created then tool2 checked/created -- otherwise, tool1
+  # existing and tool2 missing left claude_tmux fully created (session +
+  # launcher file + hook) with codex_tmux never created at all, and no
+  # easy way to tell that half-created state apart from a deliberate
+  # single-session request (confirmed live). remote_setup_tmux_mode
+  # never had this problem since it's one session either fully created
+  # or not at all; this preflights both checks up front to match that.
   # shellcheck disable=SC2087 # intentional: local expansion is the point --
   # ${claude_tmux}/${bin1_b64}/etc. below are THIS script's variables and
   # must substitute before the heredoc is sent; only the \$-escaped ones
@@ -487,21 +813,41 @@ remote_setup() {
   if ! ssh "$SSH_TARGET" -- bash -s <<EOF
 set -e
 set -C
+umask 077
 bin1=\$(echo ${bin1_b64} | base64 -d)
 bin2=\$(echo ${bin2_b64} | base64 -d)
-if ! tmux has-session -t ${claude_tmux} 2>/dev/null; then
-  command -v "\$bin1" >/dev/null 2>&1 || { echo "codersync: \$bin1 not found on \$(hostname)" >&2; exit 1; }
-  echo ${cmd1_b64} | base64 -d > ${script1}
+need_claude=0
+need_codex=0
+tmux has-session -t ${claude_tmux} 2>/dev/null || need_claude=1
+tmux has-session -t ${codex_tmux} 2>/dev/null || need_codex=1
+missing=""
+if [ "\$need_claude" = 1 ]; then
+  command -v "\$bin1" >/dev/null 2>&1 || missing="\${missing} \$bin1"
+fi
+if [ "\$need_codex" = 1 ]; then
+  command -v "\$bin2" >/dev/null 2>&1 || missing="\${missing} \$bin2"
+fi
+if [ -n "\${missing}" ]; then
+  echo "codersync: not found on \$(hostname):\${missing}" >&2
+  exit 1
+fi
+if [ "\$need_claude" = 1 ]; then
   tmux new-session -d -s ${claude_tmux} -c ${REMOTE_DIR}
+  trap 'tmux kill-session -t ${claude_tmux} 2>/dev/null; rm -f -- ${script1}' EXIT
+  echo 'rm -f -- "\$0"' > ${script1}
+  echo ${cmd1_b64} | base64 -d >> ${script1}
   tmux set-hook -t ${claude_tmux} client-attached "run-shell 'tmux send-keys -t ${claude_tmux} \"bash ${script1}\" Enter; tmux set-hook -u -t ${claude_tmux} client-attached'"
   tmux set-option -t ${claude_tmux} status off
+  trap - EXIT
 fi
-if ! tmux has-session -t ${codex_tmux} 2>/dev/null; then
-  command -v "\$bin2" >/dev/null 2>&1 || { echo "codersync: \$bin2 not found on \$(hostname)" >&2; exit 1; }
-  echo ${cmd2_b64} | base64 -d > ${script2}
+if [ "\$need_codex" = 1 ]; then
   tmux new-session -d -s ${codex_tmux} -c ${REMOTE_DIR}
+  trap 'tmux kill-session -t ${codex_tmux} 2>/dev/null; rm -f -- ${script2}' EXIT
+  echo 'rm -f -- "\$0"' > ${script2}
+  echo ${cmd2_b64} | base64 -d >> ${script2}
   tmux set-hook -t ${codex_tmux} client-attached "run-shell 'tmux send-keys -t ${codex_tmux} \"bash ${script2}\" Enter; tmux set-hook -u -t ${codex_tmux} client-attached'"
   tmux set-option -t ${codex_tmux} status off
+  trap - EXIT
 fi
 EOF
   then
@@ -558,7 +904,12 @@ APPLESCRIPT
 # server-side, instead of two separate sessions. Same idle-until-attached
 # + client-attached-hook approach as remote_setup, just targeting pane 0
 # and pane 1 of one session instead of two sessions -- still avoids the
-# resize-during-startup rendering bug.
+# resize-during-startup rendering bug. Also uses `umask 077` before
+# writing the launch scripts, and the same remote `trap ... EXIT`
+# rollback-on-failure approach -- see the comments above remote_setup()
+# for both. Only one trap/session here (not one per side), since this
+# mode is already all-or-nothing: a single session with two panes,
+# never two independent sessions to partially succeed between.
 remote_setup_tmux_mode() {
   local session="$1"
   local tool1="${2:-claude}"
@@ -591,6 +942,7 @@ remote_setup_tmux_mode() {
   if ! ssh "$SSH_TARGET" -- bash -s <<EOF
 set -e
 set -C
+umask 077
 bin1=\$(echo ${bin1_b64} | base64 -d)
 bin2=\$(echo ${bin2_b64} | base64 -d)
 if ! tmux has-session -t ${pair_tmux} 2>/dev/null; then
@@ -601,12 +953,16 @@ if ! tmux has-session -t ${pair_tmux} 2>/dev/null; then
     echo "codersync: not found on \$(hostname):\${missing}" >&2
     exit 1
   fi
-  echo ${cmd1_b64} | base64 -d > ${script1}
-  echo ${cmd2_b64} | base64 -d > ${script2}
   tmux new-session -d -s ${pair_tmux} -c ${REMOTE_DIR}
+  trap 'tmux kill-session -t ${pair_tmux} 2>/dev/null; rm -f -- ${script1} ${script2}' EXIT
   tmux split-window -h -t ${pair_tmux} -c ${REMOTE_DIR}
+  echo 'rm -f -- "\$0"' > ${script1}
+  echo ${cmd1_b64} | base64 -d >> ${script1}
+  echo 'rm -f -- "\$0"' > ${script2}
+  echo ${cmd2_b64} | base64 -d >> ${script2}
   tmux set-hook -t ${pair_tmux} client-attached "run-shell 'tmux send-keys -t ${pair_tmux}.0 \"bash ${script1}\" Enter; tmux send-keys -t ${pair_tmux}.1 \"bash ${script2}\" Enter; tmux set-hook -u -t ${pair_tmux} client-attached'"
   tmux set-option -t ${pair_tmux} status off
+  trap - EXIT
 fi
 EOF
   then
@@ -656,6 +1012,63 @@ end tell
 APPLESCRIPT
 }
 
+# Returns (on stdout) the codersync agent prefix a live tmux session
+# name starts with ("claude-", "codex-", or "pair-"), or fails if it
+# doesn't match any of them. Shared by every place that needs to
+# recognize/strip that prefix, so the claude-/codex-/pair- detection
+# lives in exactly one spot.
+session_prefix_for() {
+  case "$1" in
+    claude-*) printf 'claude-' ;;
+    codex-*)  printf 'codex-' ;;
+    pair-*)   printf 'pair-' ;;
+    *) return 1 ;;
+  esac
+}
+
+# True if `id`+`rest` (already parsed out of a live tmux session name by
+# parse_numbered_session) are, together, a session codersync actually
+# manages for the CURRENTLY configured target -- true only if the
+# registry has an entry for this target whose OWN id/rest (parsed the
+# same way) match exactly. `id=""` correctly matches only an entry with
+# no ID segment either (a legacy, pre-numbering session).
+#
+# This used to trust an IDed session by naming SHAPE alone -- first "a
+# prefix plus any valid ID" (confirmed live: an unrelated session
+# literally named "pair-1-not-codersync" was still listed/killed), then
+# "a prefix plus a valid ID AND a rest starting with the target's
+# label" (confirmed live AGAIN: for a target labeled e.g. "host",
+# "pair-1-host-unregistered" still matched -- common target labels make
+# that prefix trivial to collide with by accident). Full registry-backing
+# is the only check narrow enough to avoid yet another naming collision,
+# and it costs no real functionality: register_session() always runs
+# BEFORE remote_setup/remote_setup_tmux_mode actually create the live
+# session (see the ID-lock comment in the dispatch code below), so any
+# session THIS tool creates is already registered by the time it exists
+# to be listed/killed at all.
+#
+# A registry entry whose own first segment LOOKS like an ID attempt but
+# fails canonicalization (e.g. "0-host-foo") is poisoned -- skipped
+# outright, rather than being used to authorize anything (confirmed
+# live: without this, a poisoned entry and a live session sharing that
+# exact broken shape could authorize each other).
+session_is_owned() {
+  local id="$1" rest="$2"
+  touch "$REGISTRY"
+  local line
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    parse_registry_line "$line"
+    [[ "$ENTRY_TARGET" != "$SSH_TARGET" ]] && continue
+    if [[ "$ENTRY_NAME" =~ ^([0-9]+)-(.*)$ ]] && ! canonicalize_session_id "${BASH_REMATCH[1]}" >/dev/null; then
+      continue
+    fi
+    parse_numbered_session "" "$ENTRY_NAME"
+    [[ "$PARSED_ID" == "$id" && "$PARSED_REST" == "$rest" ]] && return 0
+  done < "$REGISTRY"
+  return 1
+}
+
 # Appends session to the registry if it isn't already recorded, tagged
 # with the CURRENT ssh-target (format: "<target>\t<session-name>" per
 # line). Storing the target is what lets restore_all tell "genuinely
@@ -669,6 +1082,36 @@ register_session() {
   touch "$REGISTRY"
   local line="${SSH_TARGET}"$'\t'"${session}"
   grep -qxF "$line" "$REGISTRY" || echo "$line" >> "$REGISTRY"
+}
+
+# Acquires a simple mkdir-based lock around ID allocation + registry
+# append (see the dispatch code that calls this), so two concurrent
+# `codersync <name>` invocations for the same name can't both read the
+# same next_id/registry state before either has written anything, and
+# each mint their own new ID for what the user meant as one session --
+# confirmed live by racing two invocations, which produced two separate
+# tmux sessions instead of one. `mkdir` is atomic on any POSIX
+# filesystem (including macOS's default APFS/HFS+), so this doesn't need
+# `flock`, which isn't universally available on macOS. Retries for 5s
+# before giving up, in case a previous run crashed and left the lock
+# directory behind rather than blocking forever; the failure message
+# tells the user how to recover.
+acquire_id_lock() {
+  local lock_dir="$CONFIG_DIR/id.lock"
+  mkdir -p "$CONFIG_DIR"
+  local waited_ms=0
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    if ((waited_ms >= 5000)); then
+      echo "codersync: couldn't acquire the session-ID lock at ${lock_dir} after 5s -- remove it manually if you're sure no other codersync invocation is running." >&2
+      return 1
+    fi
+    sleep 0.1
+    waited_ms=$((waited_ms + 100))
+  done
+}
+
+release_id_lock() {
+  rmdir "$CONFIG_DIR/id.lock" 2>/dev/null || true
 }
 
 # Reopens a tab for every registry entry that belongs to the currently
@@ -697,6 +1140,7 @@ restore_all() {
   local kept=()
   local restored=0
   local skipped_other_target=0
+  local skipped_unsafe=0
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     parse_registry_line "$line"
@@ -705,6 +1149,35 @@ restore_all() {
     if [[ "$entry_target" != "$SSH_TARGET" ]]; then
       kept+=("${entry_target}"$'\t'"${entry_name}")
       skipped_other_target=$((skipped_other_target + 1))
+      continue
+    fi
+
+    # entry_name gets spliced UNQUOTED into a remote bash heredoc by
+    # remote_setup/remote_setup_tmux_mode below (tmux -s/-t need the
+    # actual session name, not an escaped one) -- a registry poisoned by
+    # hand-editing, a bug, or a pre-validation version of this script
+    # could contain shell metacharacters, which then become literal
+    # remote shell syntax (confirmed live with an entry like
+    # "pair-x;touch /tmp/pwn"). Dropped rather than kept, since an entry
+    # that fails this check is untrustworthy regardless of what wrote it.
+    if ! validate_session_name "$entry_name"; then
+      echo "Skipping unsafe registry entry (contains characters outside a-z/0-9/_/- ): $entry_name" >&2
+      skipped_unsafe=$((skipped_unsafe + 1))
+      continue
+    fi
+    # A safe CHARACTER set alone doesn't mean a safe ID: an entry like
+    # "0-devbox-example-com-foo" passes the check above (every character is
+    # allowed) but has a digit-shaped first segment that fails
+    # canonicalization (0 is never a valid ID) -- the exact same
+    # poisoned-entry shape session_is_owned() already rejects for
+    # --list-all/--kill/--kill-all. restore_all had its own, older,
+    # separate gating logic that never applied that check, so a
+    # registry line like this was rejected everywhere else but still
+    # restored here -- confirmed live, it called remote_setup_tmux_mode
+    # with "0-devbox-example-com-foo" outright.
+    if [[ "$entry_name" =~ ^([0-9]+)-(.*)$ ]] && ! canonicalize_session_id "${BASH_REMATCH[1]}" >/dev/null; then
+      echo "Skipping unsafe registry entry (invalid ID segment): $entry_name" >&2
+      skipped_unsafe=$((skipped_unsafe + 1))
       continue
     fi
 
@@ -750,18 +1223,22 @@ restore_all() {
   if [[ "$skipped_other_target" -gt 0 ]]; then
     echo "Skipped ${skipped_other_target} entry/entries for a different configured box -- re-run --setup for that box, then --restore-all again, to check those."
   fi
+  if [[ "$skipped_unsafe" -gt 0 ]]; then
+    echo "Dropped ${skipped_unsafe} unsafe registry entry/entries (see warnings above)."
+  fi
   echo "Restored ${restored} session(s)."
 }
 
 # Queries the currently configured target's live tmux sessions and
 # prints a table of every codersync-managed one (claude-<id>-<rest>/
 # codex-<id>-<rest> pairs, or pair-<id>-<rest> sessions), one row per
-# logical session regardless of split mode. Sessions from before
-# numbering existed still show up (with a "-" in the ID column) since
-# this reads live tmux state directly, not the local registry -- it's
-# meant to answer "what's actually running", which the registry alone
-# can't fully answer (e.g. if it was cleared, or a session was created
-# from a different machine).
+# logical session regardless of split mode. See session_is_owned() for
+# what qualifies a session to show up at all -- registry-backing is
+# required either way, but this is still reading LIVE tmux state, not
+# just the registry file, so a registered session that's since died
+# (killed outside codersync, the box rebooted, whatever) correctly
+# doesn't show up here even though its registry entry might still
+# exist -- only --restore-all prunes that entry.
 list_all_sessions() {
   local live
   live="$(ssh "$SSH_TARGET" -- "tmux list-sessions -F '#{session_name}'" 2>/dev/null || true)"
@@ -770,21 +1247,27 @@ list_all_sessions() {
     return 0
   fi
 
-  local -A seen=()
+  # A newline-wrapped string used as a de-dup set (instead of an
+  # associative array -- see parse_kill_spec's comment for why: macOS's
+  # own bash 3.2 doesn't support `local -A` at all). An iterm-split pair
+  # is TWO live tmux sessions (claude-<id>-<rest>, codex-<id>-<rest>) for
+  # ONE logical row, so this still needs an explicit check during the
+  # loop -- not just a sort -u at the end -- to collapse them into one.
+  local seen_keys=$'\n'
   local -a rows=()
-  local line kind prefix
+  local line prefix kind key
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
-    case "$line" in
-      claude-*) kind="iterm"; prefix="claude-" ;;
-      codex-*)  kind="iterm"; prefix="codex-" ;;
-      pair-*)   kind="tmux";  prefix="pair-" ;;
-      *) continue ;;
-    esac
+    prefix="$(session_prefix_for "$line")" || continue
+    kind="iterm"
+    [[ "$prefix" == "pair-" ]] && kind="tmux"
     parse_numbered_session "$prefix" "$line"
-    local key="${kind}:${PARSED_ID}:${PARSED_REST}"
-    [[ -n "${seen[$key]:-}" ]] && continue
-    seen["$key"]=1
+    session_is_owned "$PARSED_ID" "$PARSED_REST" || continue
+    key="${kind}:${PARSED_ID}:${PARSED_REST}"
+    case "$seen_keys" in
+      *$'\n'"$key"$'\n'*) continue ;;
+    esac
+    seen_keys+="$key"$'\n'
     local id_display="${PARSED_ID:--}"
     local id_sort="${PARSED_ID:-999999}"
     rows+=("$(printf '%06d\t%s\t%s\t%s' "$id_sort" "$id_display" "$kind" "$PARSED_REST")")
@@ -799,6 +1282,67 @@ list_all_sessions() {
   printf '%s\n' "${rows[@]}" | sort -n | while IFS=$'\t' read -r _ id_display kind rest; do
     printf '%-6s %-8s %s\n' "$id_display" "$kind" "$rest"
   done
+}
+
+# Kills one remote tmux session by its exact name, safely regardless of
+# what that name contains. `name` here always comes from either the
+# registry or live `tmux list-sessions` output -- neither is guaranteed
+# to satisfy validate_session_name (a rogue/legacy/hand-created tmux
+# session can be named anything tmux itself allows), and passing it as a
+# separate ssh argument is NOT safe: ssh rejoins a multi-argument remote
+# command with plain spaces before the remote shell parses it (see the
+# ssh gotcha note near the top of this file), so a name containing shell
+# metacharacters becomes remote shell syntax at that point -- confirmed
+# with a session named `pair-1-x; touch /tmp/pwn`. Base64-encoding it and
+# decoding into a remote variable (the same technique used for --tools'
+# resolved bin/cmd values in remote_setup above) closes that off no
+# matter what the name contains; the heredoc also gives this ssh call its
+# own stdin, avoiding the same loop-stdin-forwarding issue documented at
+# each call site below.
+remote_kill_session() {
+  local name="$1"
+  local name_b64
+  name_b64="$(b64 "$name")"
+  # Also removes /tmp/codersync-<name>-*.sh -- the launch script(s) this
+  # session's own /tmp file(s) are named after (one file for an
+  # iterm-split session, two for a tmux-split pair; the glob covers
+  # either since a pair's own two filenames both start with
+  # "codersync-<pair-session-name>-"). Without this, killing a session
+  # BEFORE it was ever attached to (so its script's own self-delete line
+  # -- see remote_setup's comment -- never got a chance to run) left the
+  # file behind indefinitely -- confirmed live, over a dozen leftover
+  # scripts accumulated on devbox purely from --kill'ing test sessions
+  # during this tool's own development.
+  #
+  # That cleanup only runs when `name` matches codersync's own generated
+  # session-name shape (letters/digits/underscore/dash only), though --
+  # quoting keeps it safe from shell injection either way, but doesn't
+  # neutralize `/` as a PATH separator. `name` becomes a literal path
+  # segment in the rm glob, so one containing `/` (e.g.
+  # "pair-1-host/../../victim") could traverse outside /tmp entirely.
+  # session_is_owned() requires registry-backing before a caller ever
+  # gets this far, and a real registry entry can never contain `/`
+  # (register_session only ever writes values that already passed
+  # validate_session_name) -- so this only ever excludes a hand-crafted
+  # registry entry from bypassing that via the cleanup path specifically;
+  # the tmux-kill line above is unaffected and still runs regardless,
+  # since it's already safe for any content via base64 encoding.
+  local cleanup_cmd=""
+  if [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    # shellcheck disable=SC2016 # intentional: this is REMOTE-shell text
+    # (uses the remote script's own $name, decoded below), not meant to
+    # expand in this local single-quoted assignment.
+    cleanup_cmd='rm -f -- /tmp/codersync-"$name"-*.sh'
+  fi
+  # shellcheck disable=SC2087 # intentional: local expansion is the point --
+  # ${name_b64}/${cleanup_cmd} below are THIS script's variables and must
+  # substitute before the heredoc is sent; only the \$-escaped one is
+  # meant to survive as literal text for the remote shell to evaluate.
+  ssh "$SSH_TARGET" -- bash -s <<EOF 2>/dev/null
+name=\$(echo ${name_b64} | base64 -d)
+tmux kill-session -t "\$name" 2>/dev/null || true
+${cleanup_cmd}
+EOF
 }
 
 # Kills every remote session matching any ID in `spec` (see
@@ -817,12 +1361,31 @@ kill_sessions() {
 
   touch "$REGISTRY"
   local id any_killed=0
+  local -a killed_pairs=()
   while IFS= read -r id; do
     [[ -z "$id" ]] && continue
-    # Anchored + requires the literal id followed by `-`, so id=1 can't
-    # accidentally match a session whose id is 10, 15, etc.
-    local matches
-    matches="$(grep -E "^(claude|codex|pair)-${id}-" <<<"$live" || true)"
+    # Every live session is parsed/canonicalized via parse_numbered_session
+    # and compared against the (already-canonical) requested id -- NOT
+    # pre-grepped for the literal id text. A live session named e.g.
+    # "pair-08-host-foo" canonicalizes to ID 8 in --list-all, but a raw
+    # `grep "\-8-"` here would never match its actual on-disk text "08",
+    # so --kill 8 (or --kill 08, which canonicalizes to the same request)
+    # reported "no session found" for something --list-all had just shown
+    # as killable (confirmed live). Ownership is then checked the same as
+    # everywhere else -- see session_is_owned() -- so an ID with only
+    # unowned candidates is reported the same as an ID with no candidates
+    # at all (confirmed live: an unrelated session literally named
+    # "pair-1-not-codersync" used to be killed by `--kill 1` even though
+    # it has nothing to do with this target).
+    local matches="" cname prefix
+    while IFS= read -r cname; do
+      [[ -z "$cname" ]] && continue
+      prefix="$(session_prefix_for "$cname")" || continue
+      parse_numbered_session "$prefix" "$cname"
+      [[ "$PARSED_ID" == "$id" ]] || continue
+      session_is_owned "$PARSED_ID" "$PARSED_REST" || continue
+      matches+="${cname}"$'\n'
+    done <<<"$live"
     if [[ -z "$matches" ]]; then
       echo "codersync: no session found for ID ${id}" >&2
       continue
@@ -833,29 +1396,49 @@ kill_sessions() {
     while IFS= read -r name; do
       [[ -z "$name" ]] && continue
       echo "Killing: $name"
-      # </dev/null is required: without it, ssh forwards this loop's own
-      # stdin (the `<<<"$matches"` heredoc) to the remote command, which
-      # silently consumed the REST of $matches after the first
-      # iteration -- confirmed live, killing an iterm-split pair by ID
-      # only ever killed the claude side, never reaching codex.
-      ssh "$SSH_TARGET" -- tmux kill-session -t "$name" </dev/null 2>/dev/null || true
+      remote_kill_session "$name"
       if [[ -z "$rest" ]]; then
-        case "$name" in
-          claude-*) parse_numbered_session "claude-" "$name" ;;
-          codex-*) parse_numbered_session "codex-" "$name" ;;
-          pair-*) parse_numbered_session "pair-" "$name" ;;
-        esac
+        prefix="$(session_prefix_for "$name")"
+        parse_numbered_session "$prefix" "$name"
         rest="$PARSED_REST"
       fi
     done <<<"$matches"
     any_killed=1
-
-    if [[ -n "$rest" ]]; then
-      local entry_name="${id}-${rest}"
-      grep -vF "$(printf '%s\t%s' "$SSH_TARGET" "$entry_name")" "$REGISTRY" > "${REGISTRY}.tmp" 2>/dev/null || true
-      mv "${REGISTRY}.tmp" "$REGISTRY"
-    fi
+    # Recorded as (id, rest) -- NOT the reconstructed raw string
+    # "${id}-${rest}" -- so the registry cleanup below can compare
+    # against each entry's OWN parsed (id, rest) instead of an exact
+    # string match. A live session named e.g. "pair-08-devbox-example-com-foo"
+    # kills correctly (id canonicalizes to 8), but the matching registry
+    # entry is still literally "08-devbox-example-com-foo" on disk -- comparing
+    # "8-devbox-example-com-foo" against that raw text never matched, leaving
+    # the stale entry behind after every kill (confirmed live).
+    [[ -n "$rest" ]] && killed_pairs+=("${id}"$'\t'"${rest}")
   done <<<"$ids"
+
+  if [[ ${#killed_pairs[@]} -gt 0 ]]; then
+    local -a kept=()
+    local line kp drop
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      parse_registry_line "$line"
+      drop=0
+      if [[ "$ENTRY_TARGET" == "$SSH_TARGET" ]]; then
+        parse_numbered_session "" "$ENTRY_NAME"
+        for kp in "${killed_pairs[@]}"; do
+          if [[ "$kp" == "${PARSED_ID}"$'\t'"${PARSED_REST}" ]]; then
+            drop=1
+            break
+          fi
+        done
+      fi
+      [[ "$drop" == 0 ]] && kept+=("$line")
+    done < "$REGISTRY"
+    if [[ ${#kept[@]} -gt 0 ]]; then
+      printf '%s\n' "${kept[@]}" > "$REGISTRY"
+    else
+      : > "$REGISTRY"
+    fi
+  fi
 
   if [[ "$any_killed" == 0 ]]; then
     echo "Nothing killed."
@@ -863,26 +1446,33 @@ kill_sessions() {
 }
 
 # Kills every codersync-managed session on the currently configured
-# target (claude-*/codex-*/pair-* -- same detection as list_all_sessions,
-# including legacy sessions with no numeric ID, unlike --kill which can
-# only address IDed ones) and clears every registry entry for that
-# target. Asks for confirmation first since, unlike --kill's targeted
-# list, there's no way to undo picking the wrong box. Other targets'
-# registry entries are left untouched, same scoping as --list-all/--kill.
+# target -- see session_is_owned() for what qualifies a live session at
+# all (same rule as list_all_sessions/kill_sessions: an exact registry
+# match on both id and rest) -- and clears every registry entry for
+# that target. Asks for confirmation first since, unlike --kill's
+# targeted list, there's no way to undo picking the wrong box. Other
+# targets' registry entries are left untouched, same scoping as
+# --list-all/--kill.
 kill_all_sessions() {
   local live
   live="$(ssh "$SSH_TARGET" -- "tmux list-sessions -F '#{session_name}'" 2>/dev/null || true)"
-  local matches
-  matches="$(grep -E '^(claude|codex|pair)-' <<<"$live" || true)"
-  if [[ -z "$matches" ]]; then
+  local -a matches=()
+  local name prefix
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    prefix="$(session_prefix_for "$name")" || continue
+    parse_numbered_session "$prefix" "$name"
+    session_is_owned "$PARSED_ID" "$PARSED_REST" || continue
+    matches+=("$name")
+  done <<<"$live"
+
+  if [[ ${#matches[@]} -eq 0 ]]; then
     echo "No codersync sessions on ${SSH_TARGET}."
     return 0
   fi
 
   echo "This will kill ALL codersync sessions on ${SSH_TARGET}:"
-  while IFS= read -r name; do
-    echo "  $name"
-  done <<<"$matches"
+  printf '  %s\n' "${matches[@]}"
   local reply
   read -r -p "Proceed? [y/N] " reply
   if [[ ! "$reply" =~ ^[Yy]$ ]]; then
@@ -890,16 +1480,12 @@ kill_all_sessions() {
     return 0
   fi
 
-  local name count=0
-  while IFS= read -r name; do
-    [[ -z "$name" ]] && continue
+  local count=0
+  for name in "${matches[@]}"; do
     echo "Killing: $name"
-    # </dev/null: see the same fix/comment in kill_sessions() above --
-    # without it, ssh forwards this loop's own stdin (the `<<<"$matches"`
-    # heredoc) to the remote command instead of the loop reading it.
-    ssh "$SSH_TARGET" -- tmux kill-session -t "$name" </dev/null 2>/dev/null || true
+    remote_kill_session "$name"
     count=$((count + 1))
-  done <<<"$matches"
+  done
 
   touch "$REGISTRY"
   local kept=()
@@ -930,8 +1516,10 @@ Usage:
   codersync --kill-all                                      Kill every codersync session (asks to confirm)
   codersync --help                                          Show this help
 
-<ssh-target> is anything you'd pass to `ssh` directly (a hostname,
-user@host, or an alias from ~/.ssh/config). It's also used as the
+<ssh-target> is a hostname, user@host, or an alias from ~/.ssh/config --
+restricted to letters, digits, and . _ - @ (narrower than everything ssh
+itself accepts; use a ~/.ssh/config Host alias for anything more exotic,
+like a custom port or an IPv6 address). It's also used as the
 session-name prefix, so `codersync foo` on target `devbox.example.com` opens a
 tab and tmux sessions named `devbox-example-com-foo`.
 
@@ -941,11 +1529,13 @@ have to type the full name to look up or kill a session. Re-running
 `codersync foo` reuses foo's existing ID rather than minting a new one.
 
 --split-mode tmux (default): one tmux session with two panes split
-server-side, and the local side just opens a tab and attaches once --
-works from any terminal with plain tmux, no iTerm2 dependency.
+server-side, and the local side just opens a tab and attaches once. Uses
+iTerm2 to open that tab when it's installed, but doesn't require it --
+without iTerm2, prints the attach command to run yourself in any
+terminal instead.
 --split-mode iterm: two separate tmux sessions, split locally by iTerm2 --
 lets you attach to just the left or right pane separately, but requires
-iTerm2.
+iTerm2 (no fallback for this mode).
 
 --tools t1,t2 (default: claude,codex): which two CLI agents run left/
 right. Known keys (auto-append that tool's skip-approval flag):
@@ -964,9 +1554,12 @@ normal permission prompts apply instead. Only affects known keys -- for
 a raw/literal --tools command, just leave its skip-approval flag out.
 
 --list-all: queries the current target's live tmux sessions and prints
-each one's ID, split mode, and name. Sessions from before this ID scheme
+each one's ID, split mode, and name -- for sessions both alive on the
+box AND recorded in the local registry (~/.codersync_sessions); a live
+session missing from the registry (different machine, cleared
+registry) won't show up here. Sessions from before this ID scheme
 existed still show up, with a "-" in the ID column (they can't be
-targeted by --kill; kill them with plain tmux instead).
+targeted by --kill; kill them with --kill-all or plain tmux instead).
 
 --kill <ids>: kills every session matching any ID in <ids> and removes
 it from the local registry. Accepts a comma-separated list ("1,2,4"), a
@@ -995,7 +1588,7 @@ split_tools() {
 parse_run_args() {
   RAW_NAME="$1"
   if ! validate_session_name "$RAW_NAME"; then
-    echo "Invalid session name '${RAW_NAME}': only letters, digits, '-', and '_' are allowed." >&2
+    echo "Invalid session name '${RAW_NAME}': only letters, digits, '-', and '_' are allowed, and it can't start with '-' (if you meant to pass a flag, check it's spelled right and comes with a session name)." >&2
     exit 1
   fi
   shift
@@ -1047,15 +1640,34 @@ parse_run_args() {
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 case "${1:-}" in
   --setup)
+    # This mutates local config, so an extra trailing argument (a typo'd
+    # flag, an extra word) is rejected rather than silently ignored --
+    # confirmed live, `codersync --setup host dir extra` used to just
+    # drop "extra" with no warning at all.
+    if [[ $# -gt 3 ]]; then
+      echo "codersync: --setup takes at most 2 arguments (<ssh-target> [remote-dir]), got extra: ${*:4}" >&2
+      exit 1
+    fi
     setup "${2:-}" "${3:-}"
     exit 0
     ;;
   --restore-all)
+    # Opens tabs and rewrites the registry, so treated the same as the
+    # other mutating commands above: an extra trailing argument is
+    # rejected rather than silently ignored.
+    if [[ $# -gt 1 ]]; then
+      echo "codersync: --restore-all takes no arguments -- got extra: ${*:2}" >&2
+      exit 1
+    fi
     load_config
     restore_all
     exit 0
     ;;
   --list-all)
+    if [[ $# -gt 1 ]]; then
+      echo "codersync: --list-all takes no arguments -- got extra: ${*:2}" >&2
+      exit 1
+    fi
     load_config
     list_all_sessions
     exit 0
@@ -1066,10 +1678,21 @@ case "${1:-}" in
       echo "Usage: codersync --kill <ids> (e.g. --kill 1,2,4 or --kill 1-4)" >&2
       exit 1
     fi
+    # Kills remote sessions, so an extra trailing argument is rejected
+    # rather than silently ignored -- confirmed live, `codersync --kill 1
+    # 2` used to kill only ID 1 with no indication that "2" was dropped.
+    if [[ $# -gt 2 ]]; then
+      echo "codersync: --kill takes exactly one argument (<ids>, e.g. 1,2,4 or 1-4) -- got extra: ${*:3}" >&2
+      exit 1
+    fi
     kill_sessions "$2"
     exit 0
     ;;
   --kill-all)
+    if [[ $# -gt 1 ]]; then
+      echo "codersync: --kill-all takes no arguments -- got extra: ${*:2}" >&2
+      exit 1
+    fi
     load_config
     kill_all_sessions
     exit 0
@@ -1087,6 +1710,18 @@ case "${1:-}" in
     load_config
     parse_run_args "$@"
     split_tools "$TOOLS"
+    # --split-mode iterm has no fallback (unlike tmux mode, which prints
+    # the attach command when iTerm2 isn't available) -- checked here,
+    # before any remote work at all, not left to open_tab() to discover
+    # after the fact. Without this, remote_setup already created live
+    # tmux sessions and launch scripts by the time open_tab's osascript
+    # call failed locally, leaving that remote state behind with no
+    # local tab ever opened (confirmed live, on a machine without
+    # iTerm2 installed).
+    if [[ "$SPLIT_MODE" == "iterm" ]] && ! iterm2_available; then
+      echo "codersync: --split-mode iterm requires iTerm2 (and osascript control of it) -- none detected. Use --split-mode tmux instead, or install iTerm2 and try again." >&2
+      exit 1
+    fi
     # The (sanitized) ssh-target is folded into the session name by
     # default (e.g. `codersync foo` on target `devbox.example.com` becomes
     # session `devbox.example.com-foo`), so tmux session names/tab titles/
@@ -1095,16 +1730,27 @@ case "${1:-}" in
     # `1-devbox.example.com-foo`), reused across repeat invocations of
     # the same name so re-running doesn't mint a duplicate session --
     # see --list-all/--kill for what the ID is actually for.
+    #
+    # ID lookup/allocation + the registry write that reserves it are
+    # locked and done UP FRONT, before the slow remote SSH setup below --
+    # so a second concurrent invocation for the SAME name sees this one's
+    # reservation already in the registry and reuses it, without holding
+    # the lock through the network round-trip (which would otherwise
+    # serialize every codersync invocation against every other one, even
+    # for unrelated names).
+    acquire_id_lock || exit 1
+    trap 'release_id_lock' EXIT
     SESSION_SUFFIX="${TARGET_LABEL}-${RAW_NAME}"
     SESSION_ID="$(find_or_assign_id "$SSH_TARGET" "$SESSION_SUFFIX")"
     SESSION="${SESSION_ID}-${SESSION_SUFFIX}"
+    register_session "$SESSION"
+    trap - EXIT
+    release_id_lock
     if [[ "$SPLIT_MODE" == "tmux" ]]; then
       remote_setup_tmux_mode "$SESSION" "$TOOL1" "$TOOL2" "$SAFE_MODE"
-      register_session "$SESSION"
       open_tab_tmux_mode "$SESSION"
     else
       remote_setup "$SESSION" "$TOOL1" "$TOOL2" "$SAFE_MODE"
-      register_session "$SESSION"
       open_tab "$SESSION"
     fi
     ;;

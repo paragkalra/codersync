@@ -98,6 +98,83 @@ setup() {
   [ "$decoded" = "$original" ]
 }
 
+@test "b64: output never contains an embedded newline, even for long input" {
+  # Regression test: every call site embeds this output as ONE bare
+  # token in a remote heredoc (e.g. `echo \${cmd1_b64} | base64 -d`),
+  # which requires it to stay on a single line. macOS's own BSD base64
+  # doesn't wrap by default, but a GNU coreutils base64 earlier in PATH
+  # (a common Homebrew setup) wraps at 76 characters -- a long enough
+  # resolved command would otherwise split across multiple lines in the
+  # generated remote script and fail to decode correctly.
+  original="claude -n a-very-long-session-name-that-is-long-enough-to-trigger-line-wrapping-in-a-76-column-wrapping-base64-implementation --dangerously-skip-permissions"
+  encoded="$(b64 "$original")"
+  [[ "$encoded" != *$'\n'* ]]
+  decoded="$(printf '%s' "$encoded" | base64 -d)"
+  [ "$decoded" = "$original" ]
+}
+
+# --- remote_kill_session ---------------------------------------------
+
+@test "remote_kill_session: never passes the raw session name as an ssh argument" {
+  # Regression test: `ssh ... tmux kill-session -t "$name"` used to pass
+  # the name as a separate ssh argument, but ssh rejoins a multi-arg
+  # remote command with plain spaces before the remote shell parses it --
+  # so a name containing shell metacharacters became remote shell syntax
+  # (confirmed live with a session named "pair-1-x; touch /tmp/pwn"). The
+  # name must now only ever appear base64-encoded, never as a raw arg or
+  # raw heredoc text.
+  # shellcheck disable=SC2030 # read by remote_kill_session below, but
+  # that cross-function global dependency isn't visible statically.
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2329 # invoked indirectly, by remote_kill_session.
+  ssh() {
+    printf '%s\n' "$@" > "$BATS_TEST_TMPDIR/args"
+    cat > "$BATS_TEST_TMPDIR/stdin"
+  }
+  remote_kill_session 'pair-1-x; touch /tmp/pwn'
+  run cat "$BATS_TEST_TMPDIR/args"
+  [[ "$output" != *';'* ]]
+  [[ "$output" != *'touch'* ]]
+  decoded="$(grep -o 'echo [A-Za-z0-9+/=]*' "$BATS_TEST_TMPDIR/stdin" | awk '{print $2}' | base64 -d)"
+  [ "$decoded" = 'pair-1-x; touch /tmp/pwn' ]
+}
+
+@test "remote_kill_session: also removes the session's own launch script(s)" {
+  # Regression test: nothing ever cleaned up a session's /tmp launch
+  # script -- killing a session BEFORE it was ever attached to (so the
+  # script's own self-delete line never ran) left the file behind
+  # indefinitely, confirmed live with over a dozen leftover scripts
+  # accumulated purely from --kill'ing test sessions during development.
+  # shellcheck disable=SC2030 # read by remote_kill_session below, but
+  # that cross-function global dependency isn't visible statically.
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2329 # invoked indirectly, by remote_kill_session.
+  ssh() { cat > "$BATS_TEST_TMPDIR/stdin"; }
+  remote_kill_session 'pair-3-devbox-example-com-foo'
+  run cat "$BATS_TEST_TMPDIR/stdin"
+  # shellcheck disable=SC2016 # intentional: checking for this literal
+  # (unexpanded) text in the captured remote script, not expanding it.
+  [[ "$output" == *'rm -f -- /tmp/codersync-"$name"-*.sh'* ]]
+}
+
+@test "remote_kill_session: skips the /tmp cleanup for a name containing a path separator" {
+  # Regression test: `name` becomes a literal path segment in the rm
+  # glob -- quoting prevents shell injection, but doesn't neutralize `/`
+  # as a path separator, so a name like this could otherwise traverse
+  # outside /tmp entirely. The session itself still gets killed
+  # (tmux kill-session is safe for any content via base64 encoding);
+  # only the path-based cleanup is skipped.
+  # shellcheck disable=SC2030 # read by remote_kill_session below, but
+  # that cross-function global dependency isn't visible statically.
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2329 # invoked indirectly, by remote_kill_session.
+  ssh() { cat > "$BATS_TEST_TMPDIR/stdin"; }
+  remote_kill_session 'pair-1-host/../../victim'
+  run cat "$BATS_TEST_TMPDIR/stdin"
+  [[ "$output" == *'tmux kill-session'* ]]
+  [[ "$output" != *'rm -f'* ]]
+}
+
 # --- random_suffix --------------------------------------------------------
 
 @test "random_suffix: produces a non-empty alphanumeric string" {
@@ -124,6 +201,80 @@ setup() {
   [ "$(next_session_id)" = "3" ]
 }
 
+@test "next_session_id: resets to 1 with a warning on a non-numeric file" {
+  # Regression test: bash arithmetic on a non-numeric value (e.g. from a
+  # hand-edited or truncated-mid-write file) used to be a fatal error
+  # under `set -e`, crashing the whole invocation.
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  printf 'abc' > "$NEXT_ID_FILE"
+  run next_session_id
+  [ "$status" -eq 0 ]
+  [ "$output" = "codersync: ${NEXT_ID_FILE} contained an invalid value ('abc') -- resetting the session-ID counter to 1.
+1" ]
+}
+
+@test "next_session_id: resets to 1 on a negative value instead of producing a negative ID" {
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  printf -- '-1' > "$NEXT_ID_FILE"
+  result="$(next_session_id 2>/dev/null)"
+  [ "$result" = "1" ]
+}
+
+@test "next_session_id: resets to 1 instead of emitting ID 0" {
+  # Regression test: 0 passed the "non-negative integer" check, so a
+  # next_id file containing "0" emitted session ID 0 -- IDs are
+  # documented (and expected by --list-all/--kill) as starting at 1.
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  printf '0' > "$NEXT_ID_FILE"
+  result="$(next_session_id 2>/dev/null)"
+  [ "$result" = "1" ]
+}
+
+@test "next_session_id: a leading-zero value doesn't crash on bash's octal parsing" {
+  # Regression test: bash arithmetic treats a leading-zero numeral as
+  # octal -- "08"/"09" are a hard crash under `set -e` (8/9 aren't valid
+  # octal digits), which this exact value used to trigger.
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  printf '08' > "$NEXT_ID_FILE"
+  run next_session_id
+  [ "$status" -eq 0 ]
+  [ "$output" = "8" ]
+}
+
+@test "next_session_id: canonicalizes a leading-zero value instead of silently misreading it as octal" {
+  # "010" is valid octal (== decimal 8) -- without the 10# fix, this
+  # silently returned/persisted the wrong number instead of erroring.
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  printf '010' > "$NEXT_ID_FILE"
+  [ "$(next_session_id)" = "10" ]
+  [ "$(cat "$NEXT_ID_FILE")" = "11" ]
+}
+
+@test "next_session_id: resets to 1 on a value that would overflow 64-bit arithmetic" {
+  # Regression test: bash integers are signed 64-bit -- a value with way
+  # more digits than any real ID used to wrap to a large negative number
+  # instead of erroring (confirmed live with a 44-digit value), and even
+  # the 64-bit max itself wrapped to a negative number on the `+1` below.
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  printf '999999999999999999999999999999999999999999' > "$NEXT_ID_FILE"
+  result="$(next_session_id 2>/dev/null)"
+  [ "$result" = "1" ]
+}
+
+@test "next_session_id: resets to 1 on the 64-bit signed max instead of wrapping negative" {
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  printf '9223372036854775807' > "$NEXT_ID_FILE"
+  result="$(next_session_id 2>/dev/null)"
+  [ "$result" = "1" ]
+}
+
 @test "parse_numbered_session: extracts a leading numeric ID" {
   parse_numbered_session "claude-" "claude-3-devbox-example-com-foo"
   [ "$PARSED_ID" = "3" ]
@@ -134,6 +285,31 @@ setup() {
   parse_numbered_session "claude-" "claude-devbox-review-alex-8349"
   [ "$PARSED_ID" = "" ]
   [ "$PARSED_REST" = "devbox-review-alex-8349" ]
+}
+
+@test "parse_numbered_session: canonicalizes a leading-zero ID instead of crashing on octal" {
+  # Regression test: a live tmux session literally named
+  # "pair-08-host-foo" used to reach printf '%06d' with the raw "08" and
+  # crash there ("08: invalid octal number") -- PARSED_ID must be the
+  # canonical decimal form.
+  parse_numbered_session "pair-" "pair-08-host-foo"
+  [ "$PARSED_ID" = "8" ]
+  [ "$PARSED_REST" = "host-foo" ]
+}
+
+@test "parse_numbered_session: treats a pathologically long ID segment as no ID at all" {
+  # Regression test: a 21-digit ID used to reach printf '%06d' as-is and
+  # crash ("Result too large") -- an ID this broken should be treated
+  # the same as a legacy session with no ID, not crash downstream.
+  parse_numbered_session "pair-" "pair-123456789012345678901-host-foo"
+  [ "$PARSED_ID" = "" ]
+  [ "$PARSED_REST" = "123456789012345678901-host-foo" ]
+}
+
+@test "parse_numbered_session: treats a zero ID segment as no ID at all" {
+  parse_numbered_session "pair-" "pair-0-host-foo"
+  [ "$PARSED_ID" = "" ]
+  [ "$PARSED_REST" = "0-host-foo" ]
 }
 
 @test "find_or_assign_id: allocates a fresh ID when nothing matches" {
@@ -157,6 +333,18 @@ setup() {
   NEXT_ID_FILE="$CONFIG_DIR/next_id"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'some-other-box\t5-devbox-example-com-foo\n' > "$REGISTRY"
+  [ "$(find_or_assign_id "devbox.example.com" "devbox-example-com-foo")" = "1" ]
+}
+
+@test "find_or_assign_id: mints a fresh ID instead of reusing a poisoned registry entry" {
+  # Regression test: a registry entry with a broken ID segment (leading
+  # zero beyond what canonicalizes sanely, or literally 0) used to be
+  # reused verbatim -- next_session_id itself would never assign such a
+  # value, so returning it here let it right back out as a real ID.
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t0-devbox-example-com-foo\n' > "$REGISTRY"
   [ "$(find_or_assign_id "devbox.example.com" "devbox-example-com-foo")" = "1" ]
 }
 
@@ -192,6 +380,131 @@ setup() {
   run parse_kill_spec 'abc'
   [ "$status" -eq 1 ]
   [[ "$output" == *"Invalid --kill token"* ]]
+}
+
+@test "parse_kill_spec: accepts a range right at the max size" {
+  result="$(parse_kill_spec '1-1000' | wc -l | tr -d ' ')"
+  [ "$result" = "1000" ]
+}
+
+@test "parse_kill_spec: rejects a range that's too large instead of expanding it" {
+  # Regression test: a huge range (e.g. a typo like "1-999999999") used
+  # to be expanded into an in-memory array one ID at a time before any
+  # remote work even started, which could hang or exhaust memory locally.
+  run parse_kill_spec '1-999999999'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"spans more than"* ]]
+}
+
+@test "parse_kill_spec: a leading-zero range doesn't crash on bash's octal parsing" {
+  # Regression test: bash arithmetic treats a leading-zero numeral as
+  # octal -- "08"/"09" are a hard crash (8/9 aren't valid octal digits),
+  # which this exact range used to trigger with no IDs parsed at all.
+  result="$(parse_kill_spec '08-09' | tr '\n' ',')"
+  [ "$result" = "8,9," ]
+}
+
+@test "parse_kill_spec: canonicalizes a leading-zero single value" {
+  result="$(parse_kill_spec '08')"
+  [ "$result" = "8" ]
+}
+
+@test "parse_kill_spec: rejects ID 0 as a single value" {
+  # Regression test: "0" (and "000", after leading-zero canonicalization)
+  # used to pass through as a real ID, even though next_session_id never
+  # assigns 0 -- IDs are documented as starting at 1.
+  run parse_kill_spec '0'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"IDs start at 1"* ]]
+}
+
+@test "parse_kill_spec: rejects a range that includes 0" {
+  run parse_kill_spec '0-1'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"IDs start at 1"* ]]
+}
+
+# --- load_config ----------------------------------------------------------
+
+@test "load_config: accepts a valid config" {
+  CONFIG_FILE="$BATS_TEST_TMPDIR/config"
+  printf 'SSH_TARGET=devbox.example.com\nREMOTE_DIR=~/repos\n' > "$CONFIG_FILE"
+  load_config
+  # shellcheck disable=SC2031 # set by load_config's `source`, not
+  # visible to shellcheck's static analysis.
+  [ "$SSH_TARGET" = "devbox.example.com" ]
+}
+
+@test "load_config: rejects a config with an unsafe SSH_TARGET" {
+  # Regression test: SSH_TARGET/REMOTE_DIR used to be trusted unchecked
+  # after sourcing, so a hand-edited or pre-validation-era config value
+  # like this (quoted here so *sourcing* it is safe -- the point is that
+  # its CONTENT is unsafe once spliced unquoted into remote heredocs
+  # further down, confirmed live) used to flow straight through.
+  CONFIG_FILE="$BATS_TEST_TMPDIR/config"
+  printf "SSH_TARGET='x; touch /tmp/pwn'\nREMOTE_DIR=~/repos\n" > "$CONFIG_FILE"
+  run load_config
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"invalid SSH_TARGET"* ]]
+}
+
+@test "load_config: rejects a config with an unsafe REMOTE_DIR" {
+  CONFIG_FILE="$BATS_TEST_TMPDIR/config"
+  printf "SSH_TARGET=devbox.example.com\nREMOTE_DIR='x; touch /tmp/pwn'\n" > "$CONFIG_FILE"
+  run load_config
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"invalid REMOTE_DIR"* ]]
+}
+
+@test "load_config: never executes config content, even when rejecting it" {
+  # Regression test: load_config used to `source` the file before
+  # validating anything, so a line like this one ran immediately as a
+  # real shell command -- confirmed live -- even though the resulting
+  # (empty) SSH_TARGET was correctly rejected right after. Reading the
+  # file with plain `read`/regex instead of `source` means a line that
+  # doesn't match either expected key is just rejected outright, never
+  # executed.
+  CONFIG_FILE="$BATS_TEST_TMPDIR/config"
+  marker="$BATS_TEST_TMPDIR/executed"
+  printf 'SSH_TARGET=devbox.example.com\ntouch %s\n' "$marker" > "$CONFIG_FILE"
+  run load_config
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"unrecognized line"* ]]
+  [ ! -e "$marker" ]
+}
+
+@test "load_config: recovers the literal REMOTE_DIR value, undoing setup()'s %q tilde-escape" {
+  CONFIG_FILE="$BATS_TEST_TMPDIR/config"
+  # shellcheck disable=SC2088 # intentional: testing the literal string.
+  printf 'SSH_TARGET=devbox.example.com\nREMOTE_DIR=%s\n' "$(printf '%q' '~/repos')" > "$CONFIG_FILE"
+  load_config
+  # shellcheck disable=SC2031,SC2088 # SC2031: set by load_config above,
+  # not visible statically to this checker. SC2088: intentional literal.
+  [ "$REMOTE_DIR" = "~/repos" ]
+}
+
+@test "load_config: accepts a legacy single-quoted SSH_TARGET without forcing --setup again" {
+  # Regression test: setup() used to always wrap the value in a literal
+  # pair of single quotes (SSH_TARGET='devbox.example.com') before %q-quoting
+  # was introduced. Without stripping that one legacy quote pair, an
+  # existing config from that version breaks on upgrade even though the
+  # underlying value was always valid.
+  CONFIG_FILE="$BATS_TEST_TMPDIR/config"
+  printf "SSH_TARGET='devbox.example.com'\nREMOTE_DIR=~/repos\n" > "$CONFIG_FILE"
+  load_config
+  # shellcheck disable=SC2031 # set by load_config above, not visible
+  # statically to this checker.
+  [ "$SSH_TARGET" = "devbox.example.com" ]
+}
+
+@test "load_config: accepts a legacy single-quoted REMOTE_DIR without forcing --setup again" {
+  CONFIG_FILE="$BATS_TEST_TMPDIR/config"
+  # shellcheck disable=SC2088 # intentional: testing the literal string.
+  printf "SSH_TARGET=devbox.example.com\nREMOTE_DIR='~/repos'\n" > "$CONFIG_FILE"
+  load_config
+  # shellcheck disable=SC2031,SC2088 # SC2031: set by load_config above,
+  # not visible statically to this checker. SC2088: intentional literal.
+  [ "$REMOTE_DIR" = "~/repos" ]
 }
 
 # --- sanitize_label -------------------------------------------------------
@@ -318,6 +631,15 @@ setup() {
   [[ "$output" == *"Invalid session name"* ]]
 }
 
+@test "parse_run_args: rejects an option-like first argument instead of treating it as a session name" {
+  # Regression test: `codersync --typo` (or `--safe-mode` with its
+  # session-name argument left off by mistake) used to be silently
+  # accepted as a literal session name named "--typo".
+  run parse_run_args "--typo"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Invalid session name"* ]]
+}
+
 # --- input validation (session-name/remote-dir/ssh-target injection) ----
 
 @test "validate_session_name: accepts letters, digits, dash, underscore" {
@@ -336,6 +658,18 @@ setup() {
   run ! validate_session_name "my session"
 }
 
+@test "validate_session_name: rejects a leading dash" {
+  # Regression test: without this, `codersync --typo` or `codersync
+  # --safe-mode` (missing its session-name argument) fell through the
+  # dispatch's unrecognized-flag cases and got silently treated as a
+  # literal session name instead of erroring.
+  run ! validate_session_name "--typo"
+}
+
+@test "validate_session_name: still accepts a dash later in the name" {
+  validate_session_name "my-feature"
+}
+
 @test "validate_remote_dir: accepts a normal path" {
   # shellcheck disable=SC2088 # intentional: testing the literal string
   # "~/repos", not asking the test shell to expand it.
@@ -345,6 +679,22 @@ setup() {
 @test "validate_remote_dir: rejects shell metacharacters" {
   # shellcheck disable=SC2088 # intentional: testing the literal string.
   run ! validate_remote_dir '~/repos; rm -rf /'
+}
+
+@test "validate_remote_dir: rejects a leading dash" {
+  # Regression test: a value like "-", "-P", or "--" passed the flat
+  # character check, then reached `cd \${remote_dir}` unquoted in
+  # setup()'s existence check, where a leading dash is read by `cd`
+  # itself as an OPTION rather than a literal directory -- so the check
+  # could report success without ever proving anything about a real path.
+  run ! validate_remote_dir '-'
+  run ! validate_remote_dir '-P'
+  run ! validate_remote_dir '--'
+}
+
+@test "validate_remote_dir: still accepts a dash later in the path" {
+  # shellcheck disable=SC2088 # intentional: testing the literal string.
+  validate_remote_dir '~/my-project-dir'
 }
 
 @test "validate_ssh_target: accepts a plain hostname" {
@@ -357,6 +707,28 @@ setup() {
 
 @test "validate_ssh_target: rejects shell metacharacters" {
   run ! validate_ssh_target 'devbox.example.com; rm -rf /'
+}
+
+@test "validate_ssh_target: rejects a leading dash (ssh/scp can read it as an option)" {
+  # Regression test: a flat character-class check let a value like "-oX"
+  # or "-V" through -- these later reach ssh unquoted, where a leading
+  # dash is interpreted as an OPTION rather than a hostname.
+  run ! validate_ssh_target '-V'
+  run ! validate_ssh_target '-vvv'
+  run ! validate_ssh_target '-'
+}
+
+@test "validate_ssh_target: rejects a bare @ or all-dots value" {
+  run ! validate_ssh_target '@'
+  run ! validate_ssh_target '...'
+}
+
+@test "validate_ssh_target: rejects a doubled @ (two user@ prefixes)" {
+  run ! validate_ssh_target 'user@@host'
+}
+
+@test "validate_ssh_target: accepts an IP address" {
+  validate_ssh_target '192.168.1.1'
 }
 
 # --- iterm2_available / open_tab_tmux_mode fallback ---------------------
@@ -387,4 +759,309 @@ setup() {
   parse_registry_line "my-session"
   [ "$ENTRY_TARGET" = "devbox.example.com" ]
   [ "$ENTRY_NAME" = "my-session" ]
+}
+
+# --- restore_all: unsafe-entry defense --------------------------------
+
+@test "restore_all: drops a poisoned-ID entry instead of restoring it" {
+  # Regression test: an entry like "0-devbox-example-com-foo" passes
+  # validate_session_name (every character is allowed) but has a
+  # digit-shaped first segment that fails canonicalization (0 is never
+  # a valid ID) -- the same poisoned shape session_is_owned() already
+  # rejects for --list-all/--kill/--kill-all. restore_all had its own,
+  # separate gating logic that never applied that check, so this entry
+  # was rejected everywhere else but still restored here -- confirmed
+  # live, it called remote_setup_tmux_mode with "0-devbox-example-com-foo"
+  # outright. The live session list below deliberately includes a
+  # matching "pair-0-devbox-example-com-foo" (reproducing the exact scenario
+  # that made restore_all think there was something to restore); any
+  # ssh call OTHER than the initial list-sessions one -- i.e.
+  # remote_setup_tmux_mode actually trying to (re)create it -- gets
+  # recorded, so the test can confirm that never happens.
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t0-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all below.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'pair-0-devbox-example-com-foo\n'
+      return 0
+    fi
+    echo "unexpected: $*" >> "$BATS_TEST_TMPDIR/unexpected_ssh_calls"
+  }
+  run restore_all
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Skipping unsafe registry entry"* ]]
+  [[ "$output" == *"0-devbox-example-com-foo"* ]]
+  [[ "$output" == *"Dropped 1 unsafe registry entry"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
+  [ ! -s "$REGISTRY" ]
+}
+
+@test "restore_all: drops an unsafe registry entry instead of restoring it" {
+  # Regression test: entry_name gets spliced unquoted into a remote bash
+  # heredoc by remote_setup/remote_setup_tmux_mode -- a registry entry
+  # like this one (hand-edited, or left over from a pre-validation
+  # version of this script) used to flow straight through and execute on
+  # the remote box (confirmed live). ssh is stubbed to a no-op: if this
+  # entry were treated as safe, remote_setup would call it, so an empty
+  # stub proves it never reaches that point.
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\tpair-x; touch /tmp/pwn\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all below.
+  ssh() { :; }
+  run restore_all
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Skipping unsafe registry entry"* ]]
+  [[ "$output" == *"Dropped 1 unsafe registry entry"* ]]
+  [ ! -s "$REGISTRY" ]
+}
+
+# --- session_is_owned / unrelated-session sweep defense ----------------
+
+@test "session_is_owned: true when a no-ID rest has a matching registry entry" {
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\tdevbox-review-sam-1746\n' > "$REGISTRY"
+  session_is_owned "" "devbox-review-sam-1746"
+}
+
+@test "session_is_owned: false for a no-ID rest with no matching entry" {
+  # This is the crux of the original fix: a bare prefix (claude-/codex-/
+  # pair-) alone is also just an ordinary tmux session name someone
+  # might use for something unrelated -- "pair-programming" or
+  # "claude-notes" are not codersync's, and shouldn't be treated as such
+  # just because they happen to start with a recognized prefix.
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\tdevbox-review-sam-1746\n' > "$REGISTRY"
+  run ! session_is_owned "" "programming"
+}
+
+@test "session_is_owned: false for an entry belonging to a different target" {
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'some-other-box\tprogramming\n' > "$REGISTRY"
+  run ! session_is_owned "" "programming"
+}
+
+@test "session_is_owned: skips a poisoned entry instead of authorizing a matching broken session" {
+  # Regression test: an entry like "0-host-foo" has a digit-shaped first
+  # segment that fails canonicalization (0 is never a valid ID) -- this
+  # used to fall through to matching its raw, un-split text as if it
+  # were an ordinary legacy rest, so a live session with that exact
+  # broken shape ("pair-0-host-foo") got authorized purely because a
+  # registry entry happened to share the same broken shape.
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t0-host-foo\n' > "$REGISTRY"
+  run ! session_is_owned "" "0-host-foo"
+}
+
+@test "session_is_owned: an IDed session needs a matching registry entry, not just a plausible-looking rest" {
+  # Regression test: this used to be trusted by naming shape alone --
+  # first "a prefix plus any valid ID" (confirmed live: an unrelated
+  # session literally named "pair-1-not-codersync" was still
+  # listed/killed), then "a prefix plus a valid ID AND a rest starting
+  # with the target's label" (confirmed live again: for a target
+  # labeled e.g. "host", "pair-1-host-unregistered" still matched --
+  # common target labels make that prefix trivial to collide with by
+  # accident). Only a real, exact registry entry counts now.
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-host-registered\n' > "$REGISTRY"
+  run ! session_is_owned "1" "host-unregistered"
+}
+
+@test "session_is_owned: true for an IDed session with a matching registry entry" {
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
+  session_is_owned "1" "devbox-example-com-foo"
+}
+
+@test "session_is_owned: an ID must match the entry's own ID too, not just the rest" {
+  # A registry entry's rest matching isn't enough on its own -- the ID
+  # has to match too, otherwise a valid-but-different-id entry could
+  # authorize a session under the wrong id.
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t2-devbox-example-com-foo\n' > "$REGISTRY"
+  run ! session_is_owned "1" "devbox-example-com-foo"
+}
+
+@test "kill_all_sessions: does not sweep in an unrelated session with a matching prefix" {
+  # Regression test: --kill-all used to treat ANY live session starting
+  # with claude-/codex-/pair- as codersync-owned. Verified live: a
+  # stubbed remote session list containing "pair-programming" and
+  # "claude-notes" (neither registered, neither ID-shaped) got offered
+  # and killed by --kill-all as if they were real codersync sessions.
+  # "pair-3-devbox-example-com-foo" has an ID but is also NOT registered here --
+  # confirmed live, an unrelated but ID-shaped session used to be swept
+  # in too, before ownership required full registry-backing. Answers
+  # "n" at the confirmation prompt -- this test only needs to check
+  # what's OFFERED (the printed list), not actually kill anything.
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by kill_all_sessions.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'pair-programming\nclaude-notes\npair-3-devbox-example-com-foo\n'
+    fi
+  }
+  run kill_all_sessions <<<"n"
+  [[ "$output" != *"pair-programming"* ]]
+  [[ "$output" != *"claude-notes"* ]]
+  [[ "$output" != *"pair-3-devbox-example-com-foo"* ]]
+}
+
+@test "kill_all_sessions: still includes a registry-backed IDed session" {
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t3-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by kill_all_sessions.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'pair-3-devbox-example-com-foo\n'
+    fi
+  }
+  run kill_all_sessions <<<"n"
+  [[ "$output" == *"pair-3-devbox-example-com-foo"* ]]
+}
+
+@test "kill_all_sessions: still includes a registry-backed legacy session" {
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\tprogramming\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by kill_all_sessions.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'pair-programming\n'
+    fi
+  }
+  run kill_all_sessions <<<"n"
+  [[ "$output" == *"pair-programming"* ]]
+}
+
+@test "kill_sessions: does not kill an unrelated session sharing the requested ID" {
+  # Regression test: --kill <id> matched ANY live session with that
+  # exact numeric ID, regardless of whether it was ever registered --
+  # confirmed live, an unrelated session literally named
+  # "pair-1-not-codersync" was killed by `--kill 1`.
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by kill_sessions.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'pair-1-not-codersync\n'
+    fi
+  }
+  run kill_sessions "1"
+  [[ "$output" == *"no session found for ID 1"* ]]
+  [[ "$output" != *"Killing"* ]]
+}
+
+@test "kill_sessions: does not kill an ID-shaped session with no matching registry entry" {
+  # Same as above, but with a rest that LOOKS plausible for the current
+  # target (used to pass an earlier, looser version of this check that
+  # only required the rest to start with the target's label) -- still
+  # not owned without an actual registry entry to back it.
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by kill_sessions.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'pair-1-devbox-example-com-unregistered\n'
+    fi
+  }
+  run kill_sessions "1"
+  [[ "$output" == *"no session found for ID 1"* ]]
+  [[ "$output" != *"Killing"* ]]
+}
+
+@test "kill_sessions: still kills a session with a matching registry entry" {
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by kill_sessions.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'pair-1-devbox-example-com-foo\n'
+    fi
+  }
+  run kill_sessions "1"
+  [[ "$output" == *"Killing: pair-1-devbox-example-com-foo"* ]]
+}
+
+@test "kill_sessions: removes a non-canonical registry entry, not a reconstructed raw string" {
+  # Regression test: cleanup used to reconstruct the registry key as
+  # "${id}-${rest}" (e.g. "8-devbox-example-com-foo", using the CANONICAL id)
+  # and grep for that exact text -- but the on-disk registry entry for a
+  # leading-zero live session is still literally "08-devbox-example-com-foo",
+  # so the reconstructed string never matched it and the stale entry
+  # was left behind after every kill (confirmed live). Entries are now
+  # compared by their own PARSED (id, rest), not a reconstructed string.
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t08-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by kill_sessions.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'pair-08-devbox-example-com-foo\n'
+    fi
+  }
+  kill_sessions "8" >/dev/null
+  [ ! -s "$REGISTRY" ]
+}
+
+@test "kill_sessions: matches a live leading-zero ID that --list-all would show as canonical" {
+  # Regression test: a live session literally named "pair-08-host-foo"
+  # canonicalizes to ID 8 in --list-all, but kill_sessions used to
+  # pre-grep the live list for the literal text "-8-", which never
+  # matches "-08-" -- so --kill 8 (or --kill 08, which canonicalizes to
+  # the same request) reported "no session found" for something
+  # --list-all had just shown as killable. Candidates are now found by
+  # parsing/canonicalizing every live session instead.
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t08-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by kill_sessions.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'pair-08-devbox-example-com-foo\n'
+    fi
+  }
+  run kill_sessions "8"
+  [[ "$output" == *"Killing: pair-08-devbox-example-com-foo"* ]]
+}
+
+# --- dispatch: rejects unexpected trailing arguments -------------------
+
+@test "dispatch: --setup rejects extra trailing arguments" {
+  # Regression test: `codersync --setup host dir extra` used to silently
+  # drop "extra" with no warning. Runs the real script as a subprocess
+  # (not sourced) since this is dispatch-level, CLI-argument-count logic,
+  # not a sourced function -- but the check happens before setup() ever
+  # runs, so this never touches the network or any real config.
+  run "${BATS_TEST_DIRNAME}/../codersync" --setup host dir extra
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
+}
+
+@test "dispatch: --restore-all rejects extra trailing arguments" {
+  # Same as --setup above -- checked before load_config, so this never
+  # touches the network or any real config either.
+  run "${BATS_TEST_DIRNAME}/../codersync" --restore-all extra
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
+}
+
+@test "dispatch: --list-all rejects extra trailing arguments" {
+  run "${BATS_TEST_DIRNAME}/../codersync" --list-all extra
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
 }

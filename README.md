@@ -44,13 +44,13 @@ prompts. `codersync` exists to make all of that a non-issue.
   clears every codersync session on the box in one go (with a
   confirmation prompt first).
 - **Works with any SSH-reachable box** — not tied to any specific
-  cloud-dev provider. If you can `ssh` into it and it has `tmux`, it
-  works.
+  cloud-dev provider. If you can `ssh` into it and it has `tmux`,
+  `bash`, and `base64`, it works.
 - **Any two CLI agents, not just two** — `--tools` picks which two CLI
   agents run left/right, including the same one twice.
 - **One-time setup, not per-run configuration** — `codersync --setup`
-  validates connectivity and `tmux` availability once; every later
-  invocation just works.
+  validates connectivity, `tmux`/`bash`/`base64` availability, and that
+  the remote directory exists, once; every later invocation just works.
 - **Two split strategies** — split server-side in `tmux` (default; opens
   the tab automatically with iTerm2, or just prints the attach command
   when it's not installed, so the remote side works with any terminal
@@ -64,7 +64,8 @@ prompts. `codersync` exists to make all of that a non-issue.
 ## Prerequisites
 
 - A box reachable over `ssh` (any hostname, `user@host`, or an alias
-  from your own `~/.ssh/config`) with `tmux` installed.
+  from your own `~/.ssh/config`) with `tmux`, `bash`, and `base64`
+  installed. `--setup` checks all three before saving anything.
 - At least one CLI coding agent installed on that box (see
   [Supported tools](#supported-tools) below).
 - macOS, for the local side. `--split-mode tmux` (default) uses iTerm2's
@@ -112,17 +113,27 @@ codersync --help
 
 ### `codersync --setup <ssh-target> [remote-dir]`
 
-One-time setup. `<ssh-target>` is anything you'd pass to `ssh` directly —
-a plain hostname, `user@host`, or an alias from your own `~/.ssh/config`.
-`[remote-dir]` is where the agents start (default: `~/repos`).
+One-time setup. `<ssh-target>` is a plain hostname, `user@host`, or an
+alias from your own `~/.ssh/config` — restricted to letters, digits, and
+`. _ - @` (this is deliberately narrower than everything `ssh` itself
+accepts: it's what gets safely embedded into remote commands and tab
+titles). Forms like `host:2222` or a bracketed IPv6 address aren't
+accepted directly — put those in a `~/.ssh/config` `Host` alias instead
+and pass the alias here. `[remote-dir]` is where the agents start
+(default: `~/repos`).
 
-Setup checks the box is reachable over SSH and has `tmux` installed
-*before* saving anything. `codersync` has no dependency on any specific
-remote/cloud-dev provider — any box reachable over plain SSH with `tmux`
-works. As an optional convenience, if `<ssh-target>` matches the alias
-pattern used by the [Coder](https://coder.com) platform (`coder.*`) and
-its CLI is installed locally, setup will also offer to run `coder
-config-ssh` for you if that alias doesn't exist yet.
+Setup checks the box is reachable over SSH, has `tmux`, `bash`, and
+`base64` installed, and that `[remote-dir]` actually exists there —
+*before* saving anything (a typo'd path won't fail loudly later:
+`tmux` silently falls back to a default directory instead of erroring
+on a bad one, so this is the only place that catches it). `codersync`
+has no dependency on any specific remote/cloud-dev provider — any box
+reachable over plain SSH with those three tools works. As an optional
+convenience, if
+`<ssh-target>` matches the alias pattern used by the
+[Coder](https://coder.com) platform (`coder.*`) and its CLI is
+installed locally, setup will also offer to run `coder config-ssh` for
+you if that alias doesn't exist yet.
 
 Config lives at `~/.config/codersync/config`.
 
@@ -157,7 +168,8 @@ automatically.
 
 ### `codersync --list-all`
 
-Lists every codersync session still alive on the remote box, with its
+Lists every codersync session still alive on the remote box AND
+recorded in your local registry (`~/.codersync_sessions`), with its
 numeric ID and split mode:
 
 ```
@@ -166,9 +178,16 @@ ID     MODE     SESSION
 2      iterm    devbox-example-com-another-task
 ```
 
-This talks directly to the remote `tmux` server, so it reflects reality
-even if the local registry is stale or you're on a different machine
-than the one that created the sessions.
+This talks directly to the remote `tmux` server, so a session that's
+died (killed outside codersync, the box rebooted) correctly drops off
+the list even if its registry entry is still there. Both checks are
+required, though: a session that's alive on the box but missing from
+*this* registry — because you're on a different machine than the one
+that created it, or the registry was cleared — won't show up here.
+Its tmux session itself is completely unaffected; there's currently no
+built-in command to re-adopt it into the registry, so reattach to it
+directly with `ssh <ssh-target> -- tmux attach -t <session-name>`
+(get the exact name with `ssh <ssh-target> -- tmux list-sessions`).
 
 ### `codersync --kill <ids>`
 
