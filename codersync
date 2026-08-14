@@ -1,0 +1,622 @@
+#!/usr/bin/env bash
+# Usage: codersync --setup <ssh-target> [remote-dir]
+#        codersync <session-name> [--split-mode iterm|tmux] [--tools t1,t2] [--safe-mode]
+#        codersync --restore-all
+#
+# One-time setup: `codersync --setup <ssh-target> [remote-dir]` records
+# which remote box to use.
+#   <ssh-target>  anything you'd pass to `ssh` directly -- a plain
+#                 hostname, `user@host`, or an alias from your own
+#                 ~/.ssh/config. This also becomes the label used to
+#                 prefix session names (see below) -- any `@`, `:`, `.`,
+#                 or `/` in it are replaced with `-`, since tmux's own
+#                 -t target syntax uses `.` (and `:`) as separators and
+#                 a literal one in a session name breaks lookups.
+#   [remote-dir]  where claude/codex start (default: ~/repos)
+# Setup checks the box is reachable over SSH and has tmux installed
+# before saving anything. Config lives at ~/.config/codersync/config.
+#
+# codersync has no dependency on any specific remote/cloud-dev provider
+# -- it works with any box reachable over plain SSH that has tmux. As an
+# optional convenience, if <ssh-target> matches the alias pattern used by
+# the Coder platform (coder.com) -- `coder.*` -- and its CLI is installed
+# locally, setup will offer to run `coder config-ssh` for you first, in
+# case that alias doesn't exist yet (you'll be asked to confirm).
+#
+# Normal usage: `codersync <session-name>` opens a NEW iTerm2 tab and does
+# all its work there, leaving whatever tab you ran it from untouched. The
+# configured ssh-target (sanitized as above) is folded into the session
+# name by default (e.g. `codersync foo` on target `devbox.example.com`
+# becomes session `devbox-example-com-foo`), so names/tabs/tmux sessions
+# stay unambiguous if you use codersync against more than one box.
+#
+# By default (`--split-mode tmux`), this creates ONE tmux session
+# (`pair-<session-name>`) with claude/codex as two panes split
+# server-side (`tmux split-window`) -- both left as plain idle shells at
+# creation, only started AFTER a real client attaches (see below). The
+# local side then only needs to open a tab and run a single attach
+# command -- no local split at all -- so this works from any terminal
+# with plain tmux, no iTerm2 dependency.
+#
+# `--split-mode iterm` is the alternative: two separate tmux sessions
+# (`claude-<session-name>`, `codex-<session-name>`) instead of one,
+# split locally by iTerm2 rather than server-side by tmux. Lets you
+# attach to just claude or just codex independently from elsewhere,
+# but requires iTerm2. Uses iTerm2's native scripting API (`write text`
+# on a specific session reference) instead of simulated keystrokes: it's
+# synchronous and targets an exact pane, so there's no split/resize
+# timing to race and no Accessibility permission needed (just a one-time
+# Automation-permission prompt for controlling iTerm2).
+#
+# `--tools t1,t2` overrides which two CLI agents run left/right (default:
+# `claude,codex`). Each of t1/t2 is either a known short key (`claude`,
+# `codex`, `agy`, `aider`, `kimi` -- these auto-append that tool's
+# skip-approval flag, see resolve_tool()) or, if unrecognized, a literal
+# command run as-is -- so any CLI agent works even without a short key,
+# e.g. `--tools claude,'some-other-agent --whatever-flag'`, as long as
+# you give the exact command including its own skip-approval flag. Same
+# tool twice also works, e.g. `--tools claude,claude`.
+#
+# `--safe-mode` drops the auto-approve flag for known keys (claude,
+# codex, agy, aider, kimi), so normal permission prompts apply instead.
+# Only affects known keys -- for a raw/literal --tools command, just
+# don't include a skip-approval flag in it yourself.
+#
+# Both sessions are left idle at creation (not started with the tool
+# already running) because tmux creates detached sessions at its
+# default-size (80x24) before any client attaches. If the tool's TUI does
+# its first render at that size and then gets resized on attach, the
+# resize/redraw can come out visually broken. Starting each tool only
+# after its pane has attached and settled at its real size avoids that
+# resize-during-startup path entirely.
+#
+# Rather than guessing a fixed delay between "attach" and "start the
+# tool", a tmux `client-attached` hook fires the launch at the exact
+# moment a real client attaches, then removes itself so later reattaches
+# don't relaunch the tool on top of an already-running session.
+#
+# Note for anyone using the Coder platform (coder.com) specifically:
+# prefer routing through a real OpenSSH alias (from `coder config-ssh`)
+# rather than wrapping `coder ssh <box>` directly. `coder ssh` has its own pty
+# implementation that reports a fixed, wrong terminal size (128x128) to
+# the remote host regardless of the real pane size; real OpenSSH's
+# pty/window-size negotiation doesn't have that problem.
+#
+# Each pane's attach command runs in a `while true` retry loop, so if the
+# SSH connection drops for any reason -- laptop sleep, wifi blip, VPN
+# reconnect -- it automatically reattaches a couple seconds after the
+# connection is back, picking back up the same tmux session (and its
+# full scrollback/state) with no manual intervention.
+#
+# Every session name is appended to a local registry
+# (~/.codersync_sessions) the first time it's used. `codersync
+# --restore-all` reads that registry, checks which of those tmux sessions
+# are still actually alive on the box (pruning any that aren't from the
+# registry), and reopens an iTerm2 tab for each survivor -- meant for
+# recovering after iTerm2 gets closed: nothing on the box was ever lost,
+# this just recreates the local tabs.
+#
+# NOTE ssh gotcha worth knowing if you touch this script: passing a
+# remote command to ssh as multiple separate arguments makes ssh rejoin
+# them with plain spaces before the remote shell sees them, so any piece
+# that relies on its own quoting (e.g. a tmux format string starting with
+# `#`) loses that quoting in transit and gets mangled (`#` gets parsed as
+# a shell comment remotely). Always pass such remote commands as ONE
+# pre-quoted string argument instead.
+#
+# Requires: tmux on the remote box. iTerm2 is only required for
+# `--split-mode iterm`. `coder` CLI is only used opportunistically during
+# setup, if applicable -- see above.
+
+set -euo pipefail
+
+CONFIG_DIR="$HOME/.config/codersync"
+CONFIG_FILE="$CONFIG_DIR/config"
+REGISTRY="$HOME/.codersync_sessions"
+
+setup() {
+  local target="${1:-}"
+  local remote_dir="${2:-~/repos}"
+
+  if [[ -z "$target" ]]; then
+    echo "Usage: codersync --setup <ssh-target> [remote-dir]" >&2
+    exit 1
+  fi
+
+  if [[ "$target" == coder.* ]] && command -v coder >/dev/null 2>&1; then
+    if ! grep -q '^Host coder\.' "$HOME/.ssh/config" 2>/dev/null; then
+      echo "${target} looks like a coder workspace alias -- running 'coder config-ssh' to set up the proxy (you'll be asked to confirm)."
+      coder config-ssh
+    fi
+  fi
+
+  echo "Checking connectivity to ${target}..."
+  if ! ssh -o ConnectTimeout=10 -o BatchMode=yes "$target" -- true 2>/dev/null; then
+    echo "Could not reach ${target} over SSH. Confirm the host/alias is correct and reachable." >&2
+    exit 1
+  fi
+
+  echo "Checking tmux is available on ${target}..."
+  if ! ssh "$target" -- command -v tmux >/dev/null 2>&1; then
+    echo "tmux isn't installed on ${target}. Install it there (e.g. 'sudo apt install tmux') and re-run setup." >&2
+    exit 1
+  fi
+
+  mkdir -p "$CONFIG_DIR"
+  # Single-quoted: load_config() sources this file, and bash tilde-expands
+  # an unquoted `~` in a VAR=~/path assignment even when sourced -- using
+  # *this* machine's home directory, not a literal string. That silently
+  # turned REMOTE_DIR into a local, nonexistent path on the remote box,
+  # which fell back to $HOME there without ever erroring (confirmed live).
+  {
+    echo "SSH_TARGET='${target}'"
+    echo "REMOTE_DIR='${remote_dir}'"
+  } > "$CONFIG_FILE"
+  echo "Done. codersync will use ${target} for claude-<session>/codex-<session>, starting in ${remote_dir}."
+}
+
+# Sanitizes a string for use in session/tab names. In particular, tmux's
+# -t target-string parser uses `.` as the window/pane separator, so a
+# literal dot anywhere in a session name breaks target resolution
+# unpredictably (confirmed: `claude-devbox.local-foo` got silently
+# mis-parsed down to just `local-foo`). @, :, and / are also separators
+# elsewhere (paths, host:port), so all four are swapped for `-`. Pulled
+# out as its own function so it's unit-testable in isolation.
+sanitize_label() {
+  local s="$1"
+  echo "${s//[@:.\/]/-}"
+}
+
+load_config() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "codersync isn't set up yet. Run: codersync --setup <ssh-target> [remote-dir]" >&2
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+  if [[ -z "${SSH_TARGET:-}" ]]; then
+    echo "Config at $CONFIG_FILE is incomplete. Re-run: codersync --setup <ssh-target> [remote-dir]" >&2
+    exit 1
+  fi
+  REMOTE_DIR="${REMOTE_DIR:-~/repos}"
+  TARGET_LABEL="$(sanitize_label "$SSH_TARGET")"
+}
+
+# Resolves a short tool key to its launch command, auto-appending that
+# tool's "skip approval" flag -- unless safe="1", in which case the known
+# key's base command is used with no auto-approve flag at all, so normal
+# permission prompts apply. Anything that doesn't match a known key is
+# treated as a literal command to run as-is regardless of safe -- so any
+# CLI agent works, not just the ones with a short name below (e.g.
+# `--tools claude,zai` where `zai` is whatever exact command the user
+# already knows is correct for their tool; safe mode has no way to know
+# how to strip a flag from an arbitrary command, so it's on the user to
+# just not include one). Known-key flags are sourced and verified, not
+# guessed -- see the comment above each one.
+resolve_tool() {
+  local key="$1"
+  local session="$2"
+  local safe="${3:-0}"
+  local base flag
+  case "$key" in
+    claude) base="claude -n ${session}"; flag="--dangerously-skip-permissions" ;;
+    codex)  base="codex";                flag="--dangerously-bypass-approvals-and-sandbox" ;;
+    # Gemini CLI was shut down 2026-06-18 and replaced by Antigravity CLI
+    # (binary name `agy`, not `gemini`). No --yolo equivalent exists for
+    # agy -- --dangerously-skip-permissions is the official replacement.
+    # https://developers.googleblog.com/an-important-update-transitioning-gemini-cli-to-antigravity-cli/
+    agy)    base="agy";                  flag="--dangerously-skip-permissions" ;;
+    # https://aider.chat/docs/scripting.html
+    aider)  base="aider";                flag="--yes-always" ;;
+    # https://www.codeagentswarm.com/en/guides/kimi-code-yolo-mode
+    kimi)   base="kimi";                 flag="--yolo" ;;
+    *)      echo "$key"; return ;;
+  esac
+  if [[ "$safe" == "1" ]]; then
+    echo "$base"
+  else
+    echo "$base $flag"
+  fi
+}
+
+# Escapes backslash and double-quote for embedding a string as a literal
+# inside a "..." double-quoted context (used for the AppleScript "..."
+# strings in open_tab/open_tab_tmux_mode below).
+as_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
+# Base64-encodes a string for embedding anywhere without quoting concerns
+# -- base64 output is only [A-Za-z0-9+/=], none of which are shell-special
+# in any of the nested contexts these launch commands pass through
+# (local heredoc -> remote bash -> tmux hook value -> run-shell ->
+# /bin/sh -> tmux send-keys). Used for --tools commands specifically
+# because a raw command containing its own quotes (e.g. `bash -c "echo
+# hi"`) collided with the wrapper quotes at one of those layers no matter
+# how it was escaped -- confirmed live, tmux mis-parsed it every time.
+# Writing the resolved command to a remote file and having send-keys
+# invoke that file (a plain, quote-free path) sidesteps the problem
+# entirely instead of trying to out-escape it.
+b64() { printf '%s' "$1" | base64; }
+
+# Create both detached tmux sessions on the remote box. Idempotent: if a
+# session already exists, `tmux new-session` fails for that line (`&&`
+# short-circuits so we don't re-arm the hook on top of a running tool)
+# and we just fall through to attaching to whatever is already running.
+#
+# "claude"/"codex" in the session names below are positional slot names
+# (left pane, right pane), not necessarily what's actually running there
+# -- e.g. `--tools agy,aider` still uses claude-<session>/codex-<session>
+# as the tmux session names, just running agy/aider inside them. Kept
+# this way so restore_all's detection logic doesn't need to change.
+#
+# The hook's action runs via `run-shell`, which hands the string to a real
+# /bin/sh -- a plain `;` there is an ordinary shell statement separator,
+# not tmux's own (much trickier, nesting-depth-sensitive) command-chaining
+# syntax.
+#
+# tmux's status bar is turned off for both sessions: it isn't used for
+# anything here, and its bottom row is a second thing (besides the app
+# itself) that has to survive a resize cleanly.
+remote_setup() {
+  local session="$1"
+  local tool1="${2:-claude}"
+  local tool2="${3:-codex}"
+  local safe="${4:-0}"
+  local claude_tmux="claude-${session}"
+  local codex_tmux="codex-${session}"
+  local cmd1 cmd2 bin1 bin2 cmd1_b64 cmd2_b64 script1 script2
+  cmd1="$(resolve_tool "$tool1" "$session" "$safe")"
+  cmd2="$(resolve_tool "$tool2" "$session" "$safe")"
+  bin1="${cmd1%% *}"
+  bin2="${cmd2%% *}"
+  cmd1_b64="$(b64 "$cmd1")"
+  cmd2_b64="$(b64 "$cmd2")"
+  script1="/tmp/codersync-${claude_tmux}.sh"
+  script2="/tmp/codersync-${codex_tmux}.sh"
+  # Tool existence is checked remotely, but ONLY when actually about to
+  # create a session (guarded by `has-session`) -- not on every call.
+  # restore_all always passes placeholder "claude"/"codex" regardless of
+  # what a session was originally started with (it doesn't track that),
+  # so checking unconditionally would wrongly block restoring an
+  # already-running session over an irrelevant "claude not found" when
+  # the box only has e.g. agy/aider installed. Without this check at
+  # all, a missing tool failed completely silently on fresh creation --
+  # the local script exited 0 with no output, and the only trace was a
+  # "command not found" line inside the pane itself (confirmed live).
+  # shellcheck disable=SC2087 # intentional: local expansion is the point --
+  # ${claude_tmux}/${bin1}/etc. below are THIS script's variables and must
+  # substitute before the heredoc is sent; only the \$-escaped ones are
+  # meant to survive as literal text for the remote shell to evaluate.
+  if ! ssh "$SSH_TARGET" -- bash -s <<EOF
+set -e
+if ! tmux has-session -t ${claude_tmux} 2>/dev/null; then
+  command -v ${bin1} >/dev/null 2>&1 || { echo "codersync: ${bin1} not found on \$(hostname)" >&2; exit 1; }
+  echo ${cmd1_b64} | base64 -d > ${script1}
+  tmux new-session -d -s ${claude_tmux} -c ${REMOTE_DIR}
+  tmux set-hook -t ${claude_tmux} client-attached "run-shell 'tmux send-keys -t ${claude_tmux} \"bash ${script1}\" Enter; tmux set-hook -u -t ${claude_tmux} client-attached'"
+  tmux set-option -t ${claude_tmux} status off
+fi
+if ! tmux has-session -t ${codex_tmux} 2>/dev/null; then
+  command -v ${bin2} >/dev/null 2>&1 || { echo "codersync: ${bin2} not found on \$(hostname)" >&2; exit 1; }
+  echo ${cmd2_b64} | base64 -d > ${script2}
+  tmux new-session -d -s ${codex_tmux} -c ${REMOTE_DIR}
+  tmux set-hook -t ${codex_tmux} client-attached "run-shell 'tmux send-keys -t ${codex_tmux} \"bash ${script2}\" Enter; tmux set-hook -u -t ${codex_tmux} client-attached'"
+  tmux set-option -t ${codex_tmux} status off
+fi
+EOF
+  then
+    echo "codersync: aborting '${session}' -- see the error above." >&2
+    exit 1
+  fi
+}
+
+# Opens a new iTerm2 tab, splits it vertically (left/right), titles and
+# attaches each pane. claude on the left, codex on the right.
+open_tab() {
+  local session="$1"
+  local claude_tmux="claude-${session}"
+  local codex_tmux="codex-${session}"
+
+  local title_cmd="printf '\033]0;${session}\007'"
+  # shellcheck disable=SC2016 # intentional: $(date...) stays literal here
+  # so it's evaluated fresh by the shell that runs this loop on each
+  # retry, not frozen to the timestamp when this string was built.
+  local claude_attach='while true; do ssh -t '"${SSH_TARGET}"' -- tmux attach -t '"${claude_tmux}"'; echo "[$(date +%H:%M:%S)] disconnected, retrying in 2s..."; sleep 2; done'
+  # shellcheck disable=SC2016 # intentional -- same as claude_attach above.
+  local codex_attach='while true; do ssh -t '"${SSH_TARGET}"' -- tmux attach -t '"${codex_tmux}"'; echo "[$(date +%H:%M:%S)] disconnected, retrying in 2s..."; sleep 2; done'
+
+  local title_esc claude_esc codex_esc
+  title_esc="$(as_escape "$title_cmd")"
+  claude_esc="$(as_escape "$claude_attach")"
+  codex_esc="$(as_escape "$codex_attach")"
+
+  osascript <<APPLESCRIPT
+tell application "iTerm2"
+  activate
+  if (count of windows) = 0 then
+    create window with default profile
+  end if
+  tell current window
+    set newTab to (create tab with default profile)
+    tell newTab
+      tell current session
+        write text "${title_esc}"
+        write text "${claude_esc}"
+        set rightSession to (split vertically with default profile)
+      end tell
+    end tell
+  end tell
+  tell rightSession
+    write text "${title_esc}"
+    write text "${codex_esc}"
+  end tell
+end tell
+APPLESCRIPT
+}
+
+# --split-mode tmux: create ONE tmux session with two panes split
+# server-side, instead of two separate sessions. Same idle-until-attached
+# + client-attached-hook approach as remote_setup, just targeting pane 0
+# and pane 1 of one session instead of two sessions -- still avoids the
+# resize-during-startup rendering bug.
+remote_setup_tmux_mode() {
+  local session="$1"
+  local tool1="${2:-claude}"
+  local tool2="${3:-codex}"
+  local safe="${4:-0}"
+  local pair_tmux="pair-${session}"
+  local cmd1 cmd2 bin1 bin2 cmd1_b64 cmd2_b64 script1 script2
+  cmd1="$(resolve_tool "$tool1" "$session" "$safe")"
+  cmd2="$(resolve_tool "$tool2" "$session" "$safe")"
+  bin1="${cmd1%% *}"
+  bin2="${cmd2%% *}"
+  cmd1_b64="$(b64 "$cmd1")"
+  cmd2_b64="$(b64 "$cmd2")"
+  script1="/tmp/codersync-${pair_tmux}-0.sh"
+  script2="/tmp/codersync-${pair_tmux}-1.sh"
+  # Tool existence is checked remotely, but ONLY when actually about to
+  # create the session (guarded by `has-session`), not on every call --
+  # see the comment in remote_setup() for why (restore_all always passes
+  # placeholder tool names, which would wrongly block restoring an
+  # already-running session over an irrelevant missing-tool check).
+  # Without this check at all, a missing tool failed completely silently
+  # on fresh creation (confirmed live).
+  # shellcheck disable=SC2087 # intentional -- see remote_setup() above.
+  if ! ssh "$SSH_TARGET" -- bash -s <<EOF
+set -e
+if ! tmux has-session -t ${pair_tmux} 2>/dev/null; then
+  missing=""
+  command -v ${bin1} >/dev/null 2>&1 || missing="\${missing} ${bin1}"
+  command -v ${bin2} >/dev/null 2>&1 || missing="\${missing} ${bin2}"
+  if [ -n "\${missing}" ]; then
+    echo "codersync: not found on \$(hostname):\${missing}" >&2
+    exit 1
+  fi
+  echo ${cmd1_b64} | base64 -d > ${script1}
+  echo ${cmd2_b64} | base64 -d > ${script2}
+  tmux new-session -d -s ${pair_tmux} -c ${REMOTE_DIR}
+  tmux split-window -h -t ${pair_tmux} -c ${REMOTE_DIR}
+  tmux set-hook -t ${pair_tmux} client-attached "run-shell 'tmux send-keys -t ${pair_tmux}.0 \"bash ${script1}\" Enter; tmux send-keys -t ${pair_tmux}.1 \"bash ${script2}\" Enter; tmux set-hook -u -t ${pair_tmux} client-attached'"
+  tmux set-option -t ${pair_tmux} status off
+fi
+EOF
+  then
+    echo "codersync: aborting '${session}' -- see the error above." >&2
+    exit 1
+  fi
+}
+
+# --split-mode tmux: open a tab and run ONE attach command -- the split
+# already exists server-side, so there's nothing to split locally.
+open_tab_tmux_mode() {
+  local session="$1"
+  local pair_tmux="pair-${session}"
+
+  local title_cmd="printf '\033]0;${session}\007'"
+  # shellcheck disable=SC2016 # intentional -- see open_tab() above.
+  local attach='while true; do ssh -t '"${SSH_TARGET}"' -- tmux attach -t '"${pair_tmux}"'; echo "[$(date +%H:%M:%S)] disconnected, retrying in 2s..."; sleep 2; done'
+
+  local title_esc attach_esc
+  title_esc="$(as_escape "$title_cmd")"
+  attach_esc="$(as_escape "$attach")"
+
+  osascript <<APPLESCRIPT
+tell application "iTerm2"
+  activate
+  if (count of windows) = 0 then
+    create window with default profile
+  end if
+  tell current window
+    set newTab to (create tab with default profile)
+    tell newTab
+      tell current session
+        write text "${title_esc}"
+        write text "${attach_esc}"
+      end tell
+    end tell
+  end tell
+end tell
+APPLESCRIPT
+}
+
+# Appends session to the registry if it isn't already recorded.
+register_session() {
+  local session="$1"
+  touch "$REGISTRY"
+  grep -qxF "$session" "$REGISTRY" || echo "$session" >> "$REGISTRY"
+}
+
+# Reopens a tab for every registry entry that still has a live tmux
+# session on the remote box, and prunes entries that don't. Each entry
+# might be either split mode -- detected from which pattern is actually
+# alive (claude-<name>/codex-<name> for iterm mode, pair-<name> for tmux
+# mode), not stored separately, so the registry format stays unchanged.
+restore_all() {
+  touch "$REGISTRY"
+  local live
+  # The whole remote command must be passed as ONE pre-quoted string --
+  # see the ssh gotcha note near the top of this file.
+  live="$(ssh "$SSH_TARGET" -- "tmux list-sessions -F '#{session_name}'" 2>/dev/null || true)"
+
+  local kept=()
+  local restored=0
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    if grep -qxF "claude-${name}" <<<"$live" || grep -qxF "codex-${name}" <<<"$live"; then
+      echo "Restoring (iterm-split): $name"
+      # Args here don't matter: the sessions already exist, so
+      # `tmux new-session` just no-ops and nothing gets (re)launched.
+      remote_setup "$name" claude codex
+      open_tab "$name"
+      kept+=("$name")
+      restored=$((restored + 1))
+    elif grep -qxF "pair-${name}" <<<"$live"; then
+      echo "Restoring (tmux-split): $name"
+      remote_setup_tmux_mode "$name" claude codex
+      open_tab_tmux_mode "$name"
+      kept+=("$name")
+      restored=$((restored + 1))
+    else
+      echo "Pruning stale entry (no live tmux session): $name"
+    fi
+  done < "$REGISTRY"
+
+  if [[ ${#kept[@]} -gt 0 ]]; then
+    printf '%s\n' "${kept[@]}" > "$REGISTRY"
+  else
+    : > "$REGISTRY"
+  fi
+  echo "Restored ${restored} session(s)."
+}
+
+print_help() {
+  cat <<'HELP'
+Usage:
+  codersync --setup <ssh-target> [remote-dir]              One-time setup
+  codersync <session-name> [--split-mode iterm|tmux] [--tools t1,t2] [--safe-mode]
+                                                             Open a tab
+  codersync --restore-all                                   Reopen all live sessions
+  codersync --help                                          Show this help
+
+<ssh-target> is anything you'd pass to `ssh` directly (a hostname,
+user@host, or an alias from ~/.ssh/config). It's also used as the
+session-name prefix, so `codersync foo` on target `devbox.example.com` opens a
+tab and tmux sessions named `devbox-example-com-foo`.
+
+--split-mode tmux (default): one tmux session with two panes split
+server-side, and the local side just opens a tab and attaches once --
+works from any terminal with plain tmux, no iTerm2 dependency.
+--split-mode iterm: two separate tmux sessions, split locally by iTerm2 --
+lets you attach to just the left or right pane separately, but requires
+iTerm2.
+
+--tools t1,t2 (default: claude,codex): which two CLI agents run left/
+right. Known keys (auto-append that tool's skip-approval flag):
+  claude  claude --dangerously-skip-permissions -n <session>
+  codex   codex --dangerously-bypass-approvals-and-sandbox
+  agy     agy --dangerously-skip-permissions (Antigravity CLI, was Gemini CLI)
+  aider   aider --yes-always
+  kimi    kimi --yolo
+Anything else is run as a literal command, so any CLI agent works even
+without a short key -- give the exact command including its own
+skip-approval flag, e.g. `--tools claude,'some-agent --some-flag'`. Same
+tool twice also works: `--tools claude,claude`.
+
+--safe-mode: drop the auto-approve flag for known --tools keys, so
+normal permission prompts apply instead. Only affects known keys -- for
+a raw/literal --tools command, just leave its skip-approval flag out.
+HELP
+}
+
+# Splits a "t1,t2" string into TOOL1/TOOL2 globals. Pulled out as its own
+# function so it's unit-testable in isolation.
+split_tools() {
+  local tools="$1"
+  TOOL1="${tools%%,*}"
+  TOOL2="${tools#*,}"
+}
+
+# Parses the arguments to `codersync <session-name> [options...]`. Sets
+# RAW_NAME/SPLIT_MODE/TOOLS/SAFE_MODE globals; exits 1 with a message on
+# bad input. Pulled out as its own function so it's unit-testable via
+# bats' `run` without going through the full dispatch/network calls.
+parse_run_args() {
+  RAW_NAME="$1"
+  shift
+  SPLIT_MODE="tmux"
+  TOOLS="claude,codex"
+  SAFE_MODE=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --split-mode)
+        SPLIT_MODE="${2:-tmux}"
+        shift 2
+        ;;
+      --tools)
+        TOOLS="${2:-claude,codex}"
+        shift 2
+        ;;
+      --safe-mode)
+        SAFE_MODE=1
+        shift
+        ;;
+      *)
+        echo "Unknown argument: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+  if [[ "$SPLIT_MODE" != "iterm" && "$SPLIT_MODE" != "tmux" ]]; then
+    echo "--split-mode must be 'iterm' or 'tmux', got: $SPLIT_MODE" >&2
+    exit 1
+  fi
+}
+
+# Guarded so the tests (tests/*.bats) can `source` this file to test the
+# functions above in isolation without actually running the CLI dispatch.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+case "${1:-}" in
+  --setup)
+    setup "${2:-}" "${3:-}"
+    exit 0
+    ;;
+  --restore-all)
+    load_config
+    restore_all
+    exit 0
+    ;;
+  --help|-h)
+    print_help
+    exit 0
+    ;;
+  "")
+    echo "Usage: codersync --setup <ssh-target> [remote-dir] | codersync <session-name> | codersync --restore-all" >&2
+    echo "Run 'codersync --help' for more." >&2
+    exit 1
+    ;;
+  *)
+    load_config
+    parse_run_args "$@"
+    split_tools "$TOOLS"
+    # The (sanitized) ssh-target is folded into the session name by
+    # default (e.g. `codersync foo` on target `devbox.example.com` becomes
+    # session `devbox.example.com-foo`), so tmux session names/tab titles/
+    # registry entries stay unambiguous if you ever use codersync against
+    # more than one box.
+    SESSION="${TARGET_LABEL}-${RAW_NAME}"
+    if [[ "$SPLIT_MODE" == "tmux" ]]; then
+      remote_setup_tmux_mode "$SESSION" "$TOOL1" "$TOOL2" "$SAFE_MODE"
+      register_session "$SESSION"
+      open_tab_tmux_mode "$SESSION"
+    else
+      remote_setup "$SESSION" "$TOOL1" "$TOOL2" "$SAFE_MODE"
+      register_session "$SESSION"
+      open_tab "$SESSION"
+    fi
+    ;;
+esac
+fi
