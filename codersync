@@ -67,7 +67,10 @@
 # command run as-is -- so any CLI agent works even without a short key,
 # e.g. `--tools claude,'some-other-agent --whatever-flag'`, as long as
 # you give the exact command including its own skip-approval flag. Same
-# tool twice also works, e.g. `--tools claude,claude`.
+# tool twice also works, e.g. `--tools claude,claude`. A literal command
+# can't contain a comma (it's the t1/t2 separator, with no escaping),
+# and exactly one comma (or zero) is required -- see
+# tools_split_is_valid() for what's rejected and why.
 #
 # `--safe-mode` drops the auto-approve flag for known keys (claude,
 # codex, agy, aider, kimi), so normal permission prompts apply instead.
@@ -556,6 +559,50 @@ resolve_tool() {
   fi
 }
 
+# Returns (on stdout) the actual executable name from a resolved
+# command string, skipping any leading NAME=value environment-
+# assignment words -- e.g. "OPENAI_API_KEY=sk-... some-agent --flag"
+# becomes "some-agent", not "OPENAI_API_KEY=sk-...". A raw --tools
+# value is documented as the exact command to run, and `VAR=value cmd`
+# is an ordinary, valid way to write that under bash -- but a flat
+# "${cmd%% *}" split (the previous behavior here) took the assignment
+# itself as the thing to existence-check remotely, so setup/launch
+# reported a perfectly runnable command as "not found" (confirmed
+# live). Uses a plain space-split loop rather than `for word in $cmd`
+# specifically to avoid unquoted `$cmd` undergoing local pathname
+# (glob) expansion -- a literal --tools value could otherwise contain
+# characters that match files in whatever directory this happens to
+# run from.
+#
+# Known, deliberate limitation: only a plain, unquoted value is
+# recognized -- `FOO='bar baz' some-agent` or `FOO=bar\ baz some-agent`
+# (both valid bash, an assignment whose VALUE contains a literal space)
+# still split apart mid-value and get misread the same way the bug
+# above did, just for a narrower reason. Fixing that fully would mean
+# actually parsing the string as shell syntax (quote/escape removal),
+# and the only way to do that in bash is to have bash itself evaluate
+# it (`eval`/`set --`) -- which would also execute any `$(...)`/
+# backtick command substitution embedded in the value, immediately and
+# LOCALLY, merely to figure out what to existence-check. That's a
+# categorically different and worse risk than the narrow parsing gap
+# it would close (this string is otherwise only ever shipped to the
+# remote box as inert data, never locally evaluated), so it's not worth
+# it for this edge case. README's Supported tools section documents
+# the `env NAME=value cmd` workaround for anyone who hits this.
+command_word_for() {
+  local cmd="$1"
+  local word
+  while :; do
+    word="${cmd%% *}"
+    if [[ "$word" =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] && [[ "$cmd" == *" "* ]]; then
+      cmd="${cmd#* }"
+      continue
+    fi
+    printf '%s' "$word"
+    return 0
+  done
+}
+
 # Escapes backslash and double-quote for embedding a string as a literal
 # inside a "..." double-quoted context (used for the AppleScript "..."
 # strings in open_tab/open_tab_tmux_mode below).
@@ -771,8 +818,8 @@ remote_setup() {
   local cmd1 cmd2 bin1 bin2 cmd1_b64 cmd2_b64 bin1_b64 bin2_b64 script1 script2
   cmd1="$(resolve_tool "$tool1" "$session" "$safe")"
   cmd2="$(resolve_tool "$tool2" "$session" "$safe")"
-  bin1="${cmd1%% *}"
-  bin2="${cmd2%% *}"
+  bin1="$(command_word_for "$cmd1")"
+  bin2="$(command_word_for "$cmd2")"
   cmd1_b64="$(b64 "$cmd1")"
   cmd2_b64="$(b64 "$cmd2")"
   # bin1/bin2 are base64'd too, not interpolated as raw text like the
@@ -919,8 +966,8 @@ remote_setup_tmux_mode() {
   local cmd1 cmd2 bin1 bin2 cmd1_b64 cmd2_b64 bin1_b64 bin2_b64 script1 script2
   cmd1="$(resolve_tool "$tool1" "$session" "$safe")"
   cmd2="$(resolve_tool "$tool2" "$session" "$safe")"
-  bin1="${cmd1%% *}"
-  bin2="${cmd2%% *}"
+  bin1="$(command_word_for "$cmd1")"
+  bin2="$(command_word_for "$cmd2")"
   cmd1_b64="$(b64 "$cmd1")"
   cmd2_b64="$(b64 "$cmd2")"
   # bin1/bin2 are base64'd too -- see the comment in remote_setup() above
@@ -1547,7 +1594,12 @@ right. Known keys (auto-append that tool's skip-approval flag):
 Anything else is run as a literal command, so any CLI agent works even
 without a short key -- give the exact command including its own
 skip-approval flag, e.g. `--tools claude,'some-agent --some-flag'`. Same
-tool twice also works: `--tools claude,claude`.
+tool twice also works: `--tools claude,claude`. A literal command
+can't contain a comma, though (it's the t1/t2 separator, with no
+escaping) -- `--tools 'agent --model a,b'` splits into two tools at
+that comma rather than one tool with a comma in its flag. Exactly one
+comma (or zero) is required either way; `--tools claude,codex,aider`
+is rejected outright rather than silently dropping the third.
 
 --safe-mode: drop the auto-approve flag for known --tools keys, so
 normal permission prompts apply instead. Only affects known keys -- for
@@ -1573,12 +1625,77 @@ first, since there's no undo for picking the wrong box.
 HELP
 }
 
-# Splits a "t1,t2" string into TOOL1/TOOL2 globals. Pulled out as its own
-# function so it's unit-testable in isolation.
+# Strips leading/trailing whitespace. Portable to bash 3.2 (no
+# extglob needed): `${s%%[![:space:]]*}` extracts the leading
+# whitespace-only run, then `${s#"$that"}` removes exactly it; the
+# trailing case is the mirror image.
+trim_whitespace() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# Splits a "t1,t2" string into TOOL1/TOOL2 globals, trimming whitespace
+# around each slot -- "claude, codex" (a space after the comma, a very
+# natural way to type a list) otherwise left TOOL2 as " codex": that
+# leading space made command_word_for read an empty executable word,
+# so setup failed despite " codex" being a perfectly valid shell
+# command once actually run. The mirror case ("claude ,codex") left
+# TOOL1 as "claude " -- resolve_tool's case-statement match is exact,
+# so that missed the known `claude` key entirely and silently fell
+# through to running the literal, un-flagged text "claude " instead
+# (confirmed live for both).
+#
+# Pulled out as its own function so it's unit-testable in isolation.
+# Deliberately permissive on its own -- a single value with no comma
+# fills BOTH slots with it (intentional; see resolve_tool's own comment
+# on using the same tool twice), but that means an empty slot (from
+# "aider," / ",aider" / "," / an explicitly empty value) also splits
+# mechanically without complaint. See tools_split_is_valid() for the
+# actual rejection of that case -- kept as a separate check rather than
+# folded in here, so the "single value fills both slots" behavior stays
+# unambiguously intentional rather than looking like an input-validation
+# oversight.
 split_tools() {
   local tools="$1"
-  TOOL1="${tools%%,*}"
-  TOOL2="${tools#*,}"
+  TOOL1="$(trim_whitespace "${tools%%,*}")"
+  TOOL2="$(trim_whitespace "${tools#*,}")"
+}
+
+# True if split_tools() produced two real (non-empty) values from
+# `tools` AND `tools` doesn't have more than one comma in the first
+# place. Takes the raw pre-split value (not just TOOL1/TOOL2) because
+# the second check can't be reconstructed from the split result alone:
+# split_tools only ever considers the FIRST comma, so
+# "claude,codex,aider" already silently became TOOL1=claude,
+# TOOL2="codex,aider" by the time this runs -- an extra comma (a typo,
+# or an attempt to pass a third agent, which codersync doesn't support;
+# it only ever runs two, left and right) surfaced later as a confusing
+# "not found" for the literal text "codex,aider" instead of a clear
+# error about the actual problem.
+#
+# An empty slot ("aider," / ",aider" / "," / an explicitly empty value)
+# used to silently reach remote_setup/remote_setup_tmux_mode as an
+# empty tool1/tool2, which bash's `${2:-claude}`/`${3:-codex}` then
+# defaulted the exact same way a genuinely UNSET argument would (`:-`
+# treats empty and unset identically) -- so `--tools aider,` quietly
+# launched aider plus the DEFAULT codex, dangerous-mode flag and all
+# unless --safe-mode was also given. That's a real blast-radius
+# difference from what was typed, not a cosmetic typo (confirmed live).
+#
+# NOT checked, and not checkable here: a literal command with its own
+# comma (e.g. "agent --model a,b") is indistinguishable from valid
+# "tool1,tool2" syntax at exactly one comma -- there's no way to tell
+# "the user meant this comma as a literal character" from "the user
+# meant this as the field separator" without new escaping syntax this
+# tool doesn't have. README's Supported tools section documents that a
+# literal command can't contain a comma, full stop.
+tools_split_is_valid() {
+  local tools="$1"
+  [[ -n "$TOOL1" && -n "$TOOL2" ]] || return 1
+  local without_commas="${tools//,/}"
+  (( ${#tools} - ${#without_commas} <= 1 ))
 }
 
 # Parses the arguments to `codersync <session-name> [options...]`. Sets
@@ -1710,6 +1827,10 @@ case "${1:-}" in
     load_config
     parse_run_args "$@"
     split_tools "$TOOLS"
+    if ! tools_split_is_valid "$TOOLS"; then
+      echo "codersync: --tools '${TOOLS}' is malformed -- expected two comma-separated values (e.g. claude,codex) or a single value to use for both: no empty slot on either side of the comma, and no more than one comma total (a literal command can't contain a comma -- codersync only ever runs two tools, left and right)." >&2
+      exit 1
+    fi
     # --split-mode iterm has no fallback (unlike tmux mode, which prints
     # the attach command when iTerm2 isn't available) -- checked here,
     # before any remote work at all, not left to open_tab() to discover

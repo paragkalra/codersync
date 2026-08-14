@@ -235,6 +235,26 @@ codersync my-feature --tools claude,'some-agent --some-flag'
 
 The same tool can be used for both panes too: `--tools claude,claude`.
 
+A literal command can also start with a `NAME=value` environment
+assignment (an ordinary, valid way to write that under bash), e.g.
+`--tools 'OPENAI_API_KEY=sk-... some-agent',claude` — codersync skips
+past it when checking that the actual agent binary exists remotely.
+That check only understands a plain, unquoted value, though: if the
+value itself needs a literal space, prefix with `env` instead of
+writing the assignment directly, e.g. `--tools 'env
+SOME_VAR="has a space" some-agent',claude` — `env` gets checked for
+existence trivially (it's virtually always installed), and the actual
+command still runs exactly as typed.
+
+A literal command can't contain a comma, though — `,` is the
+separator between the two `--tools` values, with no escaping syntax:
+`--tools 'agent --model a,b'` doesn't mean "one tool with a comma in
+its flag", it splits into two (wrong) tools at that comma the same as
+`claude,codex` would. `--tools` also only ever accepts exactly one
+comma (or zero, to use the same tool for both panes) — codersync only
+runs two tools, left and right, so `--tools claude,codex,aider` is
+rejected outright rather than silently dropping the third.
+
 ## Security
 
 By default, every known `--tools` key launches with that tool's

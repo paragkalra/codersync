@@ -59,6 +59,65 @@ setup() {
   [ "$result" = "claude -n mysession --dangerously-skip-permissions" ]
 }
 
+# --- command_word_for -----------------------------------------------------
+
+@test "command_word_for: plain command with no assignment returns the first word" {
+  result="$(command_word_for 'claude -n mysession --dangerously-skip-permissions')"
+  [ "$result" = "claude" ]
+}
+
+@test "command_word_for: skips a single leading NAME=value assignment" {
+  # Regression test: a raw --tools value is documented as the exact
+  # command to run, and "VAR=value cmd" is an ordinary, valid way to
+  # write that under bash -- but a flat "\${cmd%% *}" split took the
+  # assignment itself as the thing to existence-check, so a perfectly
+  # runnable command was reported as "not found" (confirmed live).
+  result="$(command_word_for 'OPENAI_API_KEY=sk-xxx some-agent --flag')"
+  [ "$result" = "some-agent" ]
+}
+
+@test "command_word_for: skips multiple leading assignments" {
+  result="$(command_word_for 'FOO=1 BAR=2 some-agent --flag')"
+  [ "$result" = "some-agent" ]
+}
+
+@test "command_word_for: an assignment with no command after it returns the assignment itself" {
+  # Degenerate/malformed input -- there's no real command to find, so
+  # this just returns what's there rather than looping or erroring.
+  result="$(command_word_for 'FOO=1')"
+  [ "$result" = "FOO=1" ]
+}
+
+@test "command_word_for: does not treat an --flag=value as an assignment" {
+  # "--flag=value" doesn't match NAME=value (NAME can't start with a
+  # dash), so this must still be read as the actual command, not skipped.
+  result="$(command_word_for '--not-a-var=value some-agent')"
+  [ "$result" = "--not-a-var=value" ]
+}
+
+@test "command_word_for: known limitation -- a quoted space in the assignment's value still splits it apart" {
+  # Documenting, not asserting correctness: FOO='bar baz' some-agent is
+  # valid bash (an assignment whose VALUE contains a literal space),
+  # but this is a plain space-splitter, not a shell parser -- it has no
+  # way to know the space is inside quotes. Fixing that fully would
+  # require having bash itself evaluate the string (eval/set --), which
+  # would also execute any $(...)/backtick substitution embedded in the
+  # value, immediately and locally -- a worse risk than this narrow
+  # parsing gap. README documents the `env NAME=value cmd` workaround.
+  result="$(command_word_for "FOO='bar baz' some-agent --flag")"
+  [ "$result" = "baz'" ]
+}
+
+@test "command_word_for: the documented env-prefix workaround resolves cleanly" {
+  # "env" itself doesn't match NAME=value (no "="), so it's returned
+  # immediately as the first word -- "env" is virtually always
+  # installed, so the existence check trivially passes instead of
+  # wrongly aborting, even though the space in the value would
+  # otherwise trip up the plain assignment-skipping above.
+  result="$(command_word_for "env FOO='bar baz' some-agent --flag")"
+  [ "$result" = "env" ]
+}
+
 # --- as_escape ----------------------------------------------------------
 
 @test "as_escape: plain string is unchanged" {
@@ -554,6 +613,108 @@ setup() {
   split_tools "onlyone"
   [ "$TOOL1" = "onlyone" ]
   [ "$TOOL2" = "onlyone" ]
+}
+
+@test "split_tools: trims a trailing space before the comma" {
+  # Regression test: TOOL1 used to stay "claude " (trailing space) --
+  # resolve_tool's case-statement match is exact, so that missed the
+  # known claude key entirely and silently fell through to running the
+  # literal, un-flagged text "claude " instead.
+  split_tools "claude ,codex"
+  [ "$TOOL1" = "claude" ]
+  [ "$TOOL2" = "codex" ]
+}
+
+@test "split_tools: trims a leading space after the comma" {
+  # Regression test: TOOL2 used to stay " codex" (leading space) --
+  # command_word_for read an empty executable word from that, so setup
+  # failed despite " codex" being a perfectly valid shell command.
+  split_tools "claude, codex"
+  [ "$TOOL1" = "claude" ]
+  [ "$TOOL2" = "codex" ]
+}
+
+@test "split_tools: trims whitespace on both sides of both slots" {
+  split_tools "  claude  ,  codex  "
+  [ "$TOOL1" = "claude" ]
+  [ "$TOOL2" = "codex" ]
+}
+
+@test "split_tools: does not trim internal whitespace within a literal command" {
+  split_tools "claude,gemini --some-flag"
+  [ "$TOOL2" = "gemini --some-flag" ]
+}
+
+# --- trim_whitespace --------------------------------------------------
+
+@test "trim_whitespace: strips leading and trailing spaces" {
+  result="$(trim_whitespace '  hello  ')"
+  [ "$result" = "hello" ]
+}
+
+@test "trim_whitespace: leaves internal whitespace alone" {
+  result="$(trim_whitespace '  hello world  ')"
+  [ "$result" = "hello world" ]
+}
+
+@test "trim_whitespace: handles an all-whitespace string" {
+  result="$(trim_whitespace '   ')"
+  [ "$result" = "" ]
+}
+
+@test "trim_whitespace: handles an already-trimmed string" {
+  result="$(trim_whitespace 'hello')"
+  [ "$result" = "hello" ]
+}
+
+# --- tools_split_is_valid -----------------------------------------------
+
+@test "tools_split_is_valid: true for a normal two-item split" {
+  split_tools "claude,codex"
+  tools_split_is_valid "claude,codex"
+}
+
+@test "tools_split_is_valid: true when a single value fills both slots" {
+  split_tools "onlyone"
+  tools_split_is_valid "onlyone"
+}
+
+@test "tools_split_is_valid: false for a trailing empty slot" {
+  # Regression test: --tools aider, used to silently launch aider plus
+  # the DEFAULT codex (dangerous-mode flag and all, unless --safe-mode
+  # was also given) instead of erroring on the empty second slot.
+  split_tools "aider,"
+  run ! tools_split_is_valid "aider,"
+}
+
+@test "tools_split_is_valid: false for a leading empty slot" {
+  split_tools ",aider"
+  run ! tools_split_is_valid ",aider"
+}
+
+@test "tools_split_is_valid: false for both slots empty" {
+  split_tools ","
+  run ! tools_split_is_valid ","
+}
+
+@test "tools_split_is_valid: false for an entirely empty value" {
+  split_tools ""
+  run ! tools_split_is_valid ""
+}
+
+@test "tools_split_is_valid: false for more than one comma" {
+  # Regression test: --tools claude,codex,aider used to silently become
+  # tool1=claude, tool2="codex,aider" (split_tools only ever considers
+  # the first comma) -- surfacing later as a confusing "not found" for
+  # the literal text "codex,aider" instead of a clear error about the
+  # actual problem (a typo, or an unsupported third agent).
+  split_tools "claude,codex,aider"
+  run ! tools_split_is_valid "claude,codex,aider"
+}
+
+@test "tools_split_is_valid: false for four comma-separated values" {
+  split_tools "a,b,c,d"
+  run ! tools_split_is_valid "a,b,c,d"
 }
 
 # --- parse_run_args ---------------------------------------------------
