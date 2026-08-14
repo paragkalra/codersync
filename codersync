@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
-# Usage: codersync --setup <ssh-target> [remote-dir]
-#        codersync <session-name> [--split-mode iterm|tmux] [--tools t1,t2] [--safe-mode]
-#        codersync --restore-all
-#        codersync --list-all
-#        codersync --kill <ids>   (e.g. 1,2,4 or 1-4)
-#        codersync --kill-all
+# Usage: codersync --setup|-s <ssh-target> [remote-dir]
+#        codersync <session-name> [--split-mode|-m iterm|tmux] [--tools|-t t1,t2] [--safe-mode|-s]
+#        codersync --restore-all|-r
+#        codersync --list-all|-l
+#        codersync --kill|-k <ids>   (e.g. 1,2,4 or 1-4)
+#        codersync --kill-all|-K
+#        codersync --paste-image|-p
+#
+# Every flag above has a single-letter short form -- --setup/-s and
+# --safe-mode/-s share the letter "s" deliberately: they're parsed in
+# two entirely separate contexts (top-level dispatch decides
+# --setup-vs-a-session-name first; --safe-mode only exists within a
+# session-name invocation's own options), so there's no ambiguity in
+# practice, only in a skim of this comment.
 #
 # One-time setup: `codersync --setup <ssh-target> [remote-dir]` records
 # which remote box to use.
@@ -195,7 +203,7 @@ setup() {
   local remote_dir="${2:-~/repos}"
 
   if [[ -z "$target" ]]; then
-    echo "Usage: codersync --setup <ssh-target> [remote-dir]" >&2
+    echo "Usage: codersync --setup|-s <ssh-target> [remote-dir]" >&2
     exit 1
   fi
 
@@ -1551,17 +1559,140 @@ kill_all_sessions() {
   echo "Killed ${count} session(s)."
 }
 
+# `codersync --paste-image` -- lets you get an image from your LOCAL
+# clipboard into a claude/codex session running on the remote box.
+#
+# Claude Code (and most CLI agents) read the clipboard by shelling out
+# to a LOCAL utility (pbpaste on macOS, xclip/wl-paste on Linux) on
+# whatever machine the process is actually running on. Since the whole
+# point of codersync is running that process on the REMOTE box, a plain
+# Cmd+V there tries to read the REMOTE box's clipboard -- empty, no
+# display server -- not your Mac's, where the image actually is. tmux
+# makes it worse on top of that (it only forwards text on paste, not
+# binary image data), but even bypassing tmux entirely, the core
+# cross-machine clipboard problem remains.
+#
+# This sidesteps that instead of trying to solve live binary clipboard
+# forwarding: it uploads the clipboard image to the remote box as a
+# real file and puts that file's PATH (plain text) on your LOCAL
+# clipboard, so your next ordinary Cmd+V into the session pastes a path
+# claude/codex can read normally -- no binary data crosses the
+# ssh/tmux boundary at all, so there's nothing for tmux to mangle.
+#
+# Reads the clipboard via osascript's `the clipboard as «class PNGf»`
+# -- macOS-native, no extra dependency, consistent with how
+# iterm2_available()/open_tab() already shell out to osascript for
+# iTerm2 automation. The image is then base64-encoded locally and sent
+# through the SAME ssh/heredoc/`set -C`/`umask 077` mechanism already
+# used for launch scripts (see remote_setup's comment) -- not `scp` --
+# so it gets the same symlink-pre-plant and world-readable-until-cleaned
+# protections as everything else this tool writes to remote /tmp,
+# without introducing a second remote-write code path to keep in sync.
+#
+# The clipboard content (a screenshot, a copied image -- potentially
+# sensitive) briefly touches local disk at $local_tmp before upload.
+# `umask 077` (set BEFORE osascript creates the file, so the child
+# process inherits it) keeps it from being merely world-readable;
+# `trap ... EXIT`, armed right after -- before anything can fail --
+# covers the window between then and the point where its content is
+# safely captured in $encoded (a failure in `wc`, `base64`, or the
+# local user hitting Ctrl-C used to skip straight past the `rm -f`
+# calls this used to scatter across each early-exit branch, leaving
+# the file behind under this script's `set -e`). Once $encoded exists,
+# $local_tmp is cleaned up and the trap explicitly disarmed right there
+# -- NOT left for the trap to catch later: by the time it would
+# otherwise fire (this function has returned, and the dispatch case
+# that called it does `exit 0`), `local_tmp`'s `local` binding no
+# longer exists, and referencing it in the trap at that point is
+# itself a fatal error under this script's `set -u` (confirmed live).
+paste_image() {
+  local local_tmp
+  local_tmp="/tmp/codersync-clip-$(random_suffix).png"
+  trap 'rm -f -- "$local_tmp"' EXIT
+  umask 077
+  if ! osascript -e "
+    try
+      set imgData to the clipboard as «class PNGf»
+    on error
+      error \"codersync: no image found on the clipboard\"
+    end try
+    set fp to open for access (POSIX file \"${local_tmp}\") with write permission
+    set eof fp to 0
+    write imgData to fp
+    close access fp
+  " >/dev/null 2>&1; then
+    echo "codersync: no image found on the clipboard -- copy a screenshot or image first." >&2
+    exit 1
+  fi
+
+  # Sanity cap, not a hard technical limit: this all goes through a
+  # local bash variable and a heredoc (see below), both of which handle
+  # multi-MB values fine, but a huge value here is almost certainly a
+  # mistake (the wrong thing copied) rather than an intentional paste.
+  local max_bytes=$((25 * 1024 * 1024))
+  local size
+  size="$(wc -c < "$local_tmp" | tr -d ' ')"
+  if (( size > max_bytes )); then
+    echo "codersync: clipboard image is ${size} bytes -- larger than the ${max_bytes}-byte cap, aborting (probably not what you meant to paste)." >&2
+    exit 1
+  fi
+
+  local remote_path
+  remote_path="/tmp/codersync-img-$(random_suffix).png"
+  local encoded
+  encoded="$(base64 < "$local_tmp" | tr -d '\n')"
+  # local_tmp's content is now fully captured in $encoded -- clean up
+  # and disarm the trap HERE rather than leaving that to the trap alone:
+  # by the time it would otherwise fire (at the dispatch case's `exit 0`,
+  # after this function has already returned), `local_tmp`'s `local`
+  # binding no longer exists, and referencing it under this script's
+  # `set -u` at that point is itself a fatal error (confirmed live).
+  rm -f -- "$local_tmp"
+  trap - EXIT
+
+  # shellcheck disable=SC2087 # intentional: local expansion is the
+  # point -- ${encoded}/${remote_path} below are THIS script's
+  # variables and must substitute before the heredoc is sent.
+  if ! ssh "$SSH_TARGET" -- bash -s <<EOF
+set -e
+set -C
+umask 077
+echo ${encoded} | base64 -d > ${remote_path}
+EOF
+  then
+    echo "codersync: failed to upload the image to ${SSH_TARGET}." >&2
+    exit 1
+  fi
+
+  # Checked explicitly, not left to this script's own `set -e` --
+  # `pipefail` makes a pbcopy failure (no GUI session/pasteboard
+  # access, pbcopy missing, whatever) abort the WHOLE pipeline's exit
+  # status, which `set -e` then acts on immediately: the upload had
+  # already succeeded by this point, but the two echoes below never
+  # ran, so the only feedback the user got was silence -- no error, no
+  # path, nothing to indicate the file exists at all (confirmed live).
+  if ! printf '%s' "$remote_path" | pbcopy; then
+    echo "codersync: uploaded to ${SSH_TARGET}:${remote_path}, but failed to copy that path to the local clipboard." >&2
+    echo "$remote_path"
+    exit 1
+  fi
+
+  echo "Uploaded to ${SSH_TARGET}:${remote_path}"
+  echo "Paste (Cmd+V) into the session to insert the path."
+}
+
 print_help() {
   cat <<'HELP'
 Usage:
-  codersync --setup <ssh-target> [remote-dir]              One-time setup
-  codersync <session-name> [--split-mode iterm|tmux] [--tools t1,t2] [--safe-mode]
+  codersync --setup|-s <ssh-target> [remote-dir]            One-time setup
+  codersync <session-name> [--split-mode|-m iterm|tmux] [--tools|-t t1,t2] [--safe-mode|-s]
                                                              Open a tab
-  codersync --restore-all                                   Reopen all live sessions
-  codersync --list-all                                      List live sessions with their IDs
-  codersync --kill <ids>                                    Kill sessions by ID (e.g. 1,2,4 or 1-4)
-  codersync --kill-all                                      Kill every codersync session (asks to confirm)
-  codersync --help                                          Show this help
+  codersync --restore-all|-r                                Reopen all live sessions
+  codersync --list-all|-l                                   List live sessions with their IDs
+  codersync --kill|-k <ids>                                 Kill sessions by ID (e.g. 1,2,4 or 1-4)
+  codersync --kill-all|-K                                   Kill every codersync session (asks to confirm)
+  codersync --paste-image|-p                                Upload a clipboard image, copy its remote path
+  codersync --help|-h                                       Show this help
 
 <ssh-target> is a hostname, user@host, or an alias from ~/.ssh/config --
 restricted to letters, digits, and . _ - @ (narrower than everything ssh
@@ -1571,20 +1702,27 @@ session-name prefix, so `codersync foo` on target `devbox.example.com` opens a
 tab and tmux sessions named `devbox-example-com-foo`.
 
 Every session also gets a leading numeric ID (e.g. `1-devbox-example-com-foo`),
-shown by `--list-all` and used by `--kill` -- a short handle so you don't
+shown by --list-all/-l and used by --kill/-k -- a short handle so you don't
 have to type the full name to look up or kill a session. Re-running
 `codersync foo` reuses foo's existing ID rather than minting a new one.
 
---split-mode tmux (default): one tmux session with two panes split
+Every flag below has the single-letter short form shown next to it.
+--setup/-s and --safe-mode/-s deliberately share the letter "s" -- they're
+parsed in two entirely separate contexts (top-level dispatch decides
+--setup-vs-a-session-name first; --safe-mode only exists within a
+session-name invocation's own options), so there's no ambiguity in
+practice, only in a skim of this text.
+
+--split-mode/-m tmux (default): one tmux session with two panes split
 server-side, and the local side just opens a tab and attaches once. Uses
 iTerm2 to open that tab when it's installed, but doesn't require it --
 without iTerm2, prints the attach command to run yourself in any
 terminal instead.
---split-mode iterm: two separate tmux sessions, split locally by iTerm2 --
-lets you attach to just the left or right pane separately, but requires
-iTerm2 (no fallback for this mode).
+--split-mode/-m iterm: two separate tmux sessions, split locally by iTerm2
+-- lets you attach to just the left or right pane separately, but
+requires iTerm2 (no fallback for this mode).
 
---tools t1,t2 (default: claude,codex): which two CLI agents run left/
+--tools/-t t1,t2 (default: claude,codex): which two CLI agents run left/
 right. Known keys (auto-append that tool's skip-approval flag):
   claude  claude --dangerously-skip-permissions -n <session>
   codex   codex --dangerously-bypass-approvals-and-sandbox
@@ -1593,35 +1731,49 @@ right. Known keys (auto-append that tool's skip-approval flag):
   kimi    kimi --yolo
 Anything else is run as a literal command, so any CLI agent works even
 without a short key -- give the exact command including its own
-skip-approval flag, e.g. `--tools claude,'some-agent --some-flag'`. Same
-tool twice also works: `--tools claude,claude`. A literal command
+skip-approval flag, e.g. `-t claude,'some-agent --some-flag'`. Same
+tool twice also works: `-t claude,claude`. A literal command
 can't contain a comma, though (it's the t1/t2 separator, with no
-escaping) -- `--tools 'agent --model a,b'` splits into two tools at
+escaping) -- `-t 'agent --model a,b'` splits into two tools at
 that comma rather than one tool with a comma in its flag. Exactly one
-comma (or zero) is required either way; `--tools claude,codex,aider`
+comma (or zero) is required either way; `-t claude,codex,aider`
 is rejected outright rather than silently dropping the third.
 
---safe-mode: drop the auto-approve flag for known --tools keys, so
+--safe-mode/-s: drop the auto-approve flag for known --tools/-t keys, so
 normal permission prompts apply instead. Only affects known keys -- for
-a raw/literal --tools command, just leave its skip-approval flag out.
+a raw/literal --tools/-t command, just leave its skip-approval flag out.
 
---list-all: queries the current target's live tmux sessions and prints
+--list-all/-l: queries the current target's live tmux sessions and prints
 each one's ID, split mode, and name -- for sessions both alive on the
 box AND recorded in the local registry (~/.codersync_sessions); a live
 session missing from the registry (different machine, cleared
 registry) won't show up here. Sessions from before this ID scheme
 existed still show up, with a "-" in the ID column (they can't be
-targeted by --kill; kill them with --kill-all or plain tmux instead).
+targeted by --kill/-k; kill them with --kill-all/-K or plain tmux instead).
 
---kill <ids>: kills every session matching any ID in <ids> and removes
+--kill/-k <ids>: kills every session matching any ID in <ids> and removes
 it from the local registry. Accepts a comma-separated list ("1,2,4"), a
 range ("1-4"), or a mix ("1,3-5,8"). An ID with no live match is
 reported and skipped rather than aborting the rest of the list.
 
---kill-all: kills every codersync session on the current target
+--kill-all/-K: kills every codersync session on the current target
 (including legacy ones with no numeric ID) and clears the local
 registry for it. Prints the full list and asks for a y/N confirmation
-first, since there's no undo for picking the wrong box.
+first, since there's no undo for picking the wrong box. Capital -K
+(not lowercase -k, which is the narrower --kill) so the two aren't a
+one-character-case typo away from each other for something this
+destructive.
+
+--paste-image/-p: uploads whatever image is on your LOCAL clipboard to
+the current target as a real file, then replaces your clipboard
+content with that file's remote path (plain text) instead of the
+image. claude/codex read the clipboard on whatever machine they're
+actually running on -- the remote box, not your Mac -- so a plain
+Cmd+V there can't reach an image sitting on your local clipboard at
+all. Pasting the resulting path afterward is just ordinary text, so it
+goes through ssh/tmux exactly like any other paste. Fails clearly if
+there's no image on the clipboard, or if it's larger than 25MB
+(almost certainly the wrong thing was copied).
 HELP
 }
 
@@ -1714,29 +1866,32 @@ parse_run_args() {
   SAFE_MODE=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --split-mode)
+      --split-mode|-m)
         # Checked explicitly rather than just `${2:-tmux}`: with that
         # alone, `--tools --safe-mode` silently consumed --safe-mode as
         # --tools' own value (TOOLS became the literal string
         # "--safe-mode", SAFE_MODE stayed 0) instead of erroring, and a
         # flag as the very last argument with no value at all failed via
         # `shift 2`'s own error rather than this function's message.
-        if [[ $# -lt 2 || "$2" == --* ]]; then
-          echo "--split-mode requires a value (iterm or tmux)" >&2
+        # `-*` (not just `--*`) so this also catches a short flag in the
+        # value slot, e.g. `--tools -s` -- the exact same swallowing bug,
+        # just with the short form instead of the long one.
+        if [[ $# -lt 2 || "$2" == -* ]]; then
+          echo "--split-mode/-m requires a value (iterm or tmux)" >&2
           exit 1
         fi
         SPLIT_MODE="$2"
         shift 2
         ;;
-      --tools)
-        if [[ $# -lt 2 || "$2" == --* ]]; then
-          echo "--tools requires a value (e.g. claude,codex)" >&2
+      --tools|-t)
+        if [[ $# -lt 2 || "$2" == -* ]]; then
+          echo "--tools/-t requires a value (e.g. claude,codex)" >&2
           exit 1
         fi
         TOOLS="$2"
         shift 2
         ;;
-      --safe-mode)
+      --safe-mode|-s)
         SAFE_MODE=1
         shift
         ;;
@@ -1756,62 +1911,74 @@ parse_run_args() {
 # functions above in isolation without actually running the CLI dispatch.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 case "${1:-}" in
-  --setup)
+  --setup|-s)
     # This mutates local config, so an extra trailing argument (a typo'd
     # flag, an extra word) is rejected rather than silently ignored --
     # confirmed live, `codersync --setup host dir extra` used to just
     # drop "extra" with no warning at all.
     if [[ $# -gt 3 ]]; then
-      echo "codersync: --setup takes at most 2 arguments (<ssh-target> [remote-dir]), got extra: ${*:4}" >&2
+      echo "codersync: $1 takes at most 2 arguments (<ssh-target> [remote-dir]), got extra: ${*:4}" >&2
       exit 1
     fi
     setup "${2:-}" "${3:-}"
     exit 0
     ;;
-  --restore-all)
+  --restore-all|-r)
     # Opens tabs and rewrites the registry, so treated the same as the
     # other mutating commands above: an extra trailing argument is
     # rejected rather than silently ignored.
     if [[ $# -gt 1 ]]; then
-      echo "codersync: --restore-all takes no arguments -- got extra: ${*:2}" >&2
+      echo "codersync: $1 takes no arguments -- got extra: ${*:2}" >&2
       exit 1
     fi
     load_config
     restore_all
     exit 0
     ;;
-  --list-all)
+  --list-all|-l)
     if [[ $# -gt 1 ]]; then
-      echo "codersync: --list-all takes no arguments -- got extra: ${*:2}" >&2
+      echo "codersync: $1 takes no arguments -- got extra: ${*:2}" >&2
       exit 1
     fi
     load_config
     list_all_sessions
     exit 0
     ;;
-  --kill)
-    load_config
+  --kill|-k)
     if [[ -z "${2:-}" ]]; then
-      echo "Usage: codersync --kill <ids> (e.g. --kill 1,2,4 or --kill 1-4)" >&2
+      echo "Usage: codersync --kill|-k <ids> (e.g. --kill 1,2,4 or -k 1-4)" >&2
       exit 1
     fi
     # Kills remote sessions, so an extra trailing argument is rejected
     # rather than silently ignored -- confirmed live, `codersync --kill 1
     # 2` used to kill only ID 1 with no indication that "2" was dropped.
+    # Checked before load_config (like every other arity check above),
+    # so a malformed invocation never touches the network or any real
+    # config either.
     if [[ $# -gt 2 ]]; then
-      echo "codersync: --kill takes exactly one argument (<ids>, e.g. 1,2,4 or 1-4) -- got extra: ${*:3}" >&2
+      echo "codersync: $1 takes exactly one argument (<ids>, e.g. 1,2,4 or 1-4) -- got extra: ${*:3}" >&2
       exit 1
     fi
+    load_config
     kill_sessions "$2"
     exit 0
     ;;
-  --kill-all)
+  --kill-all|-K)
     if [[ $# -gt 1 ]]; then
-      echo "codersync: --kill-all takes no arguments -- got extra: ${*:2}" >&2
+      echo "codersync: $1 takes no arguments -- got extra: ${*:2}" >&2
       exit 1
     fi
     load_config
     kill_all_sessions
+    exit 0
+    ;;
+  --paste-image|-p)
+    if [[ $# -gt 1 ]]; then
+      echo "codersync: $1 takes no arguments -- got extra: ${*:2}" >&2
+      exit 1
+    fi
+    load_config
+    paste_image
     exit 0
     ;;
   --help|-h)
@@ -1819,7 +1986,7 @@ case "${1:-}" in
     exit 0
     ;;
   "")
-    echo "Usage: codersync --setup <ssh-target> [remote-dir] | codersync <session-name> | codersync --restore-all | codersync --list-all | codersync --kill <ids> | codersync --kill-all" >&2
+    echo "Usage: codersync --setup|-s <ssh-target> [remote-dir] | codersync <session-name> | codersync --restore-all|-r | codersync --list-all|-l | codersync --kill|-k <ids> | codersync --kill-all|-K | codersync --paste-image|-p" >&2
     echo "Run 'codersync --help' for more." >&2
     exit 1
     ;;

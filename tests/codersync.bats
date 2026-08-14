@@ -750,6 +750,24 @@ setup() {
   [ "$SAFE_MODE" = "1" ]
 }
 
+@test "parse_run_args: -m/-t/-s are accepted as shorthands for --split-mode/--tools/--safe-mode" {
+  parse_run_args "mysession" -m iterm -t "agy,aider" -s
+  [ "$SPLIT_MODE" = "iterm" ]
+  [ "$TOOLS" = "agy,aider" ]
+  [ "$SAFE_MODE" = "1" ]
+}
+
+@test "parse_run_args: -t followed immediately by a short flag errors instead of swallowing it" {
+  # Regression test: the original --tools/--safe-mode swallowing bug
+  # (fixed long before -t/-s existed) only checked for a *long* flag
+  # (--*) in the value slot -- broadened to -* so the short forms don't
+  # reopen the exact same hole, e.g. "-t -s" silently setting
+  # TOOLS="-s" and leaving SAFE_MODE unset.
+  run parse_run_args "mysession" -t -s
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"--tools/-t requires a value"* ]]
+}
+
 @test "parse_run_args: rejects an invalid --split-mode value" {
   run parse_run_args "mysession" --split-mode bogus
   [ "$status" -eq 1 ]
@@ -767,7 +785,7 @@ setup() {
   # leave SAFE_MODE=0, discarding the user's actual --safe-mode request.
   run parse_run_args "mysession" --tools --safe-mode
   [ "$status" -eq 1 ]
-  [[ "$output" == *"--tools requires a value"* ]]
+  [[ "$output" == *"--tools/-t requires a value"* ]]
 }
 
 @test "parse_run_args: --split-mode as the last argument with no value errors clearly" {
@@ -775,13 +793,13 @@ setup() {
   # this function's message.
   run parse_run_args "mysession" --split-mode
   [ "$status" -eq 1 ]
-  [[ "$output" == *"--split-mode requires a value"* ]]
+  [[ "$output" == *"--split-mode/-m requires a value"* ]]
 }
 
 @test "parse_run_args: --tools as the last argument with no value errors clearly" {
   run parse_run_args "mysession" --tools
   [ "$status" -eq 1 ]
-  [[ "$output" == *"--tools requires a value"* ]]
+  [[ "$output" == *"--tools/-t requires a value"* ]]
 }
 
 @test "parse_run_args: rejects a session name containing shell metacharacters" {
@@ -1225,4 +1243,66 @@ setup() {
   run "${BATS_TEST_DIRNAME}/../codersync" --list-all extra
   [ "$status" -eq 1 ]
   [[ "$output" == *"got extra"* ]]
+}
+
+@test "dispatch: --paste-image rejects extra trailing arguments" {
+  # Checked before load_config, so this never touches the network,
+  # clipboard, or any real config either.
+  run "${BATS_TEST_DIRNAME}/../codersync" --paste-image extra
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
+}
+
+@test "dispatch: -p is accepted as a shorthand for --paste-image" {
+  # Same arity check, same code path -- -p extra should be rejected the
+  # exact same way --paste-image extra is, proving the alias reaches the
+  # same case branch rather than falling through to the catch-all
+  # "unknown session name" dispatch.
+  run "${BATS_TEST_DIRNAME}/../codersync" -p extra
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
+  [[ "$output" == *"-p"* ]]
+}
+
+@test "dispatch: -s is accepted as a shorthand for --setup" {
+  run "${BATS_TEST_DIRNAME}/../codersync" -s host dir extra
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
+  [[ "$output" == *"-s"* ]]
+}
+
+@test "dispatch: -r is accepted as a shorthand for --restore-all" {
+  run "${BATS_TEST_DIRNAME}/../codersync" -r extra
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
+  [[ "$output" == *"-r"* ]]
+}
+
+@test "dispatch: -l is accepted as a shorthand for --list-all" {
+  run "${BATS_TEST_DIRNAME}/../codersync" -l extra
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
+  [[ "$output" == *"-l"* ]]
+}
+
+@test "dispatch: -K is accepted as a shorthand for --kill-all" {
+  run "${BATS_TEST_DIRNAME}/../codersync" -K extra
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
+  [[ "$output" == *"-K"* ]]
+}
+
+@test "dispatch: -k is accepted as a shorthand for --kill (missing-ids check, no real config needed)" {
+  # -k with no <ids> argument at all -- rejected before load_config, so
+  # this never touches the network or any real config either.
+  run "${BATS_TEST_DIRNAME}/../codersync" -k
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Usage: codersync --kill|-k"* ]]
+}
+
+@test "dispatch: -k rejects extra trailing arguments the same as --kill does" {
+  run "${BATS_TEST_DIRNAME}/../codersync" -k 1 2
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
+  [[ "$output" == *"-k"* ]]
 }

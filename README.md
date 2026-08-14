@@ -46,6 +46,12 @@ prompts. `codersync` exists to make all of that a non-issue.
 - **Works with any SSH-reachable box** — not tied to any specific
   cloud-dev provider. If you can `ssh` into it and it has `tmux`,
   `bash`, and `base64`, it works.
+- **Paste images across the ssh boundary** — claude/codex read the
+  clipboard on whatever machine they're running on, which is the
+  remote box, not your Mac, so a plain paste can't reach an image sitting
+  on your local clipboard. `codersync --paste-image` (or `-p`) uploads
+  it and puts the resulting remote path on your clipboard instead, so
+  your next Cmd+V pastes a path the agent can read normally.
 - **Any two CLI agents, not just two** — `--tools` picks which two CLI
   agents run left/right, including the same one twice.
 - **One-time setup, not per-run configuration** — `codersync --setup`
@@ -102,16 +108,26 @@ session also gets a small numeric ID prefixed on the remote side (e.g.
 ## Usage
 
 ```
-codersync --setup <ssh-target> [remote-dir]
-codersync <session-name> [--split-mode iterm|tmux] [--tools t1,t2] [--safe-mode]
-codersync --restore-all
-codersync --list-all
-codersync --kill <ids>
-codersync --kill-all
-codersync --help
+codersync --setup|-s <ssh-target> [remote-dir]
+codersync <session-name> [--split-mode|-m iterm|tmux] [--tools|-t t1,t2] [--safe-mode|-s]
+codersync --restore-all|-r
+codersync --list-all|-l
+codersync --kill|-k <ids>
+codersync --kill-all|-K
+codersync --paste-image|-p
+codersync --help|-h
 ```
 
-### `codersync --setup <ssh-target> [remote-dir]`
+Every flag has the single-letter short form shown next to it.
+`--setup`/`-s` and `--safe-mode`/`-s` deliberately share the letter —
+they're parsed in two entirely separate contexts (top-level dispatch
+decides `--setup`-vs-a-session-name first; `--safe-mode` only exists
+within a session-name invocation's own options), so there's no
+ambiguity in practice. `--kill-all` gets capital `-K` (not `-k`, which
+is the narrower `--kill`) since those two aren't something you want a
+one-character-case typo away from each other.
+
+### `codersync --setup|-s <ssh-target> [remote-dir]`
 
 One-time setup. `<ssh-target>` is a plain hostname, `user@host`, or an
 alias from your own `~/.ssh/config` — restricted to letters, digits, and
@@ -141,23 +157,24 @@ Config lives at `~/.config/codersync/config`.
 
 Opens a new tab and sets up the two-agent split. Options:
 
-- **`--split-mode tmux`** (default) — one `tmux` session with two panes
-  split server-side. The local side just opens a tab and attaches once;
-  with iTerm2 installed that tab opens automatically, and without it
-  `codersync` prints the attach command for you to run in any terminal
-  yourself instead. You can't attach to just one pane independently,
-  since it's one session.
-- **`--split-mode iterm`** — two separate `tmux` sessions, split locally
-  by iTerm2's native scripting API. Lets you attach to just the left or
-  right pane independently from elsewhere. Requires iTerm2 (plus a
-  one-time Automation-permission prompt the first time it controls it).
-- **`--tools t1,t2`** (default: `claude,codex`) — which two CLI agents
-  run left/right. See [Supported tools](#supported-tools).
-- **`--safe-mode`** — drop the auto-approve flag for known `--tools`
-  keys, so normal permission prompts apply instead of the dangerous
-  auto-approve default. See [Security](#security) below.
+- **`--split-mode`/`-m tmux`** (default) — one `tmux` session with two
+  panes split server-side. The local side just opens a tab and attaches
+  once; with iTerm2 installed that tab opens automatically, and without
+  it `codersync` prints the attach command for you to run in any
+  terminal yourself instead. You can't attach to just one pane
+  independently, since it's one session.
+- **`--split-mode`/`-m iterm`** — two separate `tmux` sessions, split
+  locally by iTerm2's native scripting API. Lets you attach to just the
+  left or right pane independently from elsewhere. Requires iTerm2
+  (plus a one-time Automation-permission prompt the first time it
+  controls it).
+- **`--tools`/`-t t1,t2`** (default: `claude,codex`) — which two CLI
+  agents run left/right. See [Supported tools](#supported-tools).
+- **`--safe-mode`/`-s`** — drop the auto-approve flag for known
+  `--tools`/`-t` keys, so normal permission prompts apply instead of
+  the dangerous auto-approve default. See [Security](#security) below.
 
-### `codersync --restore-all`
+### `codersync --restore-all|-r`
 
 Reopens a tab for every session that's still alive on the remote box,
 based on a local registry (`~/.codersync_sessions`) that every session
@@ -166,7 +183,7 @@ closed: nothing on the remote box was ever lost, this just recreates the
 local tabs. Stale entries (sessions no longer alive) are pruned
 automatically.
 
-### `codersync --list-all`
+### `codersync --list-all|-l`
 
 Lists every codersync session still alive on the remote box AND
 recorded in your local registry (`~/.codersync_sessions`), with its
@@ -189,7 +206,7 @@ built-in command to re-adopt it into the registry, so reattach to it
 directly with `ssh <ssh-target> -- tmux attach -t <session-name>`
 (get the exact name with `ssh <ssh-target> -- tmux list-sessions`).
 
-### `codersync --kill <ids>`
+### `codersync --kill|-k <ids>`
 
 Kills specific sessions on the remote box by ID, leaving everything else
 untouched:
@@ -205,12 +222,42 @@ tmux sessions behind it; for a `tmux`-split session it kills the single
 paired session. Only the local registry entry for a fully-killed session
 is cleaned up — everything else on the box is left alone.
 
-### `codersync --kill-all`
+### `codersync --kill-all|-K`
 
 Kills every codersync session on the box in one go, including legacy
 sessions from before the numeric-ID scheme existed (which `--kill` can't
 address individually). Prints the full list of what's about to die and
 asks for a `y/N` confirmation first — there's no undo once you say yes.
+
+### `codersync --paste-image|-p`
+
+Claude Code (and most CLI agents) read the clipboard by shelling out to
+a *local* utility (`pbpaste` on macOS, `xclip`/`wl-paste` on Linux) on
+whatever machine the process is actually running on. Since the whole
+point of codersync is running that process on the remote box, a plain
+paste there tries to read the *remote* box's clipboard — empty, no
+display server — not your Mac's, where the image actually is.
+
+`--paste-image` sidesteps that instead of trying to forward binary
+clipboard data live: it reads whatever image is on your local
+clipboard (copy a screenshot, or copy an image from a browser/Slack/
+Preview — anything that puts image data on the clipboard works),
+uploads it to the current target as a real file, and replaces your
+clipboard content with that file's path instead of the image:
+
+```
+$ codersync --paste-image
+Uploaded to devbox.example.com:/tmp/codersync-img-a1b2c3d4e5f6.png
+Paste (Cmd+V) into the session to insert the path.
+```
+
+Your next `Cmd+V` into the session then pastes that path as plain
+text — no binary data crosses the ssh/tmux boundary at all, so there's
+nothing for tmux to mangle. Fails clearly if there's no image on the
+clipboard, or if it's larger than 25MB (almost certainly the wrong
+thing was copied). Bind it to a hotkey with your automation tool of
+choice (macOS Shortcuts, Keyboard Maestro, Raycast/Alfred) if you want
+one keystroke instead of switching to a terminal to run it.
 
 ## Supported tools
 
