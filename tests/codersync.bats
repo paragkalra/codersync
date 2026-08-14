@@ -5,6 +5,8 @@
 # touches SSH, tmux, or iTerm2: those are exercised by hand against a
 # real box (see README.md's "Testing" section), not by this suite.
 
+bats_require_minimum_version 1.5.0
+
 setup() {
   # shellcheck disable=SC1091
   source "${BATS_TEST_DIRNAME}/../codersync"
@@ -94,6 +96,22 @@ setup() {
   encoded="$(b64 "$original")"
   decoded="$(printf '%s' "$encoded" | base64 -d)"
   [ "$decoded" = "$original" ]
+}
+
+# --- random_suffix --------------------------------------------------------
+
+@test "random_suffix: produces a non-empty alphanumeric string" {
+  result="$(random_suffix)"
+  [ -n "$result" ]
+  [[ "$result" =~ ^[A-Za-z0-9]+$ ]]
+}
+
+@test "random_suffix: two calls produce different values" {
+  # Not a strict guarantee (it's random), but a collision here would be
+  # astronomically unlikely and almost certainly indicate a real bug.
+  first="$(random_suffix)"
+  second="$(random_suffix)"
+  [ "$first" != "$second" ]
 }
 
 # --- sanitize_label -------------------------------------------------------
@@ -188,4 +206,105 @@ setup() {
   run parse_run_args "mysession" --nonsense-flag
   [ "$status" -eq 1 ]
   [[ "$output" == *"Unknown argument"* ]]
+}
+
+@test "parse_run_args: --tools followed immediately by another flag errors instead of swallowing it" {
+  # Regression test: this used to silently set TOOLS="--safe-mode" and
+  # leave SAFE_MODE=0, discarding the user's actual --safe-mode request.
+  run parse_run_args "mysession" --tools --safe-mode
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"--tools requires a value"* ]]
+}
+
+@test "parse_run_args: --split-mode as the last argument with no value errors clearly" {
+  # Regression test: this used to fail via shift 2's own error instead of
+  # this function's message.
+  run parse_run_args "mysession" --split-mode
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"--split-mode requires a value"* ]]
+}
+
+@test "parse_run_args: --tools as the last argument with no value errors clearly" {
+  run parse_run_args "mysession" --tools
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"--tools requires a value"* ]]
+}
+
+@test "parse_run_args: rejects a session name containing shell metacharacters" {
+  # Regression test: this exact payload created a real file on a remote
+  # box before validate_session_name existed (confirmed live).
+  run parse_run_args 'x; touch /tmp/pwn'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Invalid session name"* ]]
+}
+
+# --- input validation (session-name/remote-dir/ssh-target injection) ----
+
+@test "validate_session_name: accepts letters, digits, dash, underscore" {
+  validate_session_name "my-session_123"
+}
+
+@test "validate_session_name: rejects a semicolon" {
+  run ! validate_session_name 'x; touch /tmp/pwn'
+}
+
+@test "validate_session_name: rejects a dot (breaks tmux target parsing)" {
+  run ! validate_session_name "my.session"
+}
+
+@test "validate_session_name: rejects a space" {
+  run ! validate_session_name "my session"
+}
+
+@test "validate_remote_dir: accepts a normal path" {
+  # shellcheck disable=SC2088 # intentional: testing the literal string
+  # "~/repos", not asking the test shell to expand it.
+  validate_remote_dir "~/repos"
+}
+
+@test "validate_remote_dir: rejects shell metacharacters" {
+  # shellcheck disable=SC2088 # intentional: testing the literal string.
+  run ! validate_remote_dir '~/repos; rm -rf /'
+}
+
+@test "validate_ssh_target: accepts a plain hostname" {
+  validate_ssh_target "devbox.example.com"
+}
+
+@test "validate_ssh_target: accepts user@host" {
+  validate_ssh_target "user@devbox.example.com"
+}
+
+@test "validate_ssh_target: rejects shell metacharacters" {
+  run ! validate_ssh_target 'devbox.example.com; rm -rf /'
+}
+
+# --- iterm2_available / open_tab_tmux_mode fallback ---------------------
+
+@test "open_tab_tmux_mode: falls back to printed instructions when iTerm2 is unavailable" {
+  # shellcheck disable=SC2034 # read by open_tab_tmux_mode below, but
+  # that cross-function global dependency isn't visible statically.
+  SSH_TARGET="devbox.example.com"
+  # Mocks out the real check -- this suite has no network/GUI dependency.
+  iterm2_available() { return 1; }
+  run open_tab_tmux_mode "mysession"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"iTerm2 not found"* ]]
+  [[ "$output" == *"tmux attach -t pair-mysession"* ]]
+}
+
+# --- parse_registry_line -------------------------------------------------
+
+@test "parse_registry_line: splits a target-tagged entry" {
+  parse_registry_line "$(printf 'devbox.example.com\tmy-session')"
+  [ "$ENTRY_TARGET" = "devbox.example.com" ]
+  [ "$ENTRY_NAME" = "my-session" ]
+}
+
+@test "parse_registry_line: bare (pre-migration) entry takes the current target" {
+  # shellcheck disable=SC2034 # read by parse_registry_line below.
+  SSH_TARGET="devbox.example.com"
+  parse_registry_line "my-session"
+  [ "$ENTRY_TARGET" = "devbox.example.com" ]
+  [ "$ENTRY_NAME" = "my-session" ]
 }

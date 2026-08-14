@@ -44,10 +44,12 @@ prompts. `codersync` exists to make all of that a non-issue.
 - **One-time setup, not per-run configuration** — `codersync --setup`
   validates connectivity and `tmux` availability once; every later
   invocation just works.
-- **Two split strategies** — split server-side in `tmux` (default; works
-  from any terminal with plain `tmux`, no local dependency) or split
-  locally via iTerm2's native scripting API (lets you attach to just one
-  pane independently from elsewhere, but requires iTerm2).
+- **Two split strategies** — split server-side in `tmux` (default; opens
+  the tab automatically with iTerm2, or just prints the attach command
+  when it's not installed, so the remote side works with any terminal
+  regardless) or split locally via iTerm2's native scripting API (lets
+  you attach to just one pane independently from elsewhere, but requires
+  iTerm2, no fallback).
 - **Fails loudly, not silently** — a missing tool or unreachable box
   produces a clear error before anything is created, not a tab that
   quietly does nothing.
@@ -58,9 +60,11 @@ prompts. `codersync` exists to make all of that a non-issue.
   from your own `~/.ssh/config`) with `tmux` installed.
 - At least one CLI coding agent installed on that box (see
   [Supported tools](#supported-tools) below).
-- macOS, for the local side (uses `ssh`/`tmux` either way; `osascript`
-  is only invoked for `--split-mode iterm`, which additionally requires
-  iTerm2).
+- macOS, for the local side. `--split-mode tmux` (default) uses iTerm2's
+  scripting API to open the tab when iTerm2 is installed, and otherwise
+  prints the attach command for you to run in any terminal yourself.
+  `--split-mode iterm` requires iTerm2 — there's no fallback for that
+  mode, since the split itself is done via iTerm2's own API.
 
 ## Installation
 
@@ -114,9 +118,11 @@ Config lives at `~/.config/codersync/config`.
 Opens a new tab and sets up the two-agent split. Options:
 
 - **`--split-mode tmux`** (default) — one `tmux` session with two panes
-  split server-side. The local side just opens a tab and attaches once.
-  Works from any terminal with plain `tmux`, no iTerm2 dependency. You
-  can't attach to just one pane independently, since it's one session.
+  split server-side. The local side just opens a tab and attaches once;
+  with iTerm2 installed that tab opens automatically, and without it
+  `codersync` prints the attach command for you to run in any terminal
+  yourself instead. You can't attach to just one pane independently,
+  since it's one session.
 - **`--split-mode iterm`** — two separate `tmux` sessions, split locally
   by iTerm2's native scripting API. Lets you attach to just the left or
   right pane independently from elsewhere. Requires iTerm2 (plus a

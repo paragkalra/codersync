@@ -89,12 +89,15 @@
 # full scrollback/state) with no manual intervention.
 #
 # Every session name is appended to a local registry
-# (~/.codersync_sessions) the first time it's used. `codersync
-# --restore-all` reads that registry, checks which of those tmux sessions
-# are still actually alive on the box (pruning any that aren't from the
-# registry), and reopens an iTerm2 tab for each survivor -- meant for
-# recovering after iTerm2 gets closed: nothing on the box was ever lost,
-# this just recreates the local tabs.
+# (~/.codersync_sessions), tagged with the ssh-target it was created
+# against, the first time it's used. `codersync --restore-all` reads
+# that registry, checks which entries for the CURRENTLY configured
+# target are still actually alive there (pruning any that aren't) and
+# reopens a tab for each survivor -- meant for recovering after your
+# terminal gets closed: nothing on the box was ever lost, this just
+# recreates the local tabs. Entries for a different target (from before
+# a later --setup pointed elsewhere) are left untouched either way,
+# since their aliveness can't be checked without connecting there.
 #
 # NOTE ssh gotcha worth knowing if you touch this script: passing a
 # remote command to ssh as multiple separate arguments makes ssh rejoin
@@ -114,12 +117,50 @@ CONFIG_DIR="$HOME/.config/codersync"
 CONFIG_FILE="$CONFIG_DIR/config"
 REGISTRY="$HOME/.codersync_sessions"
 
+# Input validation, all for the same reason: ssh-target, remote-dir, and
+# session names all eventually get interpolated UNQUOTED into a heredoc
+# sent to `bash -s` on the remote box (needed so this script's own local
+# variables substitute before the heredoc is sent -- see the ssh gotcha
+# note near the top of this file). That means any of these containing a
+# shell metacharacter doesn't just misbehave, it runs on the remote box:
+# confirmed live, `codersync 'x; touch /tmp/pwn'` created that file
+# remotely. Restricting each to a safe, realistic character set up front
+# is far more robust than trying to out-escape arbitrary input through
+# the several nested quoting layers these values pass through (that
+# approach has already produced multiple real bugs in this codebase).
+validate_ssh_target() {
+  [[ "$1" =~ ^[A-Za-z0-9@._-]+$ ]]
+}
+
+validate_remote_dir() {
+  [[ "$1" =~ ^[A-Za-z0-9_./~-]+$ ]]
+}
+
+# Deliberately excludes `.` too, even though it might look path-safe,
+# because tmux's own -t target parser treats `.` as the window/pane
+# separator (see sanitize_label() above) -- a literal one breaks tmux
+# target resolution the same way regardless of whether it came from the
+# ssh-target or a user-supplied session name.
+validate_session_name() {
+  [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]]
+}
+
 setup() {
   local target="${1:-}"
   local remote_dir="${2:-~/repos}"
 
   if [[ -z "$target" ]]; then
     echo "Usage: codersync --setup <ssh-target> [remote-dir]" >&2
+    exit 1
+  fi
+
+  if ! validate_ssh_target "$target"; then
+    echo "Invalid ssh-target '${target}': only letters, digits, and . _ - @ are allowed." >&2
+    exit 1
+  fi
+
+  if ! validate_remote_dir "$remote_dir"; then
+    echo "Invalid remote-dir '${remote_dir}': only letters, digits, and . _ - / ~ are allowed." >&2
     exit 1
   fi
 
@@ -143,14 +184,20 @@ setup() {
   fi
 
   mkdir -p "$CONFIG_DIR"
-  # Single-quoted: load_config() sources this file, and bash tilde-expands
-  # an unquoted `~` in a VAR=~/path assignment even when sourced -- using
-  # *this* machine's home directory, not a literal string. That silently
-  # turned REMOTE_DIR into a local, nonexistent path on the remote box,
-  # which fell back to $HOME there without ever erroring (confirmed live).
+  # printf %q, not naive quoting: load_config() sources this file, and
+  # (a) bash tilde-expands an unquoted `~` in a VAR=~/path assignment
+  # even when single-quoted -- that silently turned REMOTE_DIR into a
+  # local, nonexistent path on the remote box, which fell back to $HOME
+  # there without ever erroring (confirmed live); %q escapes the `~`
+  # itself so it stays literal on source. (b) naive single-quoting
+  # breaks -- or with a crafted value, injects -- if the value contains
+  # its own single quote (e.g. a real path like /home/o'brien/repos);
+  # %q handles that correctly too. validate_ssh_target/validate_remote_dir
+  # above already reject quote characters, so this is defense in depth,
+  # not the only thing standing between untrusted input and this file.
   {
-    echo "SSH_TARGET='${target}'"
-    echo "REMOTE_DIR='${remote_dir}'"
+    printf 'SSH_TARGET=%q\n' "$target"
+    printf 'REMOTE_DIR=%q\n' "$remote_dir"
   } > "$CONFIG_FILE"
   echo "Done. codersync will use ${target} for claude-<session>/codex-<session>, starting in ${remote_dir}."
 }
@@ -165,6 +212,22 @@ setup() {
 sanitize_label() {
   local s="$1"
   echo "${s//[@:.\/]/-}"
+}
+
+# Parses one registry line into ENTRY_TARGET/ENTRY_NAME globals. Lines
+# from before the per-target format existed are bare names with no tab
+# -- treated as belonging to the current target (a one-time migration
+# assumption; see register_session()/restore_all() below). Pulled out
+# as its own function so it's unit-testable in isolation.
+parse_registry_line() {
+  local line="$1"
+  if [[ "$line" == *$'\t'* ]]; then
+    ENTRY_TARGET="${line%%$'\t'*}"
+    ENTRY_NAME="${line#*$'\t'}"
+  else
+    ENTRY_TARGET="$SSH_TARGET"
+    ENTRY_NAME="$line"
+  fi
 }
 
 load_config() {
@@ -242,6 +305,34 @@ as_escape() {
 # entirely instead of trying to out-escape it.
 b64() { printf '%s' "$1" | base64; }
 
+# A short random alphanumeric string for use in a remote temp-file name.
+# Deterministic /tmp paths are a real risk on a shared/multi-user remote
+# box: another user could pre-create a symlink at a guessable path
+# pointing at a file we don't intend to touch, and our `>` redirect
+# would follow it. Randomizing the path each run makes that
+# infeasible to pre-plant; `set -C` (noclobber) in the heredocs that
+# write these files is the second layer -- it makes the write fail
+# outright rather than follow a symlink if something's already there.
+random_suffix() {
+  if [[ -r /dev/urandom ]]; then
+    head -c 16 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 12
+  else
+    printf '%s' "${RANDOM}${RANDOM}${RANDOM}"
+  fi
+}
+
+# True if iTerm2 is actually installed/controllable via AppleScript.
+# `--split-mode tmux`'s whole point is not depending on iTerm2 (the
+# split lives server-side in tmux; the local side only opens a tab and
+# attaches once) -- but until there's a non-macOS/non-iTerm2 way to
+# actually open that tab, this still shells out to iTerm2 when it's
+# available and falls back to printing the attach command otherwise, so
+# the tool at least degrades gracefully instead of just failing.
+iterm2_available() {
+  command -v osascript >/dev/null 2>&1 || return 1
+  [[ "$(osascript -e 'exists application "iTerm2"' 2>/dev/null)" == "true" ]]
+}
+
 # Create both detached tmux sessions on the remote box. Idempotent: if a
 # session already exists, `tmux new-session` fails for that line (`&&`
 # short-circuits so we don't re-arm the hook on top of a running tool)
@@ -268,15 +359,24 @@ remote_setup() {
   local safe="${4:-0}"
   local claude_tmux="claude-${session}"
   local codex_tmux="codex-${session}"
-  local cmd1 cmd2 bin1 bin2 cmd1_b64 cmd2_b64 script1 script2
+  local cmd1 cmd2 bin1 bin2 cmd1_b64 cmd2_b64 bin1_b64 bin2_b64 script1 script2
   cmd1="$(resolve_tool "$tool1" "$session" "$safe")"
   cmd2="$(resolve_tool "$tool2" "$session" "$safe")"
   bin1="${cmd1%% *}"
   bin2="${cmd2%% *}"
   cmd1_b64="$(b64 "$cmd1")"
   cmd2_b64="$(b64 "$cmd2")"
-  script1="/tmp/codersync-${claude_tmux}.sh"
-  script2="/tmp/codersync-${codex_tmux}.sh"
+  # bin1/bin2 are base64'd too, not interpolated as raw text like the
+  # rest of this function's b64 comment describes -- a raw --tools value
+  # with a shell metacharacter (confirmed live with a $IFS-based payload)
+  # otherwise gets interpreted by the remote shell right here, in the
+  # existence-check line itself, before the actual b64-decoded launch
+  # script is even written. Decoding into a remote variable and using it
+  # quoted ("$bin1") closes that off regardless of what bin1 contains.
+  bin1_b64="$(b64 "$bin1")"
+  bin2_b64="$(b64 "$bin2")"
+  script1="/tmp/codersync-${claude_tmux}-$(random_suffix).sh"
+  script2="/tmp/codersync-${codex_tmux}-$(random_suffix).sh"
   # Tool existence is checked remotely, but ONLY when actually about to
   # create a session (guarded by `has-session`) -- not on every call.
   # restore_all always passes placeholder "claude"/"codex" regardless of
@@ -288,20 +388,23 @@ remote_setup() {
   # the local script exited 0 with no output, and the only trace was a
   # "command not found" line inside the pane itself (confirmed live).
   # shellcheck disable=SC2087 # intentional: local expansion is the point --
-  # ${claude_tmux}/${bin1}/etc. below are THIS script's variables and must
-  # substitute before the heredoc is sent; only the \$-escaped ones are
-  # meant to survive as literal text for the remote shell to evaluate.
+  # ${claude_tmux}/${bin1_b64}/etc. below are THIS script's variables and
+  # must substitute before the heredoc is sent; only the \$-escaped ones
+  # are meant to survive as literal text for the remote shell to evaluate.
   if ! ssh "$SSH_TARGET" -- bash -s <<EOF
 set -e
+set -C
+bin1=\$(echo ${bin1_b64} | base64 -d)
+bin2=\$(echo ${bin2_b64} | base64 -d)
 if ! tmux has-session -t ${claude_tmux} 2>/dev/null; then
-  command -v ${bin1} >/dev/null 2>&1 || { echo "codersync: ${bin1} not found on \$(hostname)" >&2; exit 1; }
+  command -v "\$bin1" >/dev/null 2>&1 || { echo "codersync: \$bin1 not found on \$(hostname)" >&2; exit 1; }
   echo ${cmd1_b64} | base64 -d > ${script1}
   tmux new-session -d -s ${claude_tmux} -c ${REMOTE_DIR}
   tmux set-hook -t ${claude_tmux} client-attached "run-shell 'tmux send-keys -t ${claude_tmux} \"bash ${script1}\" Enter; tmux set-hook -u -t ${claude_tmux} client-attached'"
   tmux set-option -t ${claude_tmux} status off
 fi
 if ! tmux has-session -t ${codex_tmux} 2>/dev/null; then
-  command -v ${bin2} >/dev/null 2>&1 || { echo "codersync: ${bin2} not found on \$(hostname)" >&2; exit 1; }
+  command -v "\$bin2" >/dev/null 2>&1 || { echo "codersync: \$bin2 not found on \$(hostname)" >&2; exit 1; }
   echo ${cmd2_b64} | base64 -d > ${script2}
   tmux new-session -d -s ${codex_tmux} -c ${REMOTE_DIR}
   tmux set-hook -t ${codex_tmux} client-attached "run-shell 'tmux send-keys -t ${codex_tmux} \"bash ${script2}\" Enter; tmux set-hook -u -t ${codex_tmux} client-attached'"
@@ -369,15 +472,21 @@ remote_setup_tmux_mode() {
   local tool2="${3:-codex}"
   local safe="${4:-0}"
   local pair_tmux="pair-${session}"
-  local cmd1 cmd2 bin1 bin2 cmd1_b64 cmd2_b64 script1 script2
+  local cmd1 cmd2 bin1 bin2 cmd1_b64 cmd2_b64 bin1_b64 bin2_b64 script1 script2
   cmd1="$(resolve_tool "$tool1" "$session" "$safe")"
   cmd2="$(resolve_tool "$tool2" "$session" "$safe")"
   bin1="${cmd1%% *}"
   bin2="${cmd2%% *}"
   cmd1_b64="$(b64 "$cmd1")"
   cmd2_b64="$(b64 "$cmd2")"
-  script1="/tmp/codersync-${pair_tmux}-0.sh"
-  script2="/tmp/codersync-${pair_tmux}-1.sh"
+  # bin1/bin2 are base64'd too -- see the comment in remote_setup() above
+  # for why (a raw --tools value with a shell metacharacter otherwise
+  # gets interpreted by the remote shell in the existence-check line
+  # itself; confirmed live with a $IFS-based payload).
+  bin1_b64="$(b64 "$bin1")"
+  bin2_b64="$(b64 "$bin2")"
+  script1="/tmp/codersync-${pair_tmux}-0-$(random_suffix).sh"
+  script2="/tmp/codersync-${pair_tmux}-1-$(random_suffix).sh"
   # Tool existence is checked remotely, but ONLY when actually about to
   # create the session (guarded by `has-session`), not on every call --
   # see the comment in remote_setup() for why (restore_all always passes
@@ -388,10 +497,13 @@ remote_setup_tmux_mode() {
   # shellcheck disable=SC2087 # intentional -- see remote_setup() above.
   if ! ssh "$SSH_TARGET" -- bash -s <<EOF
 set -e
+set -C
+bin1=\$(echo ${bin1_b64} | base64 -d)
+bin2=\$(echo ${bin2_b64} | base64 -d)
 if ! tmux has-session -t ${pair_tmux} 2>/dev/null; then
   missing=""
-  command -v ${bin1} >/dev/null 2>&1 || missing="\${missing} ${bin1}"
-  command -v ${bin2} >/dev/null 2>&1 || missing="\${missing} ${bin2}"
+  command -v "\$bin1" >/dev/null 2>&1 || missing="\${missing} \$bin1"
+  command -v "\$bin2" >/dev/null 2>&1 || missing="\${missing} \$bin2"
   if [ -n "\${missing}" ]; then
     echo "codersync: not found on \$(hostname):\${missing}" >&2
     exit 1
@@ -411,15 +523,23 @@ EOF
 }
 
 # --split-mode tmux: open a tab and run ONE attach command -- the split
-# already exists server-side, so there's nothing to split locally.
+# already exists server-side, so there's nothing to split locally. Falls
+# back to printing the attach command when iTerm2 isn't available, since
+# this mode's whole point is not depending on it (see iterm2_available()).
 open_tab_tmux_mode() {
   local session="$1"
   local pair_tmux="pair-${session}"
 
-  local title_cmd="printf '\033]0;${session}\007'"
   # shellcheck disable=SC2016 # intentional -- see open_tab() above.
   local attach='while true; do ssh -t '"${SSH_TARGET}"' -- tmux attach -t '"${pair_tmux}"'; echo "[$(date +%H:%M:%S)] disconnected, retrying in 2s..."; sleep 2; done'
 
+  if ! iterm2_available; then
+    echo "iTerm2 not found -- open a new tab/terminal yourself and run:"
+    echo "  $attach"
+    return 0
+  fi
+
+  local title_cmd="printf '\033]0;${session}\007'"
   local title_esc attach_esc
   title_esc="$(as_escape "$title_cmd")"
   attach_esc="$(as_escape "$attach")"
@@ -443,18 +563,37 @@ end tell
 APPLESCRIPT
 }
 
-# Appends session to the registry if it isn't already recorded.
+# Appends session to the registry if it isn't already recorded, tagged
+# with the CURRENT ssh-target (format: "<target>\t<session-name>" per
+# line). Storing the target is what lets restore_all tell "genuinely
+# dead" apart from "belongs to a different box than the one currently
+# configured" -- without it, switching --setup to a different box and
+# running --restore-all silently deleted every entry for the PREVIOUS
+# box, since they don't show up in the current box's tmux session list
+# either way and looked indistinguishable from stale ones.
 register_session() {
   local session="$1"
   touch "$REGISTRY"
-  grep -qxF "$session" "$REGISTRY" || echo "$session" >> "$REGISTRY"
+  local line="${SSH_TARGET}"$'\t'"${session}"
+  grep -qxF "$line" "$REGISTRY" || echo "$line" >> "$REGISTRY"
 }
 
-# Reopens a tab for every registry entry that still has a live tmux
-# session on the remote box, and prunes entries that don't. Each entry
-# might be either split mode -- detected from which pattern is actually
-# alive (claude-<name>/codex-<name> for iterm mode, pair-<name> for tmux
-# mode), not stored separately, so the registry format stays unchanged.
+# Reopens a tab for every registry entry that belongs to the currently
+# configured target and still has a live tmux session there, and prunes
+# entries that don't. Each entry might be either split mode -- detected
+# from which pattern is actually alive (claude-<name>/codex-<name> for
+# iterm mode, pair-<name> for tmux mode), not stored separately.
+#
+# Entries for a DIFFERENT target (from before a later `--setup` pointed
+# codersync elsewhere) are left completely untouched: not restored (would
+# need connecting to that other box), not pruned (they might be alive
+# and well there, just not checkable from here).
+#
+# Entries written before this per-target format existed are bare names
+# with no tab -- treated as belonging to the current target (a
+# reasonable one-time migration assumption, since anything already in
+# the registry was necessarily created against whatever was configured
+# at the time).
 restore_all() {
   touch "$REGISTRY"
   local live
@@ -464,24 +603,49 @@ restore_all() {
 
   local kept=()
   local restored=0
-  while IFS= read -r name; do
-    [[ -z "$name" ]] && continue
-    if grep -qxF "claude-${name}" <<<"$live" || grep -qxF "codex-${name}" <<<"$live"; then
-      echo "Restoring (iterm-split): $name"
-      # Args here don't matter: the sessions already exist, so
+  local skipped_other_target=0
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    parse_registry_line "$line"
+    local entry_target="$ENTRY_TARGET" entry_name="$ENTRY_NAME"
+
+    if [[ "$entry_target" != "$SSH_TARGET" ]]; then
+      kept+=("${entry_target}"$'\t'"${entry_name}")
+      skipped_other_target=$((skipped_other_target + 1))
+      continue
+    fi
+
+    local has_claude=0 has_codex=0 has_pair=0
+    grep -qxF "claude-${entry_name}" <<<"$live" && has_claude=1
+    grep -qxF "codex-${entry_name}" <<<"$live" && has_codex=1
+    grep -qxF "pair-${entry_name}" <<<"$live" && has_pair=1
+
+    if [[ "$has_claude" == 1 && "$has_codex" == 1 ]]; then
+      echo "Restoring (iterm-split): $entry_name"
+      # Args here don't matter: both sessions already exist, so
       # `tmux new-session` just no-ops and nothing gets (re)launched.
-      remote_setup "$name" claude codex
-      open_tab "$name"
-      kept+=("$name")
+      remote_setup "$entry_name" claude codex
+      open_tab "$entry_name"
+      kept+=("${entry_target}"$'\t'"${entry_name}")
       restored=$((restored + 1))
-    elif grep -qxF "pair-${name}" <<<"$live"; then
-      echo "Restoring (tmux-split): $name"
-      remote_setup_tmux_mode "$name" claude codex
-      open_tab_tmux_mode "$name"
-      kept+=("$name")
+    elif [[ "$has_pair" == 1 ]]; then
+      echo "Restoring (tmux-split): $entry_name"
+      remote_setup_tmux_mode "$entry_name" claude codex
+      open_tab_tmux_mode "$entry_name"
+      kept+=("${entry_target}"$'\t'"${entry_name}")
       restored=$((restored + 1))
+    elif [[ "$has_claude" == 1 || "$has_codex" == 1 ]]; then
+      # Only one side of an iterm-split pair survives -- the other was
+      # likely killed on purpose. Not calling remote_setup here is the
+      # point: it would otherwise recreate the missing half with default
+      # claude/codex, silently discarding whatever --tools the pair was
+      # originally created with (which this registry doesn't track).
+      # Kept in the registry since it's not actually dead -- pruning it
+      # would make a later restore-all forget about the surviving pane.
+      echo "Skipping '$entry_name': only one of claude/codex is still alive -- not auto-recreating the other with default tools. Run codersync again with this session's name if you want both back."
+      kept+=("${entry_target}"$'\t'"${entry_name}")
     else
-      echo "Pruning stale entry (no live tmux session): $name"
+      echo "Pruning stale entry (no live tmux session): $entry_name"
     fi
   done < "$REGISTRY"
 
@@ -489,6 +653,9 @@ restore_all() {
     printf '%s\n' "${kept[@]}" > "$REGISTRY"
   else
     : > "$REGISTRY"
+  fi
+  if [[ "$skipped_other_target" -gt 0 ]]; then
+    echo "Skipped ${skipped_other_target} entry/entries for a different configured box -- re-run --setup for that box, then --restore-all again, to check those."
   fi
   echo "Restored ${restored} session(s)."
 }
@@ -546,6 +713,10 @@ split_tools() {
 # bats' `run` without going through the full dispatch/network calls.
 parse_run_args() {
   RAW_NAME="$1"
+  if ! validate_session_name "$RAW_NAME"; then
+    echo "Invalid session name '${RAW_NAME}': only letters, digits, '-', and '_' are allowed." >&2
+    exit 1
+  fi
   shift
   SPLIT_MODE="tmux"
   TOOLS="claude,codex"
@@ -553,11 +724,25 @@ parse_run_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --split-mode)
-        SPLIT_MODE="${2:-tmux}"
+        # Checked explicitly rather than just `${2:-tmux}`: with that
+        # alone, `--tools --safe-mode` silently consumed --safe-mode as
+        # --tools' own value (TOOLS became the literal string
+        # "--safe-mode", SAFE_MODE stayed 0) instead of erroring, and a
+        # flag as the very last argument with no value at all failed via
+        # `shift 2`'s own error rather than this function's message.
+        if [[ $# -lt 2 || "$2" == --* ]]; then
+          echo "--split-mode requires a value (iterm or tmux)" >&2
+          exit 1
+        fi
+        SPLIT_MODE="$2"
         shift 2
         ;;
       --tools)
-        TOOLS="${2:-claude,codex}"
+        if [[ $# -lt 2 || "$2" == --* ]]; then
+          echo "--tools requires a value (e.g. claude,codex)" >&2
+          exit 1
+        fi
+        TOOLS="$2"
         shift 2
         ;;
       --safe-mode)
