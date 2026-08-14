@@ -36,6 +36,13 @@ prompts. `codersync` exists to make all of that a non-issue.
   session still alive on the remote box, even if you closed your
   terminal entirely. Nothing on the box is ever lost; this just
   recreates the local view.
+- **Numbered sessions, easy cleanup** — every session gets a small
+  numeric ID (`1-`, `2-`, `3-`, ...) so you can list everything running
+  on the box with `codersync --list-all` and kill specific ones with
+  `codersync --kill 1,3` or a range like `codersync --kill 1-4`, without
+  having to type or remember full session names. `codersync --kill-all`
+  clears every codersync session on the box in one go (with a
+  confirmation prompt first).
 - **Works with any SSH-reachable box** — not tied to any specific
   cloud-dev provider. If you can `ssh` into it and it has `tmux`, it
   works.
@@ -86,7 +93,10 @@ codersync my-feature
 
 `my-feature` becomes the session name; the box name gets folded in
 automatically (e.g. `devbox-example-com-my-feature`) so names stay
-unambiguous if you ever point `codersync` at more than one box.
+unambiguous if you ever point `codersync` at more than one box. Each
+session also gets a small numeric ID prefixed on the remote side (e.g.
+`3-devbox-example-com-my-feature`) so you can refer to it later with
+`--list-all` / `--kill` instead of typing the full name.
 
 ## Usage
 
@@ -94,6 +104,9 @@ unambiguous if you ever point `codersync` at more than one box.
 codersync --setup <ssh-target> [remote-dir]
 codersync <session-name> [--split-mode iterm|tmux] [--tools t1,t2] [--safe-mode]
 codersync --restore-all
+codersync --list-all
+codersync --kill <ids>
+codersync --kill-all
 codersync --help
 ```
 
@@ -141,6 +154,44 @@ name gets appended to. Meant for recovering after your terminal gets
 closed: nothing on the remote box was ever lost, this just recreates the
 local tabs. Stale entries (sessions no longer alive) are pruned
 automatically.
+
+### `codersync --list-all`
+
+Lists every codersync session still alive on the remote box, with its
+numeric ID and split mode:
+
+```
+ID     MODE     SESSION
+1      tmux     devbox-example-com-my-feature
+2      iterm    devbox-example-com-another-task
+```
+
+This talks directly to the remote `tmux` server, so it reflects reality
+even if the local registry is stale or you're on a different machine
+than the one that created the sessions.
+
+### `codersync --kill <ids>`
+
+Kills specific sessions on the remote box by ID, leaving everything else
+untouched:
+
+```
+codersync --kill 1,3      # kill sessions 1 and 3 only
+codersync --kill 1-4      # kill sessions 1, 2, 3, and 4
+codersync --kill 1,3-5    # mix commas and ranges
+```
+
+For an `iterm`-split session this kills both the `claude` and `codex`
+tmux sessions behind it; for a `tmux`-split session it kills the single
+paired session. Only the local registry entry for a fully-killed session
+is cleaned up — everything else on the box is left alone.
+
+### `codersync --kill-all`
+
+Kills every codersync session on the box in one go, including legacy
+sessions from before the numeric-ID scheme existed (which `--kill` can't
+address individually). Prints the full list of what's about to die and
+asks for a `y/N` confirmation first — there's no undo once you say yes.
 
 ## Supported tools
 

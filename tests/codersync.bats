@@ -114,6 +114,86 @@ setup() {
   [ "$first" != "$second" ]
 }
 
+# --- next_session_id / find_or_assign_id / parse_numbered_session -------
+
+@test "next_session_id: starts at 1 and increments" {
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  [ "$(next_session_id)" = "1" ]
+  [ "$(next_session_id)" = "2" ]
+  [ "$(next_session_id)" = "3" ]
+}
+
+@test "parse_numbered_session: extracts a leading numeric ID" {
+  parse_numbered_session "claude-" "claude-3-devbox-example-com-foo"
+  [ "$PARSED_ID" = "3" ]
+  [ "$PARSED_REST" = "devbox-example-com-foo" ]
+}
+
+@test "parse_numbered_session: legacy session with no ID leaves PARSED_ID empty" {
+  parse_numbered_session "claude-" "claude-devbox-review-alex-8349"
+  [ "$PARSED_ID" = "" ]
+  [ "$PARSED_REST" = "devbox-review-alex-8349" ]
+}
+
+@test "find_or_assign_id: allocates a fresh ID when nothing matches" {
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  [ "$(find_or_assign_id "devbox.example.com" "devbox-example-com-foo")" = "1" ]
+}
+
+@test "find_or_assign_id: reuses the existing ID for the same target+name" {
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t5-devbox-example-com-foo\n' > "$REGISTRY"
+  [ "$(find_or_assign_id "devbox.example.com" "devbox-example-com-foo")" = "5" ]
+}
+
+@test "find_or_assign_id: does not reuse an ID belonging to a different target" {
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  # shellcheck disable=SC2034 # read by next_session_id, called below.
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'some-other-box\t5-devbox-example-com-foo\n' > "$REGISTRY"
+  [ "$(find_or_assign_id "devbox.example.com" "devbox-example-com-foo")" = "1" ]
+}
+
+# --- parse_kill_spec -----------------------------------------------------
+
+@test "parse_kill_spec: comma-separated list" {
+  result="$(parse_kill_spec '1,2,4' | tr '\n' ',')"
+  [ "$result" = "1,2,4," ]
+}
+
+@test "parse_kill_spec: a range" {
+  result="$(parse_kill_spec '1-4' | tr '\n' ',')"
+  [ "$result" = "1,2,3,4," ]
+}
+
+@test "parse_kill_spec: a mix of single values and ranges" {
+  result="$(parse_kill_spec '1,3-5,8' | tr '\n' ',')"
+  [ "$result" = "1,3,4,5,8," ]
+}
+
+@test "parse_kill_spec: de-duplicates and sorts" {
+  result="$(parse_kill_spec '4,1,1,2' | tr '\n' ',')"
+  [ "$result" = "1,2,4," ]
+}
+
+@test "parse_kill_spec: rejects a backwards range" {
+  run parse_kill_spec '5-2'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"start must be <= end"* ]]
+}
+
+@test "parse_kill_spec: rejects a non-numeric token" {
+  run parse_kill_spec 'abc'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Invalid --kill token"* ]]
+}
+
 # --- sanitize_label -------------------------------------------------------
 
 @test "sanitize_label: leaves a plain hostname unchanged" {
