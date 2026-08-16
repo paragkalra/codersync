@@ -38,8 +38,9 @@ prompts. `codersync` exists to make all of that a non-issue.
   closed your terminal entirely. Nothing on the box is ever lost; this
   just recreates the local view.
 - **Numbered sessions, easy cleanup.** Every session gets a small
-  numeric ID (`1-`, `2-`, `3-`, ...) so you can list everything running
-  on the box with `codersync --list-all` and kill specific ones with
+  numeric ID (`1-`, `2-`, `3-`, ...) so you can list registry-backed
+  codersync sessions running on the box with `codersync --list-all`
+  and kill specific ones with
   `codersync --kill 1,3` or a range like `codersync --kill 1-4`, without
   having to type or remember full session names. `codersync --kill-all`
   clears every registry-backed codersync session on the box in one go
