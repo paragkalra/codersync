@@ -243,8 +243,18 @@ setup() {
     exit 1
   fi
 
+  # `ssh host -- command -v X`, unlike an actual interactive login to
+  # that box, runs a non-interactive shell that doesn't source
+  # ~/.bashrc/~/.profile -- so a tool installed somewhere only added to
+  # PATH by one of those (e.g. ~/.local/bin, the default install
+  # location for pipx/pip --user/npm-with-a-user-prefix/etc.) reports as
+  # missing here even though it works fine in a real interactive
+  # session (confirmed live: claude/codex installed under
+  # ~/.local/bin). The `PATH=... command` prefix-assignment form sets
+  # PATH for just that one command, same idea as every other remote
+  # existence check in this file.
   echo "Checking tmux is available on ${target}..."
-  if ! ssh "$target" -- command -v tmux >/dev/null 2>&1; then
+  if ! ssh "$target" -- 'PATH="$HOME/.local/bin:$HOME/bin:$PATH" command -v tmux' >/dev/null 2>&1; then
     echo "tmux isn't installed on ${target}. Install it there (e.g. 'sudo apt install tmux') and re-run setup." >&2
     exit 1
   fi
@@ -255,7 +265,7 @@ setup() {
   # impossible on a minimal image) would otherwise fail opaquely on the
   # very first `codersync <name>` invocation instead of during setup.
   echo "Checking bash is available on ${target}..."
-  if ! ssh "$target" -- command -v bash >/dev/null 2>&1; then
+  if ! ssh "$target" -- 'PATH="$HOME/.local/bin:$HOME/bin:$PATH" command -v bash' >/dev/null 2>&1; then
     echo "bash isn't installed on ${target}. Install it there and re-run setup." >&2
     exit 1
   fi
@@ -861,10 +871,20 @@ remote_setup() {
   # ${claude_tmux}/${bin1_b64}/etc. below are THIS script's variables and
   # must substitute before the heredoc is sent; only the \$-escaped ones
   # are meant to survive as literal text for the remote shell to evaluate.
+  # `export PATH=...` here for the same reason as the tmux/bash checks
+  # in setup(): a non-interactive `ssh ... bash -s` doesn't source
+  # ~/.bashrc/~/.profile, so a tool only on PATH because one of those
+  # adds it (e.g. ~/.local/bin, where pipx/pip --user/etc. install)
+  # reports as missing here even though it runs fine in a real
+  # interactive session (confirmed live: claude/codex under
+  # ~/.local/bin). This is the existence check itself, not the actual
+  # launch below -- the launch runs inside a real tmux pane's own
+  # interactive shell, which sources those files normally.
   if ! ssh "$SSH_TARGET" -- bash -s <<EOF
 set -e
 set -C
 umask 077
+export PATH="\$HOME/.local/bin:\$HOME/bin:\$PATH"
 bin1=\$(echo ${bin1_b64} | base64 -d)
 bin2=\$(echo ${bin2_b64} | base64 -d)
 need_claude=0
@@ -994,6 +1014,7 @@ remote_setup_tmux_mode() {
 set -e
 set -C
 umask 077
+export PATH="\$HOME/.local/bin:\$HOME/bin:\$PATH"
 bin1=\$(echo ${bin1_b64} | base64 -d)
 bin2=\$(echo ${bin2_b64} | base64 -d)
 if ! tmux has-session -t ${pair_tmux} 2>/dev/null; then
@@ -1733,7 +1754,11 @@ sync_skills() {
   fi
 
   echo "Checking rsync is available on ${SSH_TARGET}..."
-  if ! ssh "$SSH_TARGET" -- command -v rsync >/dev/null 2>&1; then
+  # PATH-prefixed for the same reason as setup()'s tmux/bash checks: a
+  # non-interactive `ssh ... command -v` doesn't source
+  # ~/.bashrc/~/.profile, so rsync installed only under e.g. ~/.local/bin
+  # would otherwise report as missing here.
+  if ! ssh "$SSH_TARGET" -- 'PATH="$HOME/.local/bin:$HOME/bin:$PATH" command -v rsync' >/dev/null 2>&1; then
     echo "codersync: rsync isn't installed on ${SSH_TARGET}. Install it there (e.g. 'sudo apt install rsync') and re-run --sync-skills." >&2
     exit 1
   fi
