@@ -115,6 +115,7 @@ codersync --list-all|-l
 codersync --kill|-k <ids>
 codersync --kill-all|-K
 codersync --paste-image|-p
+codersync --sync-skills|-y
 codersync --help|-h
 ```
 
@@ -258,6 +259,27 @@ clipboard, or if it's larger than 25MB (almost certainly the wrong
 thing was copied). Bind it to a hotkey with your automation tool of
 choice (macOS Shortcuts, Keyboard Maestro, Raycast/Alfred) if you want
 one keystroke instead of switching to a terminal to run it.
+
+### `codersync --sync-skills|-y`
+
+Copies your locally-authored agent skills to the same path on the
+current target, via `rsync`, so a session started there has the same
+skills a local session would:
+
+```
+$ codersync --sync-skills
+Syncing claude skills (~/.claude/skills) to devbox.example.com...
+Syncing codex skills (~/.codex/skills) to devbox.example.com...
+```
+
+Only covers tools with a confirmed skills-directory convention:
+`claude` (`~/.claude/skills`) and `codex` (`~/.codex/skills`, excluding
+`~/.codex/skills/.system` — that ships bundled with Codex itself, not
+authored by you). A tool with nothing local to sync is skipped
+silently rather than treated as an error. Re-run any time after
+adding or editing a skill; already-synced files are skipped.
+`agy`/`aider`/`kimi` aren't covered — none has a confirmed
+skills-directory convention to sync against.
 
 ## Supported tools
 

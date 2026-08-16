@@ -1306,3 +1306,22 @@ setup() {
   [[ "$output" == *"got extra"* ]]
   [[ "$output" == *"-k"* ]]
 }
+
+@test "dispatch: --sync-skills rejects extra trailing arguments" {
+  # Checked before load_config, so this never touches the network or
+  # any real config either.
+  run "${BATS_TEST_DIRNAME}/../codersync" --sync-skills extra
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
+}
+
+@test "dispatch: -y is accepted as a shorthand for --sync-skills" {
+  # Same arity check, same code path -- -y extra should be rejected the
+  # exact same way --sync-skills extra is, proving the alias reaches
+  # the same case branch rather than falling through to the catch-all
+  # "unknown session name" dispatch.
+  run "${BATS_TEST_DIRNAME}/../codersync" -y extra
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
+  [[ "$output" == *"-y"* ]]
+}

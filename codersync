@@ -6,6 +6,7 @@
 #        codersync --kill|-k <ids>   (e.g. 1,2,4 or 1-4)
 #        codersync --kill-all|-K
 #        codersync --paste-image|-p
+#        codersync --sync-skills|-y
 #
 # Every flag above has a single-letter short form -- --setup/-s and
 # --safe-mode/-s share the letter "s" deliberately: they're parsed in
@@ -1681,6 +1682,84 @@ EOF
   echo "Paste (Cmd+V) into the session to insert the path."
 }
 
+# `codersync --sync-skills` -- copies locally-authored agent skills to
+# the same path on the remote box, so a claude/codex session started
+# there via codersync has the same skills a local session would.
+#
+# Only covers tools whose skills-directory convention has actually been
+# confirmed against a real local install: claude (~/.claude/skills) and
+# codex (~/.codex/skills). agy, aider, and kimi -- the other keys
+# resolve_tool() knows about -- aren't installed on this machine to
+# verify a convention against, and this tool doesn't guess unverified
+# paths, same principle as resolve_tool()'s own comment on known-key
+# flags being sourced and verified rather than assumed.
+#
+# ~/.codex/skills/.system ships bundled with Codex itself, not authored
+# by the user -- excluded so this only ever copies skills the user
+# actually created, not Codex's own default library (which already
+# exists wherever Codex is installed on the remote box, with no help
+# from this tool).
+#
+# Uses rsync rather than the base64/heredoc mechanism the rest of this
+# tool uses for single files: a skills directory is an arbitrary tree
+# of files, and rsync already handles that -- plus incremental re-syncs
+# after a local edit -- correctly. Reinventing that over a heredoc would
+# just be a worse rsync. No --delete: a skill that only exists on the
+# remote box is left alone rather than silently removed.
+sync_skills() {
+  # Discovery happens BEFORE either rsync check below, and the function
+  # returns early if there's nothing to sync -- otherwise a machine with
+  # no local skills for any known tool (or only ~/.codex/skills/.system,
+  # which never counts) would report a misleading "rsync isn't
+  # installed on <target>" if the remote box happens to lack rsync,
+  # instead of the intended no-op message, even though rsync would
+  # never actually have been needed.
+  local sync_claude=0 sync_codex=0
+
+  if [[ -d "$HOME/.claude/skills" ]] &&
+     find "$HOME/.claude/skills" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q .; then
+    sync_claude=1
+  fi
+
+  if [[ -d "$HOME/.codex/skills" ]] &&
+     find "$HOME/.codex/skills" -mindepth 1 -maxdepth 1 ! -name '.system' -print -quit 2>/dev/null | grep -q .; then
+    sync_codex=1
+  fi
+
+  if [[ "$sync_claude" -eq 0 && "$sync_codex" -eq 0 ]]; then
+    echo "No locally-authored skills found for any supported tool (checked: claude, codex)."
+    return
+  fi
+
+  echo "Checking rsync is available locally..."
+  if ! command -v rsync >/dev/null 2>&1; then
+    echo "codersync: rsync isn't installed locally. Install it (e.g. 'brew install rsync') and try again." >&2
+    exit 1
+  fi
+
+  echo "Checking rsync is available on ${SSH_TARGET}..."
+  if ! ssh "$SSH_TARGET" -- command -v rsync >/dev/null 2>&1; then
+    echo "codersync: rsync isn't installed on ${SSH_TARGET}. Install it there (e.g. 'sudo apt install rsync') and re-run --sync-skills." >&2
+    exit 1
+  fi
+
+  if [[ "$sync_claude" -eq 1 ]]; then
+    echo "Syncing claude skills (~/.claude/skills) to ${SSH_TARGET}..."
+    if ! rsync -az "$HOME/.claude/skills/" "${SSH_TARGET}:.claude/skills/"; then
+      echo "codersync: failed to sync claude skills to ${SSH_TARGET}." >&2
+      exit 1
+    fi
+  fi
+
+  if [[ "$sync_codex" -eq 1 ]]; then
+    echo "Syncing codex skills (~/.codex/skills) to ${SSH_TARGET}..."
+    if ! rsync -az --exclude='.system' "$HOME/.codex/skills/" "${SSH_TARGET}:.codex/skills/"; then
+      echo "codersync: failed to sync codex skills to ${SSH_TARGET}." >&2
+      exit 1
+    fi
+  fi
+}
+
 print_help() {
   cat <<'HELP'
 Usage:
@@ -1692,6 +1771,7 @@ Usage:
   codersync --kill|-k <ids>                                 Kill sessions by ID (e.g. 1,2,4 or 1-4)
   codersync --kill-all|-K                                   Kill every codersync session (asks to confirm)
   codersync --paste-image|-p                                Upload a clipboard image, copy its remote path
+  codersync --sync-skills|-y                                Copy local claude/codex skills to the remote box
   codersync --help|-h                                       Show this help
 
 <ssh-target> is a hostname, user@host, or an alias from ~/.ssh/config --
@@ -1774,6 +1854,15 @@ all. Pasting the resulting path afterward is just ordinary text, so it
 goes through ssh/tmux exactly like any other paste. Fails clearly if
 there's no image on the clipboard, or if it's larger than 25MB
 (almost certainly the wrong thing was copied).
+
+--sync-skills/-y: rsyncs locally-authored agent skills to the same path
+on the current target -- ~/.claude/skills for claude, ~/.codex/skills
+for codex (excluding ~/.codex/skills/.system, which ships bundled with
+Codex itself rather than being something you wrote). Only these two
+tools are covered -- agy, aider, and kimi have no confirmed
+skills-directory convention to sync against. A tool with nothing local
+to sync is skipped, not treated as an error. Re-run any time after
+adding or editing a skill locally; already-synced files are skipped.
 HELP
 }
 
@@ -1981,12 +2070,21 @@ case "${1:-}" in
     paste_image
     exit 0
     ;;
+  --sync-skills|-y)
+    if [[ $# -gt 1 ]]; then
+      echo "codersync: $1 takes no arguments -- got extra: ${*:2}" >&2
+      exit 1
+    fi
+    load_config
+    sync_skills
+    exit 0
+    ;;
   --help|-h)
     print_help
     exit 0
     ;;
   "")
-    echo "Usage: codersync --setup|-s <ssh-target> [remote-dir] | codersync <session-name> | codersync --restore-all|-r | codersync --list-all|-l | codersync --kill|-k <ids> | codersync --kill-all|-K | codersync --paste-image|-p" >&2
+    echo "Usage: codersync --setup|-s <ssh-target> [remote-dir] | codersync <session-name> | codersync --restore-all|-r | codersync --list-all|-l | codersync --kill|-k <ids> | codersync --kill-all|-K | codersync --paste-image|-p | codersync --sync-skills|-y" >&2
     echo "Run 'codersync --help' for more." >&2
     exit 1
     ;;
