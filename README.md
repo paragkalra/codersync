@@ -1,18 +1,19 @@
 # codersync
 
-Open one terminal tab, get two AI coding agents running side by side on a
-remote dev box — persistent, auto-reconnecting, and outliving your laptop
-closing.
+Pair [Claude Code](https://claude.com/claude-code) and [Codex](https://openai.com/codex/)
+(or any CLI coding agent) side by side over SSH and `tmux`, on a remote
+dev box, with persistent, auto-reconnecting sessions that outlive your
+laptop closing.
 
 ```
 $ codersync my-feature
 ```
 
-opens a new tab split into two panes, each SSH'd into your configured
-remote box, running two CLI coding agents (Claude Code and Codex by
-default) inside `tmux`. Close your laptop, lose wifi, restart your
-machine — the agents keep running on the remote box regardless, and
-`codersync` reattaches automatically.
+opens a new terminal tab split into two panes, each SSH'd into your
+configured remote box, running two CLI coding agents (Claude Code and
+Codex by default) inside `tmux`. Close your laptop, lose wifi, restart
+your machine: the agents keep running on the remote box regardless,
+and `codersync` reattaches automatically.
 
 ## Why
 
@@ -25,45 +26,45 @@ prompts. `codersync` exists to make all of that a non-issue.
 
 ## Features
 
-- **One command, two agents side by side** — a single terminal tab,
+- **One command, two agents side by side.** A single terminal tab,
   split into a left/right pane, each running a different (or the same)
   CLI coding agent.
-- **Survives everything** — agents run inside `tmux` on the remote box,
+- **Survives everything.** Agents run inside `tmux` on the remote box,
   not in your local terminal. Closing your laptop, a wifi blip, or a VPN
   reconnect doesn't kill the session; each pane detects the drop and
   reattaches automatically within a couple of seconds.
-- **Crash recovery** — `codersync --restore-all` reopens tabs for every
+- **Crash recovery.** `codersync --restore-all` reopens tabs for every
   session still alive on the remote box, even if you closed your
   terminal entirely. Nothing on the box is ever lost; this just
   recreates the local view.
-- **Numbered sessions, easy cleanup** — every session gets a small
+- **Numbered sessions, easy cleanup.** Every session gets a small
   numeric ID (`1-`, `2-`, `3-`, ...) so you can list everything running
   on the box with `codersync --list-all` and kill specific ones with
   `codersync --kill 1,3` or a range like `codersync --kill 1-4`, without
   having to type or remember full session names. `codersync --kill-all`
   clears every codersync session on the box in one go (with a
   confirmation prompt first).
-- **Works with any SSH-reachable box** — not tied to any specific
+- **Works with any SSH-reachable box.** Not tied to any specific
   cloud-dev provider. If you can `ssh` into it and it has `tmux`,
   `bash`, and `base64`, it works.
-- **Paste images across the ssh boundary** — claude/codex read the
+- **Paste images across the ssh boundary.** claude/codex read the
   clipboard on whatever machine they're running on, which is the
   remote box, not your Mac, so a plain paste can't reach an image sitting
   on your local clipboard. `codersync --paste-image` (or `-p`) uploads
   it and puts the resulting remote path on your clipboard instead, so
   your next Cmd+V pastes a path the agent can read normally.
-- **Any two CLI agents, not just two** — `--tools` picks which two CLI
+- **Any two CLI agents, not just two.** `--tools` picks which two CLI
   agents run left/right, including the same one twice.
-- **One-time setup, not per-run configuration** — `codersync --setup`
+- **One-time setup, not per-run configuration.** `codersync --setup`
   validates connectivity, `tmux`/`bash`/`base64` availability, and that
   the remote directory exists, once; every later invocation just works.
-- **Two split strategies** — split server-side in `tmux` (default; opens
+- **Two split strategies.** Split server-side in `tmux` (default; opens
   the tab automatically with iTerm2, or just prints the attach command
   when it's not installed, so the remote side works with any terminal
   regardless) or split locally via iTerm2's native scripting API (lets
   you attach to just one pane independently from elsewhere, but requires
   iTerm2, no fallback).
-- **Fails loudly, not silently** — a missing tool or unreachable box
+- **Fails loudly, not silently.** A missing tool or unreachable box
   produces a clear error before anything is created, not a tab that
   quietly does nothing.
 
@@ -77,7 +78,7 @@ prompts. `codersync` exists to make all of that a non-issue.
 - macOS, for the local side. `--split-mode tmux` (default) uses iTerm2's
   scripting API to open the tab when iTerm2 is installed, and otherwise
   prints the attach command for you to run in any terminal yourself.
-  `--split-mode iterm` requires iTerm2 — there's no fallback for that
+  `--split-mode iterm` requires iTerm2; there's no fallback for that
   mode, since the split itself is done via iTerm2's own API.
 
 ## Installation
@@ -120,7 +121,7 @@ codersync --help|-h
 ```
 
 Every flag has the single-letter short form shown next to it.
-`--setup`/`-s` and `--safe-mode`/`-s` deliberately share the letter —
+`--setup`/`-s` and `--safe-mode`/`-s` deliberately share the letter:
 they're parsed in two entirely separate contexts (top-level dispatch
 decides `--setup`-vs-a-session-name first; `--safe-mode` only exists
 within a session-name invocation's own options), so there's no
@@ -131,20 +132,20 @@ one-character-case typo away from each other.
 ### `codersync --setup|-s <ssh-target> [remote-dir]`
 
 One-time setup. `<ssh-target>` is a plain hostname, `user@host`, or an
-alias from your own `~/.ssh/config` — restricted to letters, digits, and
+alias from your own `~/.ssh/config`, restricted to letters, digits, and
 `. _ - @` (this is deliberately narrower than everything `ssh` itself
 accepts: it's what gets safely embedded into remote commands and tab
 titles). Forms like `host:2222` or a bracketed IPv6 address aren't
-accepted directly — put those in a `~/.ssh/config` `Host` alias instead
+accepted directly; put those in a `~/.ssh/config` `Host` alias instead
 and pass the alias here. `[remote-dir]` is where the agents start
 (default: `~/repos`).
 
 Setup checks the box is reachable over SSH, has `tmux`, `bash`, and
-`base64` installed, and that `[remote-dir]` actually exists there —
+`base64` installed, and that `[remote-dir]` actually exists there,
 *before* saving anything (a typo'd path won't fail loudly later:
 `tmux` silently falls back to a default directory instead of erroring
 on a bad one, so this is the only place that catches it). `codersync`
-has no dependency on any specific remote/cloud-dev provider — any box
+has no dependency on any specific remote/cloud-dev provider; any box
 reachable over plain SSH with those three tools works. As an optional
 convenience, if
 `<ssh-target>` matches the alias pattern used by the
@@ -158,20 +159,20 @@ Config lives at `~/.config/codersync/config`.
 
 Opens a new tab and sets up the two-agent split. Options:
 
-- **`--split-mode`/`-m tmux`** (default) — one `tmux` session with two
+- **`--split-mode`/`-m tmux`** (default): one `tmux` session with two
   panes split server-side. The local side just opens a tab and attaches
   once; with iTerm2 installed that tab opens automatically, and without
   it `codersync` prints the attach command for you to run in any
   terminal yourself instead. You can't attach to just one pane
   independently, since it's one session.
-- **`--split-mode`/`-m iterm`** — two separate `tmux` sessions, split
+- **`--split-mode`/`-m iterm`**: two separate `tmux` sessions, split
   locally by iTerm2's native scripting API. Lets you attach to just the
   left or right pane independently from elsewhere. Requires iTerm2
   (plus a one-time Automation-permission prompt the first time it
   controls it).
-- **`--tools`/`-t t1,t2`** (default: `claude,codex`) — which two CLI
+- **`--tools`/`-t t1,t2`** (default: `claude,codex`): which two CLI
   agents run left/right. See [Supported tools](#supported-tools).
-- **`--safe-mode`/`-s`** — drop the auto-approve flag for known
+- **`--safe-mode`/`-s`**: drop the auto-approve flag for known
   `--tools`/`-t` keys, so normal permission prompts apply instead of
   the dangerous auto-approve default. See [Security](#security) below.
 
@@ -200,8 +201,8 @@ This talks directly to the remote `tmux` server, so a session that's
 died (killed outside codersync, the box rebooted) correctly drops off
 the list even if its registry entry is still there. Both checks are
 required, though: a session that's alive on the box but missing from
-*this* registry — because you're on a different machine than the one
-that created it, or the registry was cleared — won't show up here.
+*this* registry, because you're on a different machine than the one
+that created it or the registry was cleared, won't show up here.
 Its tmux session itself is completely unaffected; there's currently no
 built-in command to re-adopt it into the registry, so reattach to it
 directly with `ssh <ssh-target> -- tmux attach -t <session-name>`
@@ -221,14 +222,14 @@ codersync --kill 1,3-5    # mix commas and ranges
 For an `iterm`-split session this kills both the `claude` and `codex`
 tmux sessions behind it; for a `tmux`-split session it kills the single
 paired session. Only the local registry entry for a fully-killed session
-is cleaned up — everything else on the box is left alone.
+is cleaned up; everything else on the box is left alone.
 
 ### `codersync --kill-all|-K`
 
 Kills every codersync session on the box in one go, including legacy
 sessions from before the numeric-ID scheme existed (which `--kill` can't
 address individually). Prints the full list of what's about to die and
-asks for a `y/N` confirmation first — there's no undo once you say yes.
+asks for a `y/N` confirmation first; there's no undo once you say yes.
 
 ### `codersync --paste-image|-p`
 
@@ -236,13 +237,13 @@ Claude Code (and most CLI agents) read the clipboard by shelling out to
 a *local* utility (`pbpaste` on macOS, `xclip`/`wl-paste` on Linux) on
 whatever machine the process is actually running on. Since the whole
 point of codersync is running that process on the remote box, a plain
-paste there tries to read the *remote* box's clipboard — empty, no
-display server — not your Mac's, where the image actually is.
+paste there tries to read the *remote* box's clipboard: empty, no
+display server, not your Mac's, where the image actually is.
 
 `--paste-image` sidesteps that instead of trying to forward binary
 clipboard data live: it reads whatever image is on your local
 clipboard (copy a screenshot, or copy an image from a browser/Slack/
-Preview — anything that puts image data on the clipboard works),
+Preview, anything that puts image data on the clipboard works),
 uploads it to the current target as a real file, and replaces your
 clipboard content with that file's path instead of the image:
 
@@ -253,7 +254,7 @@ Paste (Cmd+V) into the session to insert the path.
 ```
 
 Your next `Cmd+V` into the session then pastes that path as plain
-text — no binary data crosses the ssh/tmux boundary at all, so there's
+text; no binary data crosses the ssh/tmux boundary at all, so there's
 nothing for tmux to mangle. Fails clearly if there's no image on the
 clipboard, or if it's larger than 25MB (almost certainly the wrong
 thing was copied). Bind it to a hotkey with your automation tool of
@@ -274,11 +275,11 @@ Syncing codex skills (~/.codex/skills) to devbox.example.com...
 
 Only covers tools with a confirmed skills-directory convention:
 `claude` (`~/.claude/skills`) and `codex` (`~/.codex/skills`, excluding
-`~/.codex/skills/.system` — that ships bundled with Codex itself, not
+`~/.codex/skills/.system`, which ships bundled with Codex itself, not
 authored by you). A tool with nothing local to sync is skipped
 silently rather than treated as an error. Re-run any time after
 adding or editing a skill; already-synced files are skipped.
-`agy`/`aider`/`kimi` aren't covered — none has a confirmed
+`agy`/`aider`/`kimi` aren't covered: none has a confirmed
 skills-directory convention to sync against.
 
 ## Supported tools
@@ -295,7 +296,7 @@ tool's skip-approval flag) or a literal command for anything else:
 | `kimi`   | `kimi --yolo` ([Kimi Code CLI](https://moonshotai.github.io/kimi-code/)) |
 
 Anything not on this list is run as a literal command, so any CLI agent
-works even without a short key — just give the exact command including
+works even without a short key; just give the exact command including
 its own skip-approval flag:
 
 ```
@@ -306,28 +307,28 @@ The same tool can be used for both panes too: `--tools claude,claude`.
 
 A literal command can also start with a `NAME=value` environment
 assignment (an ordinary, valid way to write that under bash), e.g.
-`--tools 'OPENAI_API_KEY=sk-... some-agent',claude` — codersync skips
+`--tools 'OPENAI_API_KEY=sk-... some-agent',claude`; codersync skips
 past it when checking that the actual agent binary exists remotely.
 That check only understands a plain, unquoted value, though: if the
 value itself needs a literal space, prefix with `env` instead of
 writing the assignment directly, e.g. `--tools 'env
-SOME_VAR="has a space" some-agent',claude` — `env` gets checked for
+SOME_VAR="has a space" some-agent',claude`. `env` gets checked for
 existence trivially (it's virtually always installed), and the actual
 command still runs exactly as typed.
 
-A literal command can't contain a comma, though — `,` is the
+A literal command can't contain a comma, though: `,` is the
 separator between the two `--tools` values, with no escaping syntax:
 `--tools 'agent --model a,b'` doesn't mean "one tool with a comma in
 its flag", it splits into two (wrong) tools at that comma the same as
 `claude,codex` would. `--tools` also only ever accepts exactly one
-comma (or zero, to use the same tool for both panes) — codersync only
+comma (or zero, to use the same tool for both panes); codersync only
 runs two tools, left and right, so `--tools claude,codex,aider` is
 rejected outright rather than silently dropping the third.
 
 ## Security
 
 By default, every known `--tools` key launches with that tool's
-auto-approve/skip-permissions flag — the agent will read, edit, and
+auto-approve/skip-permissions flag: the agent will read, edit, and
 execute commands **without asking for confirmation**. This is
 intentional (the whole point is a hands-off session you can walk away
 from), but it means you should only point `codersync` at a box/directory
@@ -343,7 +344,7 @@ codersync my-feature --safe-mode
 
 `--safe-mode` only affects known `--tools` keys. If you pass a literal
 command via `--tools`, whether it's dangerous is entirely up to what you
-typed — just don't include a skip-approval flag if you don't want one.
+typed; just don't include a skip-approval flag if you don't want one.
 
 ## How it works
 
@@ -360,7 +361,7 @@ typed — just don't include a skip-approval flag if you don't want one.
   the remote host regardless of the real pane size.
 - Each pane's attach command runs in a retry loop, so a dropped
   connection (sleep, wifi, VPN) just reattaches a couple of seconds
-  after the connection is back — the agent itself was never
+  after the connection is back; the agent itself was never
   interrupted, since it was running in `tmux` on the remote box the
   whole time.
 - Tool availability is checked on the remote box *before* creating
