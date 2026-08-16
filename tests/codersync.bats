@@ -1231,6 +1231,35 @@ setup() {
   [[ "$output" == *"got extra"* ]]
 }
 
+@test "dispatch: --setup with no target shows usage with an example" {
+  # Checked before any SSH/network access inside setup(), so this never
+  # touches the network or any real config.
+  run "${BATS_TEST_DIRNAME}/../codersync" --setup
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Example: codersync --setup"* ]]
+}
+
+@test "dispatch: --setup help shows usage instead of trying to SSH into a host named 'help'" {
+  # Regression test: "help" passes validate_ssh_target (it's just
+  # letters), so without this special case setup() would attempt a real
+  # SSH connection to a host literally named "help" instead of showing
+  # guidance -- confusing for anyone reaching for the common `<command>
+  # help` convention.
+  run "${BATS_TEST_DIRNAME}/../codersync" --setup help
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Example: codersync --setup"* ]]
+}
+
+@test "dispatch: --setup --help and --setup -h also show usage, not a real setup attempt" {
+  run "${BATS_TEST_DIRNAME}/../codersync" --setup --help
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Example: codersync --setup"* ]]
+
+  run "${BATS_TEST_DIRNAME}/../codersync" --setup -h
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Example: codersync --setup"* ]]
+}
+
 @test "dispatch: --restore-all rejects extra trailing arguments" {
   # Same as --setup above -- checked before load_config, so this never
   # touches the network or any real config either.
