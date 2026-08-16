@@ -34,16 +34,16 @@ prompts. `codersync` exists to make all of that a non-issue.
   reconnect doesn't kill the session; each pane detects the drop and
   reattaches automatically within a couple of seconds.
 - **Crash recovery.** `codersync --restore-all` reopens tabs for every
-  session still alive on the remote box, even if you closed your
-  terminal entirely. Nothing on the box is ever lost; this just
-  recreates the local view.
+  registry-backed session still alive on the remote box, even if you
+  closed your terminal entirely. Nothing on the box is ever lost; this
+  just recreates the local view.
 - **Numbered sessions, easy cleanup.** Every session gets a small
   numeric ID (`1-`, `2-`, `3-`, ...) so you can list everything running
   on the box with `codersync --list-all` and kill specific ones with
   `codersync --kill 1,3` or a range like `codersync --kill 1-4`, without
   having to type or remember full session names. `codersync --kill-all`
-  clears every codersync session on the box in one go (with a
-  confirmation prompt first).
+  clears every registry-backed codersync session on the box in one go
+  (with a confirmation prompt first).
 - **Works with any SSH-reachable box.** Not tied to any specific
   cloud-dev provider. If you can `ssh` into it and it has `tmux`,
   `bash`, and `base64`, it works.
@@ -226,10 +226,12 @@ is cleaned up; everything else on the box is left alone.
 
 ### `codersync --kill-all|-K`
 
-Kills every codersync session on the box in one go, including legacy
-sessions from before the numeric-ID scheme existed (which `--kill` can't
-address individually). Prints the full list of what's about to die and
-asks for a `y/N` confirmation first; there's no undo once you say yes.
+Kills every registry-backed codersync session on the box in one go
+(recorded in this local registry and still alive on the current
+target), including legacy sessions from before the numeric-ID scheme
+existed (which `--kill` can't address individually). Prints the full
+list of what's about to die and asks for a `y/N` confirmation first;
+there's no undo once you say yes.
 
 ### `codersync --paste-image|-p`
 
