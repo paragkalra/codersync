@@ -76,10 +76,13 @@ prompts. `codersync` exists to make all of that a non-issue.
   installed. `--setup` checks all three before saving anything.
 - At least one CLI coding agent installed on that box (see
   [Supported tools](#supported-tools) below).
-- macOS, for the local side. `--split-mode tmux` (default) uses iTerm2's
-  scripting API to open the tab when iTerm2 is installed, and otherwise
-  prints the attach command for you to run in any terminal yourself.
-  `--split-mode iterm` requires iTerm2; there's no fallback for that
+- macOS is required for automatic iTerm2 tab opening and for
+  `--paste-image`; those are the only macOS-specific parts. Setup, run,
+  `--list-all`, and `--kill`/`--kill-all` don't otherwise depend on it.
+  `--split-mode tmux` (default) uses iTerm2's scripting API to open the
+  tab when iTerm2 is installed, and otherwise prints the attach command
+  for you to run in any terminal yourself, on any OS. `--split-mode
+  iterm` requires iTerm2 (and so macOS); there's no fallback for that
   mode, since the split itself is done via iTerm2's own API.
 
 ## Installation
