@@ -57,8 +57,8 @@ prompts. `codersync` exists to make all of that a non-issue.
 - **Any two CLI agents, not just two.** `--tools` picks which two CLI
   agents run left/right, including the same one twice.
 - **One-time setup, not per-run configuration.** `codersync --setup`
-  validates connectivity, `tmux`/`bash`/`base64` availability, and that
-  the remote directory exists, once; every later invocation just works.
+  validates connectivity and `tmux`/`bash`/`base64` availability once;
+  every later invocation just works.
 - **Two split strategies.** Split server-side in `tmux` (default; opens
   the tab automatically with iTerm2, or just prints the attach command
   when it's not installed, so the remote side works with any terminal
@@ -142,14 +142,14 @@ accepts: it's what gets safely embedded into remote commands and tab
 titles). Forms like `host:2222` or a bracketed IPv6 address aren't
 accepted directly; put those in a `~/.ssh/config` `Host` alias instead
 and pass the alias here. `[remote-dir]` is where the agents start
-(default: `~/repos`).
+(default: `~`, the remote user's home directory). It isn't checked for
+existence; the default always exists, and a custom one is on you to
+get right (a typo'd path doesn't error, since `tmux` silently falls
+back to a default directory instead).
 
-Setup checks the box is reachable over SSH, has `tmux`, `bash`, and
-`base64` installed, and that `[remote-dir]` actually exists there,
-*before* saving anything (a typo'd path won't fail loudly later:
-`tmux` silently falls back to a default directory instead of erroring
-on a bad one, so this is the only place that catches it). `codersync`
-has no dependency on any specific remote/cloud-dev provider; any box
+Setup checks the box is reachable over SSH and has `tmux`, `bash`, and
+`base64` installed, *before* saving anything. `codersync` has no
+dependency on any specific remote/cloud-dev provider; any box
 reachable over plain SSH with those three tools works. As an optional
 convenience, if
 `<ssh-target>` matches the alias pattern used by the
