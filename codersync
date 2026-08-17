@@ -282,7 +282,15 @@ setup() {
   # specific `-d` decode form this tool relies on (a non-GNU/minimal
   # one could accept different flags, or none at all).
   echo "Checking base64 is available on ${target}..."
-  if ! ssh "$target" -- 'test "$(printf codersync | base64 | base64 -d)" = codersync' 2>/dev/null; then
+  # PATH-prefixed like the tmux/bash checks above, and for a slightly
+  # different reason than those: the actual runtime `base64 -d` calls
+  # (inside the bash -s heredocs) already run with this same extended
+  # PATH, via the `export PATH=...` those heredocs set at the top --
+  # without it here too, this check could be STRICTER than reality,
+  # rejecting a box where base64 only lives under ~/.local/bin even
+  # though the real remote_setup/remote_setup_tmux_mode calls would
+  # have worked fine.
+  if ! ssh "$target" -- 'PATH="$HOME/.local/bin:$HOME/bin:$PATH" test "$(printf codersync | base64 | base64 -d)" = codersync' 2>/dev/null; then
     echo "base64 on ${target} doesn't support the 'base64 -d' decode form codersync needs (or isn't installed at all). Install a compatible base64 (e.g. GNU coreutils) and re-run setup." >&2
     exit 1
   fi
@@ -881,7 +889,7 @@ remote_setup() {
   # ~/.local/bin). This is the existence check itself, not the actual
   # launch below -- the launch runs inside a real tmux pane's own
   # interactive shell, which sources those files normally.
-  if ! ssh "$SSH_TARGET" -- bash -s <<EOF
+  if ! ssh "$SSH_TARGET" -- 'PATH="$HOME/.local/bin:$HOME/bin:$PATH" bash -s' <<EOF
 set -e
 set -C
 umask 077
@@ -1011,7 +1019,7 @@ remote_setup_tmux_mode() {
   # Without this check at all, a missing tool failed completely silently
   # on fresh creation (confirmed live).
   # shellcheck disable=SC2087 # intentional -- see remote_setup() above.
-  if ! ssh "$SSH_TARGET" -- bash -s <<EOF
+  if ! ssh "$SSH_TARGET" -- 'PATH="$HOME/.local/bin:$HOME/bin:$PATH" bash -s' <<EOF
 set -e
 set -C
 umask 077
@@ -1337,6 +1345,18 @@ attach_session() {
       [[ "$ENTRY_TARGET" != "$SSH_TARGET" ]] && continue
       parse_numbered_session "" "$ENTRY_NAME"
       if [[ "$PARSED_ID" == "$canon" ]]; then
+        # entry_name (built from PARSED_ID/PARSED_REST below) gets
+        # spliced unquoted into a remote bash heredoc by
+        # remote_setup/remote_setup_tmux_mode -- unlike the name branch
+        # below, where a match requires exact equality with an
+        # already-validated, known-safe string, ANY registry entry can
+        # match here purely by having the right leading ID segment, so
+        # its REST is never otherwise checked for safety. Same defense
+        # as restore_all: reject rather than trust it.
+        if ! validate_session_name "$ENTRY_NAME"; then
+          echo "codersync: registry entry for ID ${canon} contains unsafe characters ('${ENTRY_NAME}') -- refusing to use it. Run codersync --restore-all to prune unsafe entries." >&2
+          exit 1
+        fi
         found=1
         match_id="$PARSED_ID"
         match_rest="$PARSED_REST"
@@ -1359,6 +1379,16 @@ attach_session() {
       [[ "$ENTRY_TARGET" != "$SSH_TARGET" ]] && continue
       parse_numbered_session "" "$ENTRY_NAME"
       if [[ "$PARSED_REST" == "$suffix" ]]; then
+        # $suffix is built from an already-validated $arg, so a match
+        # here can't actually contain anything unsafe -- checked anyway,
+        # for the same reason `cd --` is still used even though
+        # validate_remote_dir already rejects a leading dash: cheap
+        # defense in depth, not the only thing standing between this and
+        # a poisoned entry.
+        if ! validate_session_name "$ENTRY_NAME"; then
+          echo "codersync: registry entry for '${arg}' contains unsafe characters ('${ENTRY_NAME}') -- refusing to use it. Run codersync --restore-all to prune unsafe entries." >&2
+          exit 1
+        fi
         found=1
         match_id="$PARSED_ID"
         match_rest="$PARSED_REST"
@@ -1515,7 +1545,7 @@ remote_kill_session() {
   # ${name_b64}/${cleanup_cmd} below are THIS script's variables and must
   # substitute before the heredoc is sent; only the \$-escaped one is
   # meant to survive as literal text for the remote shell to evaluate.
-  ssh "$SSH_TARGET" -- bash -s <<EOF 2>/dev/null
+  ssh "$SSH_TARGET" -- 'PATH="$HOME/.local/bin:$HOME/bin:$PATH" bash -s' <<EOF 2>/dev/null
 name=\$(echo ${name_b64} | base64 -d)
 tmux kill-session -t "\$name" 2>/dev/null || true
 ${cleanup_cmd}
@@ -1775,7 +1805,7 @@ paste_image() {
   # shellcheck disable=SC2087 # intentional: local expansion is the
   # point -- ${encoded}/${remote_path} below are THIS script's
   # variables and must substitute before the heredoc is sent.
-  if ! ssh "$SSH_TARGET" -- bash -s <<EOF
+  if ! ssh "$SSH_TARGET" -- 'PATH="$HOME/.local/bin:$HOME/bin:$PATH" bash -s' <<EOF
 set -e
 set -C
 umask 077

@@ -1037,6 +1037,9 @@ setup() {
 
 @test "attach_session: errors on an unregistered name without touching the network" {
   SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by attach_session below (it builds
+  # "${TARGET_LABEL}-${arg}" to match against), invisible to shellcheck
+  # since that function lives in the sourced codersync file, not here.
   TARGET_LABEL="devbox-example-com"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   : > "$REGISTRY"
@@ -1049,8 +1052,9 @@ setup() {
 }
 
 @test "attach_session: errors on an invalid name without touching the network" {
+  # No TARGET_LABEL here: validate_session_name rejects "bad;name"
+  # before attach_session ever reaches the line that would read it.
   SSH_TARGET="devbox.example.com"
-  TARGET_LABEL="devbox-example-com"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   : > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
@@ -1066,7 +1070,6 @@ setup() {
   # though "3" is technically a valid session NAME too, a registry entry
   # whose NAME happens to be "3" must not match a numeric lookup for ID 3.
   SSH_TARGET="devbox.example.com"
-  TARGET_LABEL="devbox-example-com"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\tdevbox-example-com-3\n' > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
