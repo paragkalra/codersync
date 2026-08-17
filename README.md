@@ -37,14 +37,16 @@ prompts. `codersync` exists to make all of that a non-issue.
   registry-backed session still alive on the remote box, even if you
   closed your terminal entirely. Nothing on the box is ever lost; this
   just recreates the local view.
-- **Numbered sessions, easy cleanup.** Every session gets a small
+- **Numbered sessions, easy management.** Every session gets a small
   numeric ID (`1-`, `2-`, `3-`, ...) so you can list registry-backed
-  codersync sessions running on the box with `codersync --list-all`
-  and kill specific ones with
-  `codersync --kill 1,3` or a range like `codersync --kill 1-4`, without
-  having to type or remember full session names. `codersync --kill-all`
-  clears every registry-backed codersync session on the box in one go
-  (with a confirmation prompt first).
+  codersync sessions running on the box with `codersync --list-all`,
+  reconnect to a specific one with `codersync --attach 3` (errors
+  instead of creating a new one if that ID/name doesn't exist), and
+  kill specific ones with `codersync --kill 1,3` or a range like
+  `codersync --kill 1-4`, without having to type or remember full
+  session names. `codersync --kill-all` clears every registry-backed
+  codersync session on the box in one go (with a confirmation prompt
+  first).
 - **Works with any SSH-reachable box.** Not tied to any specific
   cloud-dev provider. If you can `ssh` into it and it has `tmux`,
   `bash`, and `base64`, it works.
@@ -108,13 +110,14 @@ automatically (e.g. `devbox-example-com-my-feature`) so names stay
 unambiguous if you ever point `codersync` at more than one box. Each
 session also gets a small numeric ID prefixed on the remote side (e.g.
 `3-devbox-example-com-my-feature`) so you can refer to it later with
-`--list-all` / `--kill` instead of typing the full name.
+`--list-all` / `--attach` / `--kill` instead of typing the full name.
 
 ## Usage
 
 ```
 codersync --setup|-s <ssh-target> [remote-dir]
 codersync <session-name> [--split-mode|-m iterm|tmux] [--tools|-t t1,t2] [--safe-mode|-s]
+codersync --attach|-a <id-or-name>
 codersync --restore-all|-r
 codersync --list-all|-l
 codersync --kill|-k <ids>
@@ -179,6 +182,26 @@ Opens a new tab and sets up the two-agent split. Options:
 - **`--safe-mode`/`-s`**: drop the auto-approve flag for known
   `--tools`/`-t` keys, so normal permission prompts apply instead of
   the dangerous auto-approve default. See [Security](#security) below.
+
+### `codersync --attach|-a <id-or-name>`
+
+Reconnects to one specific existing session, by its numeric ID (see
+`--list-all`/`-l`) or its plain name (what you originally typed to
+`codersync <name>`, without the target-label/ID prefix that gets
+folded in):
+
+```
+codersync --attach 3
+codersync --attach my-feature
+```
+
+Unlike plain `codersync <name>`, which creates a session if one
+doesn't already exist, `--attach` errors instead — a typo can't
+accidentally spin up a brand-new paired session when you meant to
+reconnect to an old one. A purely-numeric argument is always read as
+an ID, never as a literal name, even though digits-only happens to be
+a valid session name too (same precedent as `--kill`/`-k`).
+Registry-scoped, same as `--list-all`/`-l`/`--kill`/`-k`/`--kill-all`/`-K`.
 
 ### `codersync --restore-all|-r`
 

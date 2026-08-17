@@ -997,6 +997,86 @@ setup() {
   [ ! -s "$REGISTRY" ]
 }
 
+# --- attach_session -----------------------------------------------------
+
+@test "attach_session: errors on an unregistered ID without touching the network" {
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  ssh() { echo "unexpected: $*" >> "$BATS_TEST_TMPDIR/unexpected_ssh_calls"; }
+  run attach_session "3"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no session with ID 3"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
+}
+
+@test "attach_session: errors on an invalid ID (0) without touching the network" {
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  ssh() { echo "unexpected: $*" >> "$BATS_TEST_TMPDIR/unexpected_ssh_calls"; }
+  run attach_session "0"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"isn't a valid session ID"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
+}
+
+@test "attach_session: finds a registered ID belonging to a different target's entry as not found" {
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'some-other-box\t3-some-other-box-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  ssh() { echo "unexpected: $*" >> "$BATS_TEST_TMPDIR/unexpected_ssh_calls"; }
+  run attach_session "3"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no session with ID 3"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
+}
+
+@test "attach_session: errors on an unregistered name without touching the network" {
+  SSH_TARGET="devbox.example.com"
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  ssh() { echo "unexpected: $*" >> "$BATS_TEST_TMPDIR/unexpected_ssh_calls"; }
+  run attach_session "my-feature"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no session named 'my-feature'"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
+}
+
+@test "attach_session: errors on an invalid name without touching the network" {
+  SSH_TARGET="devbox.example.com"
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  ssh() { echo "unexpected: $*" >> "$BATS_TEST_TMPDIR/unexpected_ssh_calls"; }
+  run attach_session "bad;name"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"isn't a valid session ID or name"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
+}
+
+@test "attach_session: a purely-numeric arg is read as an ID, never as a literal name" {
+  # Regression guard for the documented precedent (same as --kill): even
+  # though "3" is technically a valid session NAME too, a registry entry
+  # whose NAME happens to be "3" must not match a numeric lookup for ID 3.
+  SSH_TARGET="devbox.example.com"
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\tdevbox-example-com-3\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  ssh() { echo "unexpected: $*" >> "$BATS_TEST_TMPDIR/unexpected_ssh_calls"; }
+  run attach_session "3"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no session with ID 3"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
+}
+
 # --- session_is_owned / unrelated-session sweep defense ----------------
 
 @test "session_is_owned: true when a no-ID rest has a matching registry entry" {
@@ -1353,4 +1433,29 @@ setup() {
   [ "$status" -eq 1 ]
   [[ "$output" == *"got extra"* ]]
   [[ "$output" == *"-y"* ]]
+}
+
+@test "dispatch: --attach requires an id-or-name argument (missing-arg check, no real config needed)" {
+  # Checked before load_config, so this never touches the network or
+  # any real config either.
+  run "${BATS_TEST_DIRNAME}/../codersync" --attach
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Usage: codersync --attach|-a"* ]]
+}
+
+@test "dispatch: --attach rejects extra trailing arguments" {
+  run "${BATS_TEST_DIRNAME}/../codersync" --attach 3 extra
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
+}
+
+@test "dispatch: -a is accepted as a shorthand for --attach" {
+  # Same arity check, same code path -- -a with extra args should be
+  # rejected the exact same way --attach is, proving the alias reaches
+  # the same case branch rather than falling through to the catch-all
+  # "unknown session name" dispatch.
+  run "${BATS_TEST_DIRNAME}/../codersync" -a 3 extra
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
+  [[ "$output" == *"-a"* ]]
 }

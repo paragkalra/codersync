@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Usage: codersync --setup|-s <ssh-target> [remote-dir]
 #        codersync <session-name> [--split-mode|-m iterm|tmux] [--tools|-t t1,t2] [--safe-mode|-s]
+#        codersync --attach|-a <id-or-name>
 #        codersync --restore-all|-r
 #        codersync --list-all|-l
 #        codersync --kill|-k <ids>   (e.g. 1,2,4 or 1-4)
@@ -1301,6 +1302,110 @@ restore_all() {
   echo "Restored ${restored} session(s)."
 }
 
+# `codersync --attach <id-or-name>` -- reconnects to ONE specific
+# existing session, by its numeric ID (as shown by --list-all) or its
+# plain name (what you originally typed to `codersync <name>`, without
+# the target-label/ID prefixing that gets folded in). Unlike plain
+# `codersync <name>`, which creates a session if one doesn't already
+# exist, this errors instead -- the whole point is reconnecting to
+# something specific without any risk of a typo silently spinning up a
+# brand-new paired session instead.
+#
+# A purely-numeric argument is ALWAYS treated as an ID, never as a
+# literal name, even though digits-only is technically a valid session
+# name too -- same precedent as --kill, which never treats a numeric
+# token as a literal name either. Registry-scoped, same as
+# --list-all/--kill/--kill-all: a session alive on the box but not in
+# THIS registry (different machine, cleared registry) won't be found
+# here.
+attach_session() {
+  local arg="$1"
+  touch "$REGISTRY"
+
+  local found=0 match_id="" match_rest=""
+  local line
+
+  if [[ "$arg" =~ ^[0-9]+$ ]]; then
+    local canon
+    if ! canon="$(canonicalize_session_id "$arg")"; then
+      echo "codersync: '${arg}' isn't a valid session ID -- IDs start at 1, 0 is never assigned." >&2
+      exit 1
+    fi
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      parse_registry_line "$line"
+      [[ "$ENTRY_TARGET" != "$SSH_TARGET" ]] && continue
+      parse_numbered_session "" "$ENTRY_NAME"
+      if [[ "$PARSED_ID" == "$canon" ]]; then
+        found=1
+        match_id="$PARSED_ID"
+        match_rest="$PARSED_REST"
+        break
+      fi
+    done < "$REGISTRY"
+    if [[ "$found" == 0 ]]; then
+      echo "codersync: no session with ID ${canon} on ${SSH_TARGET}. Run codersync --list-all to see what's available." >&2
+      exit 1
+    fi
+  else
+    if ! validate_session_name "$arg"; then
+      echo "codersync: '${arg}' isn't a valid session ID or name -- an ID is a plain number (see --list-all), a name is letters/digits/'-'/'_' and can't start with '-'." >&2
+      exit 1
+    fi
+    local suffix="${TARGET_LABEL}-${arg}"
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      parse_registry_line "$line"
+      [[ "$ENTRY_TARGET" != "$SSH_TARGET" ]] && continue
+      parse_numbered_session "" "$ENTRY_NAME"
+      if [[ "$PARSED_REST" == "$suffix" ]]; then
+        found=1
+        match_id="$PARSED_ID"
+        match_rest="$PARSED_REST"
+        break
+      fi
+    done < "$REGISTRY"
+    if [[ "$found" == 0 ]]; then
+      echo "codersync: no session named '${arg}' on ${SSH_TARGET}. Run codersync --list-all to see what's available, or codersync ${arg} to create it." >&2
+      exit 1
+    fi
+  fi
+
+  local entry_name="$match_rest"
+  [[ -n "$match_id" ]] && entry_name="${match_id}-${match_rest}"
+
+  # Only reaches the network once a registry match is confirmed --
+  # malformed input (bad ID, invalid name, no match at all) errors out
+  # above without ever touching SSH.
+  local live
+  live="$(ssh "$SSH_TARGET" -- "tmux list-sessions -F '#{session_name}'" 2>/dev/null || true)"
+
+  local has_claude=0 has_codex=0 has_pair=0
+  grep -qxF "claude-${entry_name}" <<<"$live" && has_claude=1
+  grep -qxF "codex-${entry_name}" <<<"$live" && has_codex=1
+  grep -qxF "pair-${entry_name}" <<<"$live" && has_pair=1
+
+  if [[ "$has_claude" == 1 && "$has_codex" == 1 ]]; then
+    # Args don't matter here: both sessions already exist, so `tmux
+    # new-session` inside remote_setup just no-ops.
+    remote_setup "$entry_name" claude codex
+    open_tab "$entry_name"
+  elif [[ "$has_pair" == 1 ]]; then
+    remote_setup_tmux_mode "$entry_name" claude codex
+    open_tab_tmux_mode "$entry_name"
+  elif [[ "$has_claude" == 1 || "$has_codex" == 1 ]]; then
+    # Same reasoning as restore_all's equivalent case: not auto-
+    # recreating the missing half with default claude/codex, since that
+    # would silently discard whatever --tools this pair actually used
+    # (this registry doesn't track it).
+    echo "codersync: only one side of '${entry_name}' is still alive on ${SSH_TARGET}. Run codersync with this session's plain name if you want the other side back too." >&2
+    exit 1
+  else
+    echo "codersync: '${entry_name}' is registered but not alive on ${SSH_TARGET} anymore. Run codersync --restore-all to prune it, or start it fresh with its plain name." >&2
+    exit 1
+  fi
+}
+
 # Queries the currently configured target's live tmux sessions and
 # prints a table of every codersync-managed one (claude-<id>-<rest>/
 # codex-<id>-<rest> pairs, or pair-<id>-<rest> sessions), one row per
@@ -1786,6 +1891,7 @@ Usage:
   codersync --setup|-s <ssh-target> [remote-dir]            One-time setup
   codersync <session-name> [--split-mode|-m iterm|tmux] [--tools|-t t1,t2] [--safe-mode|-s]
                                                              Open a tab
+  codersync --attach|-a <id-or-name>                        Reconnect to one existing session
   codersync --restore-all|-r                                Reopen all live sessions
   codersync --list-all|-l                                   List live sessions with their IDs
   codersync --kill|-k <ids>                                 Kill sessions by ID (e.g. 1,2,4 or 1-4)
@@ -1842,6 +1948,16 @@ is rejected outright rather than silently dropping the third.
 --safe-mode/-s: drop the auto-approve flag for known --tools/-t keys, so
 normal permission prompts apply instead. Only affects known keys -- for
 a raw/literal --tools/-t command, just leave its skip-approval flag out.
+
+--attach/-a <id-or-name>: reconnects to ONE specific existing session, by
+its numeric ID (see --list-all/-l) or its plain name (what you typed to
+`codersync <name>` originally, without the target-label/ID prefixing).
+Unlike plain `codersync <name>`, which creates a session if it doesn't
+already exist, this errors instead -- so a typo can't accidentally spin
+up a brand-new paired session when you meant to reconnect to an old
+one. A purely-numeric argument is always read as an ID, never as a
+literal name (same precedent as --kill/-k). Registry-scoped, same as
+--list-all/-l/--kill/-k/--kill-all/-K.
 
 --list-all/-l: queries the current target's live tmux sessions and prints
 each one's ID, split mode, and name -- for sessions both alive on the
@@ -2044,6 +2160,23 @@ case "${1:-}" in
     restore_all
     exit 0
     ;;
+  --attach|-a)
+    if [[ -z "${2:-}" ]]; then
+      echo "Usage: codersync --attach|-a <id-or-name> (e.g. --attach 3 or --attach my-feature)" >&2
+      exit 1
+    fi
+    # Opens a tab, so treated the same as the other mutating commands
+    # above: an extra trailing argument is rejected rather than silently
+    # ignored. Checked before load_config, like every other arity check
+    # here, so a malformed invocation never touches the network either.
+    if [[ $# -gt 2 ]]; then
+      echo "codersync: $1 takes exactly one argument (<id-or-name>) -- got extra: ${*:3}" >&2
+      exit 1
+    fi
+    load_config
+    attach_session "$2"
+    exit 0
+    ;;
   --list-all|-l)
     if [[ $# -gt 1 ]]; then
       echo "codersync: $1 takes no arguments -- got extra: ${*:2}" >&2
@@ -2104,7 +2237,7 @@ case "${1:-}" in
     exit 0
     ;;
   "")
-    echo "Usage: codersync --setup|-s <ssh-target> [remote-dir] | codersync <session-name> | codersync --restore-all|-r | codersync --list-all|-l | codersync --kill|-k <ids> | codersync --kill-all|-K | codersync --paste-image|-p | codersync --sync-skills|-y" >&2
+    echo "Usage: codersync --setup|-s <ssh-target> [remote-dir] | codersync <session-name> | codersync --attach|-a <id-or-name> | codersync --restore-all|-r | codersync --list-all|-l | codersync --kill|-k <ids> | codersync --kill-all|-K | codersync --paste-image|-p | codersync --sync-skills|-y" >&2
     echo "Run 'codersync --help' for more." >&2
     exit 1
     ;;
