@@ -563,7 +563,7 @@ resolve_tool() {
   local base flag
   case "$key" in
     claude) base="claude -n ${session}"; flag="--dangerously-skip-permissions" ;;
-    codex)  base="codex";                flag="--dangerously-bypass-approvals-and-sandbox" ;;
+    codex)  base="codex";                flag="--dangerously-bypass-approvals-and-sandbox -s danger-full-access" ;;
     # Gemini CLI was shut down 2026-06-18 and replaced by Antigravity CLI
     # (binary name `agy`, not `gemini`). No --yolo equivalent exists for
     # agy -- --dangerously-skip-permissions is the official replacement.
@@ -1963,7 +1963,7 @@ requires iTerm2 (no fallback for this mode).
 --tools/-t t1,t2 (default: claude,codex): which two CLI agents run left/
 right. Known keys (auto-append that tool's skip-approval flag):
   claude  claude --dangerously-skip-permissions -n <session>
-  codex   codex --dangerously-bypass-approvals-and-sandbox
+  codex   codex --dangerously-bypass-approvals-and-sandbox -s danger-full-access
   agy     agy --dangerously-skip-permissions (Antigravity CLI, was Gemini CLI)
   aider   aider --yes-always
   kimi    kimi --yolo

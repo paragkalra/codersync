@@ -319,7 +319,7 @@ tool's skip-approval flag) or a literal command for anything else:
 | Key      | Resolves to                                      |
 |----------|---------------------------------------------------|
 | `claude` | `claude --dangerously-skip-permissions -n <session>` |
-| `codex`  | `codex --dangerously-bypass-approvals-and-sandbox` |
+| `codex`  | `codex --dangerously-bypass-approvals-and-sandbox -s danger-full-access` |
 | `agy`    | `agy --dangerously-skip-permissions` ([Antigravity CLI](https://antigravity.google/docs/cli/using), successor to the now-discontinued Gemini CLI) |
 | `aider`  | `aider --yes-always` |
 | `kimi`   | `kimi --yolo` ([Kimi Code CLI](https://moonshotai.github.io/kimi-code/)) |

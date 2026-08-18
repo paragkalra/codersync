@@ -26,7 +26,7 @@ setup() {
 
 @test "resolve_tool: codex, dangerous mode" {
   result="$(resolve_tool codex mysession 0)"
-  [ "$result" = "codex --dangerously-bypass-approvals-and-sandbox" ]
+  [ "$result" = "codex --dangerously-bypass-approvals-and-sandbox -s danger-full-access" ]
 }
 
 @test "resolve_tool: codex, safe mode" {
