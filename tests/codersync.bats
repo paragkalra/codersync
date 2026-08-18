@@ -1080,6 +1080,37 @@ setup() {
   [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
 }
 
+@test "attach_session: matches a live leading-zero session by its canonical ID" {
+  # Regression test: entry_name used to be reconstructed from the
+  # canonical id + rest ("8-devbox-example-com-foo"), instead of using
+  # the matched registry line's raw text. A session recorded as
+  # "08-devbox-example-com-foo" (--list-all shows it as ID 8, same
+  # canonicalization as everywhere else) has a live tmux session
+  # literally named "pair-08-devbox-example-com-foo" -- the
+  # reconstructed "pair-8-..." string never matched that, so
+  # attach_session incorrectly treated it as not alive (confirmed live,
+  # same bug shape kill_sessions' own comment describes and avoids).
+  # remote_setup_tmux_mode/open_tab_tmux_mode are stubbed to record what
+  # they're called with, instead of doing real ssh/iTerm2 work -- this
+  # test only needs to confirm the RIGHT session gets recognized as
+  # alive and handed off, not that the full live attach flow works
+  # end-to-end (that part stays live-only, same as restore_all's
+  # equivalent success path).
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t08-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf 'pair-08-devbox-example-com-foo\n'; }
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  remote_setup_tmux_mode() { echo "remote_setup_tmux_mode:$1"; }
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  open_tab_tmux_mode() { echo "open_tab_tmux_mode:$1"; }
+  run attach_session "8"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"remote_setup_tmux_mode:08-devbox-example-com-foo"* ]]
+  [[ "$output" == *"open_tab_tmux_mode:08-devbox-example-com-foo"* ]]
+}
+
 # --- session_is_owned / unrelated-session sweep defense ----------------
 
 @test "session_is_owned: true when a no-ID rest has a matching registry entry" {
