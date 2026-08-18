@@ -1330,7 +1330,7 @@ attach_session() {
   local arg="$1"
   touch "$REGISTRY"
 
-  local found=0 match_id="" match_rest=""
+  local found=0 entry_name=""
   local line
 
   if [[ "$arg" =~ ^[0-9]+$ ]]; then
@@ -1345,21 +1345,20 @@ attach_session() {
       [[ "$ENTRY_TARGET" != "$SSH_TARGET" ]] && continue
       parse_numbered_session "" "$ENTRY_NAME"
       if [[ "$PARSED_ID" == "$canon" ]]; then
-        # entry_name (built from PARSED_ID/PARSED_REST below) gets
-        # spliced unquoted into a remote bash heredoc by
-        # remote_setup/remote_setup_tmux_mode -- unlike the name branch
-        # below, where a match requires exact equality with an
-        # already-validated, known-safe string, ANY registry entry can
-        # match here purely by having the right leading ID segment, so
-        # its REST is never otherwise checked for safety. Same defense
-        # as restore_all: reject rather than trust it.
+        # ENTRY_NAME (used below AS-IS, not reconstructed from
+        # PARSED_ID/PARSED_REST) gets spliced unquoted into a remote
+        # bash heredoc by remote_setup/remote_setup_tmux_mode -- unlike
+        # the name branch below, where a match requires exact equality
+        # with an already-validated, known-safe string, ANY registry
+        # entry can match here purely by having the right leading ID
+        # segment, so its REST is never otherwise checked for safety.
+        # Same defense as restore_all: reject rather than trust it.
         if ! validate_session_name "$ENTRY_NAME"; then
           echo "codersync: registry entry for ID ${canon} contains unsafe characters ('${ENTRY_NAME}') -- refusing to use it. Run codersync --restore-all to prune unsafe entries." >&2
           exit 1
         fi
         found=1
-        match_id="$PARSED_ID"
-        match_rest="$PARSED_REST"
+        entry_name="$ENTRY_NAME"
         break
       fi
     done < "$REGISTRY"
@@ -1390,8 +1389,7 @@ attach_session() {
           exit 1
         fi
         found=1
-        match_id="$PARSED_ID"
-        match_rest="$PARSED_REST"
+        entry_name="$ENTRY_NAME"
         break
       fi
     done < "$REGISTRY"
@@ -1401,8 +1399,12 @@ attach_session() {
     fi
   fi
 
-  local entry_name="$match_rest"
-  [[ -n "$match_id" ]] && entry_name="${match_id}-${match_rest}"
+  # entry_name is the RAW registry text (e.g. "08-devbox-example-com-foo"),
+  # not reconstructed from the canonical id -- a live session named
+  # "pair-08-devbox-example-com-foo" (--list-all shows it as ID 8, same
+  # canonicalization every other command uses) would otherwise never
+  # match a reconstructed "pair-8-devbox-example-com-foo" below, exactly
+  # the bug --kill's own comment above describes and avoids the same way.
 
   # Only reaches the network once a registry match is confirmed --
   # malformed input (bad ID, invalid name, no match at all) errors out
