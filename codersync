@@ -1555,15 +1555,26 @@ rename_session() {
   # codex-<new> already existed, leaving the pair permanently split
   # between old and new names (registry, which only gets rewritten on
   # full success, reflected neither).
-  if [[ "$has_claude" == 1 ]] && grep -qxF "claude-${new_entry_name}" <<<"$live"; then
+  #
+  # Checked unconditionally across all three prefixes, NOT gated by
+  # $has_claude/$has_codex/$has_pair (the SOURCE session's own mode) --
+  # session_is_owned only ever matches on id+rest, never on which
+  # prefix a live session actually uses, so an unrelated live session
+  # under a DIFFERENT prefix than the source's own mode would otherwise
+  # get silently adopted as owned the moment the registry is rewritten
+  # to the same id+rest. Confirmed live: renaming a tmux-mode (pair-only)
+  # session onto a name where an unrelated claude-/codex- pair happened
+  # to already exist succeeded with the old (mode-gated) checks, after
+  # which --list-all/--kill treated that unrelated pair as owned too.
+  if grep -qxF "claude-${new_entry_name}" <<<"$live"; then
     echo "codersync: can't rename to '${new_name}' -- a live tmux session already exists at 'claude-${new_entry_name}' on ${SSH_TARGET}." >&2
     exit 1
   fi
-  if [[ "$has_codex" == 1 ]] && grep -qxF "codex-${new_entry_name}" <<<"$live"; then
+  if grep -qxF "codex-${new_entry_name}" <<<"$live"; then
     echo "codersync: can't rename to '${new_name}' -- a live tmux session already exists at 'codex-${new_entry_name}' on ${SSH_TARGET}." >&2
     exit 1
   fi
-  if [[ "$has_pair" == 1 ]] && grep -qxF "pair-${new_entry_name}" <<<"$live"; then
+  if grep -qxF "pair-${new_entry_name}" <<<"$live"; then
     echo "codersync: can't rename to '${new_name}' -- a live tmux session already exists at 'pair-${new_entry_name}' on ${SSH_TARGET}." >&2
     exit 1
   fi

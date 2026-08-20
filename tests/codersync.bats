@@ -1230,6 +1230,38 @@ setup() {
   [[ "$(cat "$REGISTRY")" == "devbox.example.com"$'\t'"1-devbox-example-com-foo" ]]
 }
 
+@test "rename_session: refuses to rename a tmux-mode session onto an unrelated claude-/codex- pair" {
+  # Regression test: the preflight above used to be gated by the
+  # SOURCE session's own mode ($has_pair/$has_claude/$has_codex), so
+  # renaming a tmux-mode (pair-only) session only checked for a
+  # colliding pair-<new>, never claude-<new>/codex-<new> -- but
+  # session_is_owned only ever matches on id+rest, never on which
+  # prefix a live session actually uses, so an unrelated live
+  # claude-/codex- pair at the destination name got silently adopted as
+  # owned the moment the registry was rewritten to the same id+rest
+  # (confirmed live: --list-all/--kill then treated it as owned too).
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by rename_session below, to build
+  # the candidate new_entry_name checked against the destination.
+  TARGET_LABEL="devbox-example-com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by rename_session below.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'pair-1-devbox-example-com-foo\nclaude-1-devbox-example-com-bar\ncodex-1-devbox-example-com-bar\n'
+    else
+      echo "unexpected: $*" >> "$BATS_TEST_TMPDIR/unexpected_ssh_calls"
+    fi
+  }
+  run rename_session "1" "bar"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"a live tmux session already exists at 'claude-1-devbox-example-com-bar'"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
+  [[ "$(cat "$REGISTRY")" == "devbox.example.com"$'\t'"1-devbox-example-com-foo" ]]
+}
+
 @test "rename_session: fails clearly when the session-ID lock is already held" {
   # Simulates a concurrent codersync invocation (session creation or
   # another --rename) already holding the lock -- confirms rename_session
