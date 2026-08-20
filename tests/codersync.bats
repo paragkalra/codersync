@@ -1174,6 +1174,7 @@ setup() {
   # shellcheck disable=SC2034 # read by rename_session below, to build
   # the candidate new_entry_name it then checks for a collision.
   TARGET_LABEL="devbox-example-com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\t1-devbox-example-com-foo\ndevbox.example.com\t2-devbox-example-com-bar\n' > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by rename_session below.
@@ -1189,6 +1190,7 @@ setup() {
   # shellcheck disable=SC2034 # read by rename_session below, to build
   # the candidate new_entry_name before it checks liveness.
   TARGET_LABEL="devbox-example-com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by rename_session below.
@@ -1198,11 +1200,61 @@ setup() {
   [[ "$output" == *"not alive on ${SSH_TARGET} anymore"* ]]
 }
 
+@test "rename_session: refuses to rename when the destination tmux name already exists" {
+  # Regression test: without this preflight, remote_rename went ahead and
+  # renamed claude-* successfully, then failed renaming codex-* because
+  # codex-<new> already existed (an unrelated live session) -- leaving
+  # the pair permanently split between old and new names, with the
+  # registry (rewritten only on full success) reflecting neither.
+  # Checked here entirely from the same `live` listing already fetched,
+  # before ever attempting the actual remote rename.
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by rename_session below, to build
+  # the candidate new_entry_name checked against the destination.
+  TARGET_LABEL="devbox-example-com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by rename_session below.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'claude-1-devbox-example-com-foo\ncodex-1-devbox-example-com-foo\ncodex-1-devbox-example-com-bar\n'
+    else
+      echo "unexpected: $*" >> "$BATS_TEST_TMPDIR/unexpected_ssh_calls"
+    fi
+  }
+  run rename_session "1" "bar"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"a live tmux session already exists at 'codex-1-devbox-example-com-bar'"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
+  [[ "$(cat "$REGISTRY")" == "devbox.example.com"$'\t'"1-devbox-example-com-foo" ]]
+}
+
+@test "rename_session: fails clearly when the session-ID lock is already held" {
+  # Simulates a concurrent codersync invocation (session creation or
+  # another --rename) already holding the lock -- confirms rename_session
+  # doesn't proceed (or touch the network) while it's contended, rather
+  # than racing past it.
+  SSH_TARGET="devbox.example.com"
+  TARGET_LABEL="devbox-example-com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
+  mkdir -p "$CONFIG_DIR/id.lock"
+  # shellcheck disable=SC2329 # invoked indirectly, by rename_session below.
+  ssh() { echo "unexpected: $*" >> "$BATS_TEST_TMPDIR/unexpected_ssh_calls"; }
+  run rename_session "1" "bar"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"couldn't acquire the session-ID lock"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
+}
+
 @test "rename_session: renames a live tmux-mode session and updates the registry" {
   SSH_TARGET="devbox.example.com"
   # shellcheck disable=SC2034 # read by rename_session below, to build
   # the new registry-stored session name.
   TARGET_LABEL="devbox-example-com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\t1-devbox-example-com-foo\ndevbox.example.com\t2-devbox-example-com-other\n' > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by rename_session below.
@@ -1220,6 +1272,7 @@ setup() {
   # shellcheck disable=SC2034 # read by rename_session below, to build
   # the new registry-stored session name.
   TARGET_LABEL="devbox-example-com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by rename_session below.
@@ -1238,6 +1291,7 @@ setup() {
   SSH_TARGET="devbox.example.com"
   # shellcheck disable=SC2034 # read by resolve_registered_session below.
   TARGET_LABEL="devbox-example-com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\tdevbox-example-com-foo\n' > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by rename_session below.

@@ -1498,6 +1498,22 @@ rename_session() {
     exit 1
   fi
 
+  # Locked from here through the registry write at the end (including
+  # the remote SSH rename in between) -- the normal `codersync <name>`
+  # creation path takes this same lock around ITS OWN registry
+  # reservation (see the dispatch case's comment), so without it here
+  # too, a concurrent `codersync <name>` using the same target name as
+  # $new_name could insert a colliding entry between this collision
+  # check and the write below, defeating the uniqueness the check
+  # exists for. Held across the network round-trip too, unlike the
+  # creation path (which releases before its own slow remote work):
+  # this function's registry write only happens AFTER the remote rename
+  # succeeds, so releasing early would let a concurrent writer interleave
+  # between a collision check that already passed and a write that
+  # hasn't happened yet.
+  acquire_id_lock || exit 1
+  trap 'release_id_lock' EXIT
+
   # Compared against each candidate's REST, not the reconstructed
   # new_entry_name (which includes THIS session's own, preserved ID) --
   # two sessions can never actually collide on the full tmux/registry
@@ -1530,6 +1546,28 @@ rename_session() {
     exit 1
   fi
 
+  # Preflight, checked against the SAME `live` already fetched above (no
+  # extra round-trip): refuse if any DESTINATION name is already a live
+  # session, registered or not. `tmux rename-session` itself would fail
+  # on this too, but only AFTER possibly already renaming an earlier
+  # side in the same remote script -- confirmed live, with a stubbed
+  # remote: claude-* renamed successfully, then codex-* failed because
+  # codex-<new> already existed, leaving the pair permanently split
+  # between old and new names (registry, which only gets rewritten on
+  # full success, reflected neither).
+  if [[ "$has_claude" == 1 ]] && grep -qxF "claude-${new_entry_name}" <<<"$live"; then
+    echo "codersync: can't rename to '${new_name}' -- a live tmux session already exists at 'claude-${new_entry_name}' on ${SSH_TARGET}." >&2
+    exit 1
+  fi
+  if [[ "$has_codex" == 1 ]] && grep -qxF "codex-${new_entry_name}" <<<"$live"; then
+    echo "codersync: can't rename to '${new_name}' -- a live tmux session already exists at 'codex-${new_entry_name}' on ${SSH_TARGET}." >&2
+    exit 1
+  fi
+  if [[ "$has_pair" == 1 ]] && grep -qxF "pair-${new_entry_name}" <<<"$live"; then
+    echo "codersync: can't rename to '${new_name}' -- a live tmux session already exists at 'pair-${new_entry_name}' on ${SSH_TARGET}." >&2
+    exit 1
+  fi
+
   # old_entry_name/new_entry_name are both already-validated, known-safe
   # strings (validate_session_name), but base64'd anyway before being
   # spliced into the remote heredoc -- same defense-in-depth convention
@@ -1544,16 +1582,36 @@ rename_session() {
   # variables and must substitute before the heredoc is sent; only the
   # \$-escaped ones are meant to survive as literal text for the remote
   # shell to evaluate.
+  #
+  # Even with the preflight above, the remote rename-session calls still
+  # roll back on any failure (same trap-based all-or-nothing pattern as
+  # remote_setup's own comment) -- the preflight closes the most likely
+  # gap (an unrelated destination session already existing), but doesn't
+  # cover every conceivable mid-script failure, and for an iterm-split
+  # pair, a half-renamed claude/codex split is exactly the broken state
+  # this whole thing exists to prevent.
   if ! ssh "$SSH_TARGET" -- 'PATH="$HOME/.local/bin:$HOME/bin:$PATH" bash -s' <<EOF
 set -e
 old=\$(echo ${old_b64} | base64 -d)
 new=\$(echo ${new_b64} | base64 -d)
-if [ "${has_claude}" = 1 ]; then tmux rename-session -t "claude-\${old}" "claude-\${new}"; fi
-if [ "${has_codex}" = 1 ]; then tmux rename-session -t "codex-\${old}" "codex-\${new}"; fi
-if [ "${has_pair}" = 1 ]; then tmux rename-session -t "pair-\${old}" "pair-\${new}"; fi
+renamed=""
+rollback() {
+  for x in \$renamed; do
+    case "\$x" in
+      claude) tmux rename-session -t "claude-\${new}" "claude-\${old}" 2>/dev/null || true ;;
+      codex) tmux rename-session -t "codex-\${new}" "codex-\${old}" 2>/dev/null || true ;;
+      pair) tmux rename-session -t "pair-\${new}" "pair-\${old}" 2>/dev/null || true ;;
+    esac
+  done
+}
+trap rollback EXIT
+if [ "${has_claude}" = 1 ]; then tmux rename-session -t "claude-\${old}" "claude-\${new}"; renamed="\${renamed} claude"; fi
+if [ "${has_codex}" = 1 ]; then tmux rename-session -t "codex-\${old}" "codex-\${new}"; renamed="\${renamed} codex"; fi
+if [ "${has_pair}" = 1 ]; then tmux rename-session -t "pair-\${old}" "pair-\${new}"; renamed="\${renamed} pair"; fi
+trap - EXIT
 EOF
   then
-    echo "codersync: failed to rename '${arg}' to '${new_name}' on ${SSH_TARGET}." >&2
+    echo "codersync: failed to rename '${arg}' to '${new_name}' on ${SSH_TARGET} -- any partial rename was rolled back." >&2
     exit 1
   fi
 
@@ -1568,6 +1626,9 @@ EOF
     fi
   done < "$REGISTRY"
   printf '%s\n' "${kept[@]}" > "$REGISTRY"
+
+  trap - EXIT
+  release_id_lock
 
   echo "Renamed '${old_entry_name}' to '${new_entry_name}' on ${SSH_TARGET}."
 }
