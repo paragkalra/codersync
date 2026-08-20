@@ -41,8 +41,9 @@ prompts. `codersync` exists to make all of that a non-issue.
   numeric ID (`1-`, `2-`, `3-`, ...) so you can list registry-backed
   codersync sessions running on the box with `codersync --list-all`,
   reconnect to a specific one with `codersync --attach 3` (errors
-  instead of creating a new one if that ID/name doesn't exist), and
-  kill specific ones with `codersync --kill 1,3` or a range like
+  instead of creating a new one if that ID/name doesn't exist), rename
+  one with `codersync --rename 3 my-better-name`, and kill specific
+  ones with `codersync --kill 1,3` or a range like
   `codersync --kill 1-4`, without having to type or remember full
   session names. `codersync --kill-all` clears every registry-backed
   codersync session on the box in one go (with a confirmation prompt
@@ -118,6 +119,7 @@ session also gets a small numeric ID prefixed on the remote side (e.g.
 codersync --setup|-s <ssh-target> [remote-dir]
 codersync <session-name> [--split-mode|-m iterm|tmux] [--tools|-t t1,t2] [--safe-mode|-s]
 codersync --attach|-a <id-or-name>
+codersync --rename|-R <id-or-name> <new-name>
 codersync --restore-all|-r
 codersync --list-all|-l
 codersync --kill|-k <ids>
@@ -196,12 +198,28 @@ codersync --attach my-feature
 ```
 
 Unlike plain `codersync <name>`, which creates a session if one
-doesn't already exist, `--attach` errors instead — a typo can't
+doesn't already exist, `--attach` errors instead: a typo can't
 accidentally spin up a brand-new paired session when you meant to
 reconnect to an old one. A purely-numeric argument is always read as
 an ID, never as a literal name, even though digits-only happens to be
 a valid session name too (same precedent as `--kill`/`-k`).
 Registry-scoped, same as `--list-all`/`-l`/`--kill`/`-k`/`--kill-all`/`-K`.
+
+### `codersync --rename|-R <id-or-name> <new-name>`
+
+Renames one existing session (looked up the same way as `--attach`)
+to a new plain name, keeping its numeric ID unchanged:
+
+```
+codersync --rename 3 my-better-name
+codersync --rename my-feature my-better-name
+```
+
+Only renames the live tmux session(s); whatever's actually running
+inside is untouched, not restarted. `<new-name>` can't be a plain
+number either, for the same reason a bare number is never read as a
+name: it would make the session unreachable by name afterward. Gets
+capital `-R` since lowercase `-r` is already taken by `--restore-all`.
 
 ### `codersync --restore-all|-r`
 

@@ -2,6 +2,7 @@
 # Usage: codersync --setup|-s <ssh-target> [remote-dir]
 #        codersync <session-name> [--split-mode|-m iterm|tmux] [--tools|-t t1,t2] [--safe-mode|-s]
 #        codersync --attach|-a <id-or-name>
+#        codersync --rename|-R <id-or-name> <new-name>
 #        codersync --restore-all|-r
 #        codersync --list-all|-l
 #        codersync --kill|-k <ids>   (e.g. 1,2,4 or 1-4)
@@ -1310,14 +1311,15 @@ restore_all() {
   echo "Restored ${restored} session(s)."
 }
 
-# `codersync --attach <id-or-name>` -- reconnects to ONE specific
-# existing session, by its numeric ID (as shown by --list-all) or its
-# plain name (what you originally typed to `codersync <name>`, without
-# the target-label/ID prefixing that gets folded in). Unlike plain
-# `codersync <name>`, which creates a session if one doesn't already
-# exist, this errors instead -- the whole point is reconnecting to
-# something specific without any risk of a typo silently spinning up a
-# brand-new paired session instead.
+# Resolves <id-or-name> to the raw, registry-stored session name for
+# the current target -- shared by --attach and --rename, which both
+# need exactly this: an ID (as shown by --list-all) or a plain name
+# (what you originally typed to `codersync <name>`, without the
+# target-label/ID prefixing that gets folded in), matched against THIS
+# registry. Prints the raw entry name on stdout and returns 0 on a
+# match; prints a clear message to stderr and returns 1 otherwise
+# (callers exit 1 themselves -- this runs inside `$(...)`, where `exit`
+# would only end the subshell, not the whole script).
 #
 # A purely-numeric argument is ALWAYS treated as an ID, never as a
 # literal name, even though digits-only is technically a valid session
@@ -1326,7 +1328,7 @@ restore_all() {
 # --list-all/--kill/--kill-all: a session alive on the box but not in
 # THIS registry (different machine, cleared registry) won't be found
 # here.
-attach_session() {
+resolve_registered_session() {
   local arg="$1"
   touch "$REGISTRY"
 
@@ -1337,7 +1339,7 @@ attach_session() {
     local canon
     if ! canon="$(canonicalize_session_id "$arg")"; then
       echo "codersync: '${arg}' isn't a valid session ID -- IDs start at 1, 0 is never assigned." >&2
-      exit 1
+      return 1
     fi
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
@@ -1345,17 +1347,17 @@ attach_session() {
       [[ "$ENTRY_TARGET" != "$SSH_TARGET" ]] && continue
       parse_numbered_session "" "$ENTRY_NAME"
       if [[ "$PARSED_ID" == "$canon" ]]; then
-        # ENTRY_NAME (used below AS-IS, not reconstructed from
-        # PARSED_ID/PARSED_REST) gets spliced unquoted into a remote
-        # bash heredoc by remote_setup/remote_setup_tmux_mode -- unlike
-        # the name branch below, where a match requires exact equality
-        # with an already-validated, known-safe string, ANY registry
-        # entry can match here purely by having the right leading ID
-        # segment, so its REST is never otherwise checked for safety.
-        # Same defense as restore_all: reject rather than trust it.
+        # ENTRY_NAME (returned AS-IS below, not reconstructed from
+        # PARSED_ID/PARSED_REST) ends up spliced unquoted into a remote
+        # bash heredoc by callers -- unlike the name branch below, where
+        # a match requires exact equality with an already-validated,
+        # known-safe string, ANY registry entry can match here purely by
+        # having the right leading ID segment, so its REST is never
+        # otherwise checked for safety. Same defense as restore_all:
+        # reject rather than trust it.
         if ! validate_session_name "$ENTRY_NAME"; then
           echo "codersync: registry entry for ID ${canon} contains unsafe characters ('${ENTRY_NAME}') -- refusing to use it. Run codersync --restore-all to prune unsafe entries." >&2
-          exit 1
+          return 1
         fi
         found=1
         entry_name="$ENTRY_NAME"
@@ -1364,12 +1366,12 @@ attach_session() {
     done < "$REGISTRY"
     if [[ "$found" == 0 ]]; then
       echo "codersync: no session with ID ${canon} on ${SSH_TARGET}. Run codersync --list-all to see what's available." >&2
-      exit 1
+      return 1
     fi
   else
     if ! validate_session_name "$arg"; then
       echo "codersync: '${arg}' isn't a valid session ID or name -- an ID is a plain number (see --list-all), a name is letters/digits/'-'/'_' and can't start with '-'." >&2
-      exit 1
+      return 1
     fi
     local suffix="${TARGET_LABEL}-${arg}"
     while IFS= read -r line; do
@@ -1386,7 +1388,7 @@ attach_session() {
         # a poisoned entry.
         if ! validate_session_name "$ENTRY_NAME"; then
           echo "codersync: registry entry for '${arg}' contains unsafe characters ('${ENTRY_NAME}') -- refusing to use it. Run codersync --restore-all to prune unsafe entries." >&2
-          exit 1
+          return 1
         fi
         found=1
         entry_name="$ENTRY_NAME"
@@ -1394,8 +1396,8 @@ attach_session() {
       fi
     done < "$REGISTRY"
     if [[ "$found" == 0 ]]; then
-      echo "codersync: no session named '${arg}' on ${SSH_TARGET}. Run codersync --list-all to see what's available, or codersync ${arg} to create it." >&2
-      exit 1
+      echo "codersync: no session named '${arg}' on ${SSH_TARGET}. Run codersync --list-all to see what's available." >&2
+      return 1
     fi
   fi
 
@@ -1403,12 +1405,24 @@ attach_session() {
   # not reconstructed from the canonical id -- a live session named
   # "pair-08-devbox-example-com-foo" (--list-all shows it as ID 8, same
   # canonicalization every other command uses) would otherwise never
-  # match a reconstructed "pair-8-devbox-example-com-foo" below, exactly
-  # the bug --kill's own comment above describes and avoids the same way.
+  # match a reconstructed "pair-8-devbox-example-com-foo", exactly the
+  # bug --kill's own comment above describes and avoids the same way.
+  printf '%s' "$entry_name"
+}
+
+# `codersync --attach <id-or-name>` -- reconnects to ONE specific
+# existing session. Unlike plain `codersync <name>`, which creates a
+# session if one doesn't already exist, this errors instead -- the
+# whole point is reconnecting to something specific without any risk
+# of a typo silently spinning up a brand-new paired session instead.
+attach_session() {
+  local arg="$1"
+  local entry_name
+  entry_name="$(resolve_registered_session "$arg")" || exit 1
 
   # Only reaches the network once a registry match is confirmed --
   # malformed input (bad ID, invalid name, no match at all) errors out
-  # above without ever touching SSH.
+  # inside resolve_registered_session without ever touching SSH.
   local live
   live="$(ssh "$SSH_TARGET" -- "tmux list-sessions -F '#{session_name}'" 2>/dev/null || true)"
 
@@ -1436,6 +1450,126 @@ attach_session() {
     echo "codersync: '${entry_name}' is registered but not alive on ${SSH_TARGET} anymore. Run codersync --restore-all to prune it, or start it fresh with its plain name." >&2
     exit 1
   fi
+}
+
+# `codersync --rename|-R <id-or-name> <new-name>` -- renames one
+# specific existing session (looked up the same way as --attach) to a
+# new plain name, keeping its numeric ID and everything else about it
+# unchanged. Uses `tmux rename-session`, which only changes tmux's
+# internal session name -- it doesn't touch, restart, or even briefly
+# interrupt whatever's actually running inside (confirmed live).
+#
+# Known limitation, not specifically handled: a session renamed in the
+# brief window between creation and its first attach would have the
+# client-attached hook that fires its actual launch (see
+# remote_setup_tmux_mode's comment) fail, since that hook has the OLD
+# session name hardcoded into the command it runs. In practice this
+# window is seconds at most -- open_tab/open_tab_tmux_mode attach
+# immediately after creating a session -- so renaming something before
+# ever looking at it once is exceedingly unlikely.
+rename_session() {
+  local arg="$1" new_name="$2"
+  local old_entry_name
+  old_entry_name="$(resolve_registered_session "$arg")" || exit 1
+
+  if ! validate_session_name "$new_name"; then
+    echo "codersync: '${new_name}' isn't a valid session name -- only letters, digits, '-', and '_' are allowed, and it can't start with '-'." >&2
+    exit 1
+  fi
+  # Rejected for the same reason resolve_registered_session's ID branch
+  # always wins over a same-shaped name: allowing it would make this
+  # session unreachable by name afterward, since --attach/--kill always
+  # read a purely-numeric argument as an ID first, never as a name.
+  if [[ "$new_name" =~ ^[0-9]+$ ]]; then
+    echo "codersync: '${new_name}' can't be a plain number -- --attach/--kill always read a numeric argument as an ID, never a name, so a session named that would be unreachable by name afterward." >&2
+    exit 1
+  fi
+
+  # Keeps the same numeric ID (or stays ID-less, for a pre-numbering
+  # legacy entry) -- renaming changes what a session is CALLED, not
+  # its identity.
+  parse_numbered_session "" "$old_entry_name"
+  local old_id="$PARSED_ID"
+  local new_entry_name="${TARGET_LABEL}-${new_name}"
+  [[ -n "$old_id" ]] && new_entry_name="${old_id}-${new_entry_name}"
+
+  if [[ "$new_entry_name" == "$old_entry_name" ]]; then
+    echo "codersync: '${arg}' is already named '${new_name}'." >&2
+    exit 1
+  fi
+
+  # Compared against each candidate's REST, not the reconstructed
+  # new_entry_name (which includes THIS session's own, preserved ID) --
+  # two sessions can never actually collide on the full tmux/registry
+  # name, since IDs are unique, but two different IDs sharing the same
+  # rest is exactly the ambiguity resolve_registered_session's name
+  # branch can't resolve (it takes the first match and stops), so it's
+  # what actually needs rejecting here.
+  touch "$REGISTRY"
+  local line new_suffix="${TARGET_LABEL}-${new_name}"
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    parse_registry_line "$line"
+    [[ "$ENTRY_TARGET" != "$SSH_TARGET" ]] && continue
+    parse_numbered_session "" "$ENTRY_NAME"
+    if [[ "$PARSED_REST" == "$new_suffix" ]]; then
+      echo "codersync: '${new_name}' is already in use on ${SSH_TARGET} (as ${ENTRY_NAME}) -- pick a different name." >&2
+      exit 1
+    fi
+  done < "$REGISTRY"
+
+  local live
+  live="$(ssh "$SSH_TARGET" -- "tmux list-sessions -F '#{session_name}'" 2>/dev/null || true)"
+  local has_claude=0 has_codex=0 has_pair=0
+  grep -qxF "claude-${old_entry_name}" <<<"$live" && has_claude=1
+  grep -qxF "codex-${old_entry_name}" <<<"$live" && has_codex=1
+  grep -qxF "pair-${old_entry_name}" <<<"$live" && has_pair=1
+
+  if [[ "$has_claude" == 0 && "$has_codex" == 0 && "$has_pair" == 0 ]]; then
+    echo "codersync: '${old_entry_name}' is registered but not alive on ${SSH_TARGET} anymore -- nothing to rename. Run codersync --restore-all to prune it." >&2
+    exit 1
+  fi
+
+  # old_entry_name/new_entry_name are both already-validated, known-safe
+  # strings (validate_session_name), but base64'd anyway before being
+  # spliced into the remote heredoc -- same defense-in-depth convention
+  # every other value in this file goes through one, not the only thing
+  # standing between untrusted input and a remote shell.
+  local old_b64 new_b64
+  old_b64="$(b64 "$old_entry_name")"
+  new_b64="$(b64 "$new_entry_name")"
+
+  # shellcheck disable=SC2087 # intentional: local expansion is the point --
+  # ${has_claude}/etc. and old_b64/new_b64 below are THIS script's
+  # variables and must substitute before the heredoc is sent; only the
+  # \$-escaped ones are meant to survive as literal text for the remote
+  # shell to evaluate.
+  if ! ssh "$SSH_TARGET" -- 'PATH="$HOME/.local/bin:$HOME/bin:$PATH" bash -s' <<EOF
+set -e
+old=\$(echo ${old_b64} | base64 -d)
+new=\$(echo ${new_b64} | base64 -d)
+if [ "${has_claude}" = 1 ]; then tmux rename-session -t "claude-\${old}" "claude-\${new}"; fi
+if [ "${has_codex}" = 1 ]; then tmux rename-session -t "codex-\${old}" "codex-\${new}"; fi
+if [ "${has_pair}" = 1 ]; then tmux rename-session -t "pair-\${old}" "pair-\${new}"; fi
+EOF
+  then
+    echo "codersync: failed to rename '${arg}' to '${new_name}' on ${SSH_TARGET}." >&2
+    exit 1
+  fi
+
+  local -a kept=()
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    parse_registry_line "$line"
+    if [[ "$ENTRY_TARGET" == "$SSH_TARGET" && "$ENTRY_NAME" == "$old_entry_name" ]]; then
+      kept+=("${SSH_TARGET}"$'\t'"${new_entry_name}")
+    else
+      kept+=("$line")
+    fi
+  done < "$REGISTRY"
+  printf '%s\n' "${kept[@]}" > "$REGISTRY"
+
+  echo "Renamed '${old_entry_name}' to '${new_entry_name}' on ${SSH_TARGET}."
 }
 
 # Queries the currently configured target's live tmux sessions and
@@ -1924,6 +2058,7 @@ Usage:
   codersync <session-name> [--split-mode|-m iterm|tmux] [--tools|-t t1,t2] [--safe-mode|-s]
                                                              Open a tab
   codersync --attach|-a <id-or-name>                        Reconnect to one existing session
+  codersync --rename|-R <id-or-name> <new-name>             Rename one existing session
   codersync --restore-all|-r                                Reopen all live sessions
   codersync --list-all|-l                                   List live sessions with their IDs
   codersync --kill|-k <ids>                                 Kill sessions by ID (e.g. 1,2,4 or 1-4)
@@ -1990,6 +2125,15 @@ up a brand-new paired session when you meant to reconnect to an old
 one. A purely-numeric argument is always read as an ID, never as a
 literal name (same precedent as --kill/-k). Registry-scoped, same as
 --list-all/-l/--kill/-k/--kill-all/-K.
+
+--rename/-R <id-or-name> <new-name>: renames one existing session
+(looked up the same way as --attach/-a) to a new plain name, keeping
+its numeric ID unchanged. Just renames the live tmux session(s) --
+whatever's running inside is untouched, not restarted. <new-name>
+can't be a plain number either, for the same reason a bare number is
+never read as a name: it would make the session unreachable by name
+afterward. Gets capital -R since lowercase -r is already taken by
+--restore-all.
 
 --list-all/-l: queries the current target's live tmux sessions and prints
 each one's ID, split mode, and name -- for sessions both alive on the
@@ -2209,6 +2353,24 @@ case "${1:-}" in
     attach_session "$2"
     exit 0
     ;;
+  --rename|-R)
+    if [[ -z "${2:-}" || -z "${3:-}" ]]; then
+      echo "Usage: codersync --rename|-R <id-or-name> <new-name>" >&2
+      exit 1
+    fi
+    # Renames a live tmux session and rewrites the registry, so treated
+    # the same as the other mutating commands above: an extra trailing
+    # argument is rejected rather than silently ignored. Checked before
+    # load_config, like every other arity check here, so a malformed
+    # invocation never touches the network either.
+    if [[ $# -gt 3 ]]; then
+      echo "codersync: $1 takes exactly two arguments (<id-or-name> <new-name>) -- got extra: ${*:4}" >&2
+      exit 1
+    fi
+    load_config
+    rename_session "$2" "$3"
+    exit 0
+    ;;
   --list-all|-l)
     if [[ $# -gt 1 ]]; then
       echo "codersync: $1 takes no arguments -- got extra: ${*:2}" >&2
@@ -2269,7 +2431,7 @@ case "${1:-}" in
     exit 0
     ;;
   "")
-    echo "Usage: codersync --setup|-s <ssh-target> [remote-dir] | codersync <session-name> | codersync --attach|-a <id-or-name> | codersync --restore-all|-r | codersync --list-all|-l | codersync --kill|-k <ids> | codersync --kill-all|-K | codersync --paste-image|-p | codersync --sync-skills|-y" >&2
+    echo "Usage: codersync --setup|-s <ssh-target> [remote-dir] | codersync <session-name> | codersync --attach|-a <id-or-name> | codersync --rename|-R <id-or-name> <new-name> | codersync --restore-all|-r | codersync --list-all|-l | codersync --kill|-k <ids> | codersync --kill-all|-K | codersync --paste-image|-p | codersync --sync-skills|-y" >&2
     echo "Run 'codersync --help' for more." >&2
     exit 1
     ;;

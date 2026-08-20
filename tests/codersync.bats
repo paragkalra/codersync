@@ -1111,6 +1111,143 @@ setup() {
   [[ "$output" == *"open_tab_tmux_mode:08-devbox-example-com-foo"* ]]
 }
 
+# --- rename_session -------------------------------------------------------
+
+@test "rename_session: rejects an invalid new name without touching the network" {
+  # No TARGET_LABEL: arg "1" is numeric, so resolve_registered_session
+  # never reaches the branch that reads it.
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by rename_session below.
+  ssh() { echo "unexpected: $*" >> "$BATS_TEST_TMPDIR/unexpected_ssh_calls"; }
+  run rename_session "1" "bad;name"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"isn't a valid session name"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
+}
+
+@test "rename_session: rejects a purely-numeric new name" {
+  # A session named a bare number would be unreachable by name
+  # afterward, since --attach/--kill always read a numeric argument as
+  # an ID first.
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by rename_session below.
+  ssh() { echo "unexpected: $*" >> "$BATS_TEST_TMPDIR/unexpected_ssh_calls"; }
+  run rename_session "1" "42"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"can't be a plain number"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
+}
+
+@test "rename_session: errors when the given ID doesn't resolve to any session" {
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by rename_session below.
+  ssh() { echo "unexpected: $*" >> "$BATS_TEST_TMPDIR/unexpected_ssh_calls"; }
+  run rename_session "3" "new-name"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no session with ID 3"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
+}
+
+@test "rename_session: errors when the new name is the same as the current one" {
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by rename_session below, to build
+  # the candidate new_entry_name it then compares against old_entry_name.
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by rename_session below.
+  ssh() { echo "unexpected: $*" >> "$BATS_TEST_TMPDIR/unexpected_ssh_calls"; }
+  run rename_session "1" "foo"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"already named 'foo'"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
+}
+
+@test "rename_session: rejects renaming to a name already in use on this target" {
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by rename_session below, to build
+  # the candidate new_entry_name it then checks for a collision.
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-foo\ndevbox.example.com\t2-devbox-example-com-bar\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by rename_session below.
+  ssh() { echo "unexpected: $*" >> "$BATS_TEST_TMPDIR/unexpected_ssh_calls"; }
+  run rename_session "1" "bar"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"'bar' is already in use"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
+}
+
+@test "rename_session: errors when the resolved session isn't alive anymore" {
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by rename_session below, to build
+  # the candidate new_entry_name before it checks liveness.
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by rename_session below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf ''; }
+  run rename_session "1" "new-name"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"not alive on ${SSH_TARGET} anymore"* ]]
+}
+
+@test "rename_session: renames a live tmux-mode session and updates the registry" {
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by rename_session below, to build
+  # the new registry-stored session name.
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-foo\ndevbox.example.com\t2-devbox-example-com-other\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by rename_session below.
+  ssh() { if [[ "$*" == *"list-sessions"* ]]; then printf 'pair-1-devbox-example-com-foo\n'; fi; }
+  run rename_session "1" "bar"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Renamed '1-devbox-example-com-foo' to '1-devbox-example-com-bar'"* ]]
+  [[ "$(cat "$REGISTRY")" == *$'devbox.example.com\t1-devbox-example-com-bar'* ]]
+  [[ "$(cat "$REGISTRY")" == *$'devbox.example.com\t2-devbox-example-com-other'* ]]
+  [[ "$(cat "$REGISTRY")" != *"1-devbox-example-com-foo"* ]]
+}
+
+@test "rename_session: renames a live iterm-mode (claude-/codex-) pair" {
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by rename_session below, to build
+  # the new registry-stored session name.
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by rename_session below.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'claude-1-devbox-example-com-foo\ncodex-1-devbox-example-com-foo\n'
+    fi
+  }
+  run rename_session "1" "bar"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Renamed '1-devbox-example-com-foo' to '1-devbox-example-com-bar'"* ]]
+  [[ "$(cat "$REGISTRY")" == "devbox.example.com"$'\t'"1-devbox-example-com-bar" ]]
+}
+
+@test "rename_session: preserves a legacy no-ID session's ID-less shape" {
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by resolve_registered_session below.
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\tdevbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by rename_session below.
+  ssh() { if [[ "$*" == *"list-sessions"* ]]; then printf 'pair-devbox-example-com-foo\n'; fi; }
+  run rename_session "foo" "bar"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Renamed 'devbox-example-com-foo' to 'devbox-example-com-bar'"* ]]
+  [[ "$(cat "$REGISTRY")" == "devbox.example.com"$'\t'"devbox-example-com-bar" ]]
+}
+
 # --- session_is_owned / unrelated-session sweep defense ----------------
 
 @test "session_is_owned: true when a no-ID rest has a matching registry entry" {
@@ -1492,4 +1629,29 @@ setup() {
   [ "$status" -eq 1 ]
   [[ "$output" == *"got extra"* ]]
   [[ "$output" == *"-a"* ]]
+}
+
+@test "dispatch: --rename requires two arguments (missing-arg check, no real config needed)" {
+  # Checked before load_config, so this never touches the network or
+  # any real config either.
+  run "${BATS_TEST_DIRNAME}/../codersync" --rename 3
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Usage: codersync --rename|-R"* ]]
+}
+
+@test "dispatch: --rename rejects extra trailing arguments" {
+  run "${BATS_TEST_DIRNAME}/../codersync" --rename 3 new-name extra
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
+}
+
+@test "dispatch: -R is accepted as a shorthand for --rename" {
+  # Same arity check, same code path -- -R with extra args should be
+  # rejected the exact same way --rename is, proving the alias reaches
+  # the same case branch rather than falling through to the catch-all
+  # "unknown session name" dispatch.
+  run "${BATS_TEST_DIRNAME}/../codersync" -R 3 new-name extra
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
+  [[ "$output" == *"-R"* ]]
 }
