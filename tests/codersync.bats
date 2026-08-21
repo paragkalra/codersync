@@ -403,6 +403,24 @@ setup() {
   [ "$(find_or_assign_id "devbox.example.com" "devbox-example-com-foo")" = "08-devbox-example-com-foo" ]
 }
 
+@test "find_or_assign_id: errors on duplicate entries for the same suffix instead of picking one" {
+  # Regression test: a leftover pair of entries from the PRIOR version
+  # of the leading-zero bug (e.g. both "8-devbox-example-com-foo" and
+  # "08-devbox-example-com-foo" registered for the same suffix, from
+  # before that bug was fixed) used to make this just return whichever
+  # happened to be first on disk -- regardless of which one, if either,
+  # is actually still live. Errors instead of guessing, pointing at
+  # --restore-all to resolve the duplication first.
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t8-devbox-example-com-foo\ndevbox.example.com\t08-devbox-example-com-foo\n' > "$REGISTRY"
+  run find_or_assign_id "devbox.example.com" "devbox-example-com-foo"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"multiple registry entries match"* ]]
+  [[ "$output" == *"--restore-all"* ]]
+}
+
 @test "find_or_assign_id: does not reuse an entry belonging to a different target" {
   CONFIG_DIR="$BATS_TEST_TMPDIR"
   # shellcheck disable=SC2034 # read by next_session_id, called below.
@@ -1163,6 +1181,46 @@ setup() {
   run attach_session "foo"
   [ "$status" -eq 0 ]
   [[ "$output" == *"remote_setup_tmux_mode:devbox-example-com-foo"* ]]
+}
+
+@test "attach_session: errors on duplicate registry entries for the same ID instead of picking one" {
+  # Regression test: a leftover pair of entries from the PRIOR version
+  # of the leading-zero bug (e.g. both "8-devbox-example-com-foo" and
+  # "08-devbox-example-com-foo" registered, only one of them actually
+  # still live) used to make this just return whichever happened to be
+  # first on disk -- --list-all correctly showed the live one, but
+  # --attach on the shared ID resolved the OTHER, stale entry and
+  # reported it as "registered but not alive" (confirmed live). Errors
+  # instead of guessing, pointing at --restore-all to resolve the
+  # duplication first.
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t8-devbox-example-com-foo\ndevbox.example.com\t08-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  ssh() { echo "unexpected: $*" >> "$BATS_TEST_TMPDIR/unexpected_ssh_calls"; }
+  run attach_session "8"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"multiple registry entries match ID 8"* ]]
+  [[ "$output" == *"--restore-all"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
+}
+
+@test "attach_session: errors on duplicate registry entries for the same name instead of picking one" {
+  # Same duplicate scenario as above, but reached via the labeled-name
+  # lookup instead of the numeric-ID one -- both entries share the
+  # exact same PARSED_REST ("devbox-example-com-foo"), differing only
+  # in their own id's raw formatting.
+  SSH_TARGET="devbox.example.com"
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t8-devbox-example-com-foo\ndevbox.example.com\t08-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  ssh() { echo "unexpected: $*" >> "$BATS_TEST_TMPDIR/unexpected_ssh_calls"; }
+  run attach_session "foo"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"multiple registry entries match 'foo'"* ]]
+  [[ "$output" == *"--restore-all"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
 }
 
 # --- rename_session -------------------------------------------------------
