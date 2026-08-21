@@ -1135,6 +1135,72 @@ setup() {
   run ! is_pending "devbox.example.com" "3-devbox-example-com-foo"
 }
 
+@test "mark_pending: fails clearly when the pending-file lock is already held, without touching the file" {
+  # Regression test: mark_pending's append and clear_pending's
+  # read-modify-write used to run completely unlocked -- two overlapping
+  # creations could interleave so one clear_pending wrote back a stale
+  # snapshot after another session's mark_pending had already appended,
+  # silently dropping that marker (confirmed live racing two overlapping
+  # `codersync <name>` invocations). Simulates a concurrent invocation
+  # already holding the (now-separate) pending.lock the same way the
+  # existing id.lock contention test above does for session creation/
+  # rename, and confirms mark_pending backs off cleanly instead of
+  # writing anyway while contended.
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  PENDING_FILE="$CONFIG_DIR/pending"
+  mkdir -p "$CONFIG_DIR/pending.lock"
+  run mark_pending "3-devbox-example-com-foo"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"couldn't acquire the pending-file lock"* ]]
+  [ ! -e "$PENDING_FILE" ]
+}
+
+@test "clear_pending: fails clearly when the pending-file lock is already held, without rewriting the file" {
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  PENDING_FILE="$CONFIG_DIR/pending"
+  printf '%s\n' "1"$'\t'"devbox.example.com"$'\t'"3-devbox-example-com-foo" > "$PENDING_FILE"
+  mkdir -p "$CONFIG_DIR/pending.lock"
+  run clear_pending "3-devbox-example-com-foo"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"couldn't acquire the pending-file lock"* ]]
+  # Untouched, not rewritten (which is what would have happened had
+  # clear_pending proceeded without the lock): the original marker is
+  # still there verbatim.
+  [ "$(cat "$PENDING_FILE")" = "1"$'\t'"devbox.example.com"$'\t'"3-devbox-example-com-foo" ]
+}
+
+@test "is_pending: ignores a malformed (non-numeric) timestamp instead of crashing" {
+  # Regression test: is_pending fed the timestamp field straight into
+  # `(( now - ts ))` with no validation -- a hand-edited or corrupted
+  # pending file with a non-numeric first field crashed the whole
+  # command with "abc: unbound variable" under set -u (confirmed live).
+  # A malformed row is now just skipped, same as if it weren't there.
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  PENDING_FILE="$CONFIG_DIR/pending"
+  printf 'abc\tdevbox.example.com\t3-devbox-example-com-foo\n' > "$PENDING_FILE"
+  run is_pending "devbox.example.com" "3-devbox-example-com-foo"
+  [ "$status" -eq 1 ]
+  [[ "$output" != *"unbound variable"* ]]
+}
+
+@test "restore_all: a malformed pending timestamp doesn't crash, entry is treated as prunable" {
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  PENDING_FILE="$CONFIG_DIR/pending"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t3-devbox-example-com-foo\n' > "$REGISTRY"
+  printf 'abc\tdevbox.example.com\t3-devbox-example-com-foo\n' > "$PENDING_FILE"
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf ''; }
+  run restore_all
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Pruning stale entry"* ]]
+  [ ! -s "$REGISTRY" ]
+}
+
 # --- attach_session -----------------------------------------------------
 
 @test "attach_session: errors on an unregistered ID without touching the network" {
@@ -2360,6 +2426,32 @@ setup() {
   [[ "$output" == *"no session found for ID 8"* ]]
   [[ "$output" != *"Killing:"* ]]
   [[ "$(cat "$REGISTRY")" == "devbox.example.com"$'\t'"08-devbox-example-com-foo" ]]
+}
+
+# --- dispatch: session-creation lifecycle ordering ----------------------
+
+@test "dispatch: mark_pending is written before id.lock is released, not after" {
+  # Regression test: mark_pending used to be called AFTER release_id_lock
+  # in the creation path's dispatch case, leaving a gap where the
+  # registry had the new entry but no pending marker existed yet for
+  # restore_all/kill_all_sessions to respect -- confirmed live,
+  # --restore-all deleted a freshly-registered entry in exactly that
+  # gap. The creation path is inline dispatch code, not a sourced
+  # function (see the other dispatch: tests above/below, which run the
+  # real script as a subprocess for the same reason), so it can't be
+  # driven directly through a stubbed remote_setup the way
+  # restore_all/kill_all_sessions are elsewhere in this file. This
+  # instead asserts the source-order invariant the actual fix depends
+  # on: mark_pending's call site occurs before the release_id_lock that
+  # follows it.
+  script="${BATS_TEST_DIRNAME}/../codersync"
+  # shellcheck disable=SC2016 # single-quoted on purpose: matching the
+  # literal text `$SESSION` in codersync's own source, not expanding it.
+  mark_line="$(grep -n '^[[:space:]]*mark_pending "\$SESSION"$' "$script" | head -1 | cut -d: -f1)"
+  [ -n "$mark_line" ]
+  release_line="$(awk -v start="$mark_line" 'NR > start && /^[[:space:]]*release_id_lock$/ { print NR; exit }' "$script")"
+  [ -n "$release_line" ]
+  [ "$mark_line" -lt "$release_line" ]
 }
 
 # --- dispatch: rejects unexpected trailing arguments -------------------

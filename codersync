@@ -1294,6 +1294,33 @@ release_id_lock() {
   rmdir "$CONFIG_DIR/id.lock" 2>/dev/null || true
 }
 
+# Separate from id.lock (NOT reused) because mark_pending is called
+# while the caller is STILL holding id.lock (see the dispatch case's
+# comment on why the marker has to be written before id.lock is
+# released) -- mkdir-based locks aren't reentrant, so acquiring id.lock
+# a second time from inside the same invocation would just block for 5s
+# and fail. This one only ever guards the three pending-file functions
+# below, held briefly (a single read-modify-write of a small local
+# file, no network I/O), so it's never held long enough to matter for
+# concurrent unrelated invocations.
+acquire_pending_lock() {
+  local lock_dir="$CONFIG_DIR/pending.lock"
+  mkdir -p "$CONFIG_DIR"
+  local waited_ms=0
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    if ((waited_ms >= 5000)); then
+      echo "codersync: couldn't acquire the pending-file lock at ${lock_dir} after 5s -- remove it manually if you're sure no other codersync invocation is running." >&2
+      return 1
+    fi
+    sleep 0.1
+    waited_ms=$((waited_ms + 100))
+  done
+}
+
+release_pending_lock() {
+  rmdir "$CONFIG_DIR/pending.lock" 2>/dev/null || true
+}
+
 # Marks a just-registered session as "still being created" -- the
 # normal creation path releases id.lock right after register_session
 # (deliberately, before the slow remote SSH setup -- see the dispatch
@@ -1304,21 +1331,39 @@ release_id_lock() {
 # brand-new entry -- confirmed live by registering an entry, holding off
 # on remote_setup, and running --restore-all in between: it deleted the
 # entry a split second before the real tmux session came up, leaving the
-# session alive but registry-orphaned. Appends rather than overwrites
-# since more than one creation can be in flight at once.
+# session alive but registry-orphaned. Called by the dispatch case
+# BEFORE it releases id.lock, not after, so there's no gap between the
+# registry write and the marker existing for restore_all to race into
+# (confirmed live: writing the marker after releasing id.lock let
+# --restore-all delete a registered-but-not-yet-pending entry in that
+# exact gap). Appends rather than overwrites since more than one
+# creation can be in flight at once.
 mark_pending() {
   local session="$1"
   mkdir -p "$CONFIG_DIR"
+  acquire_pending_lock || return 1
   printf '%s\n' "$(date +%s)"$'\t'"${SSH_TARGET}"$'\t'"${session}" >> "$PENDING_FILE"
+  release_pending_lock
 }
 
 # Removes this session's own pending marker once remote setup has
 # finished (or the creation path is giving up -- wired to an EXIT trap
 # so a crash/Ctrl-C still clears it, though a hard kill -9 skips traps
-# entirely, which is exactly what PENDING_TTL_SECONDS is for).
+# entirely, which is exactly what PENDING_TTL_SECONDS is for). Locked
+# the same as mark_pending/is_pending: this does a full
+# read-then-rewrite of the whole file, which without a lock could race
+# a concurrent mark_pending/clear_pending for a DIFFERENT in-flight
+# session -- e.g. this read the file before that session's mark_pending
+# appended its line, then this rewrite wrote back a stale snapshot that
+# silently dropped the other session's marker (confirmed live with two
+# overlapping creations racing this exact read-modify-write).
 clear_pending() {
   local session="$1"
-  [[ -f "$PENDING_FILE" ]] || return 0
+  acquire_pending_lock || return 1
+  if [[ ! -f "$PENDING_FILE" ]]; then
+    release_pending_lock
+    return 0
+  fi
   local line kept=()
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
@@ -1334,6 +1379,7 @@ clear_pending() {
   else
     : > "$PENDING_FILE"
   fi
+  release_pending_lock
 }
 
 # Whether (target, name) has an unexpired pending marker -- checked by
@@ -1341,20 +1387,34 @@ clear_pending() {
 # in-flight creation isn't mistaken for a dead one. Markers older than
 # PENDING_TTL_SECONDS are ignored (treated as an abandoned marker from a
 # crashed run, per clear_pending's comment) rather than protecting an
-# entry forever.
+# entry forever. Locked the same as mark_pending/clear_pending so a read
+# here can't land mid-rewrite of clear_pending's full-file rewrite.
+# The timestamp field is validated as all-digits before any arithmetic
+# on it -- a hand-edited or corrupted pending file with a non-numeric
+# timestamp used to crash restore_all outright with "unbound variable"
+# under set -u the moment `(( now - ts ))` tried to evaluate it
+# (confirmed live); such a row is now just treated as not-pending
+# (falling through to whatever restore_all would otherwise do with no
+# marker at all) rather than trusted or crashing.
 is_pending() {
   local target="$1" name="$2"
   [[ -f "$PENDING_FILE" ]] || return 1
-  local now line
+  acquire_pending_lock || return 1
+  local now line found=1
   now="$(date +%s)"
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     local ts="${line%%$'\t'*}" rest="${line#*$'\t'}"
     local ptarget="${rest%%$'\t'*}" pname="${rest#*$'\t'}"
     [[ "$ptarget" == "$target" && "$pname" == "$name" ]] || continue
-    (( now - ts < PENDING_TTL_SECONDS )) && return 0
+    [[ "$ts" =~ ^[0-9]+$ ]] || continue
+    if (( now - ts < PENDING_TTL_SECONDS )); then
+      found=0
+      break
+    fi
   done < "$PENDING_FILE"
-  return 1
+  release_pending_lock
+  return "$found"
 }
 
 # Reopens a tab for every registry entry that belongs to the currently
@@ -3270,18 +3330,18 @@ case "${1:-}" in
     SESSION_SUFFIX="${TARGET_LABEL}-${RAW_NAME}"
     SESSION="$(find_or_assign_id "$SSH_TARGET" "$SESSION_SUFFIX")"
     register_session "$SESSION"
-    trap - EXIT
-    release_id_lock
     # Marks the registry entry just written above as still-being-created
-    # (see mark_pending) and holds that marker through the remote setup
-    # below via an EXIT trap -- id.lock itself is already released by
-    # this point (see the comment above), so without this marker,
-    # restore_all/kill_all_sessions running in that exact window would
-    # see a registered-but-not-yet-live entry and prune it as if it were
-    # stale (see mark_pending's own comment for how this was confirmed
-    # live).
+    # (see mark_pending) -- written BEFORE id.lock is released, not
+    # after, so there's no window where the entry is registered but not
+    # yet marked pending for restore_all/kill_all_sessions to race into
+    # (confirmed live: writing the marker after releasing id.lock let
+    # --restore-all delete the entry in that exact gap). mark_pending
+    # takes its own separate pending.lock internally rather than
+    # id.lock -- mkdir-based locks aren't reentrant, and id.lock is
+    # still held here.
     mark_pending "$SESSION"
-    trap 'clear_pending "$SESSION"' EXIT
+    trap 'clear_pending "$SESSION"; release_id_lock' EXIT
+    release_id_lock
     if [[ "$SPLIT_MODE" == "tmux" ]]; then
       remote_setup_tmux_mode "$SESSION" "$TOOL1" "$TOOL2" "$SAFE_MODE"
       open_tab_tmux_mode "$SESSION"
