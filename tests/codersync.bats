@@ -1479,6 +1479,17 @@ setup() {
       *) echo "unexpected tmux call: $*" >> "$BATS_TEST_TMPDIR/unexpected_tmux_calls"; return 1 ;;
     esac
   }
+  # Stubbed so this test doesn't depend on claude/codex actually being
+  # installed wherever it runs -- "true" is a real, universally
+  # available command, so local_setup's own `command -v "$bin1"`/
+  # `"$bin2"` existence check passes regardless of environment,
+  # letting execution reach the tmux calls this test actually cares
+  # about. Confirmed live: this test passed on a machine with
+  # claude/codex installed but failed in CI (neither installed there),
+  # exiting early with "not found on <host>: claude codex" instead of
+  # ever reaching has-session/new-session at all.
+  # shellcheck disable=SC2329 # invoked indirectly, by local_setup below.
+  command_word_for() { echo "true"; }
   run local_setup "race-test"
   [ "$status" -eq 1 ]
   [[ "$output" == *"couldn't create local session"* ]]

@@ -2519,9 +2519,18 @@ adopt_sessions() {
         "$prefix_key"*)
           araw="${ak#"$prefix_key"}"
           already=0
-          for existing in "${distinct_raws[@]}"; do
-            [[ "$existing" == "$araw" ]] && { already=1; break; }
-          done
+          # Guarded on length before expanding "${distinct_raws[@]}" --
+          # macOS ships bash 3.2 as /bin/bash (see b64()'s neighboring
+          # comment for the same constraint elsewhere in this file),
+          # and expanding an EMPTY array this way is a fatal "unbound
+          # variable" under this script's own `set -u` on that version
+          # (confirmed directly against /bin/bash 3.2; bash 4.4+ fixed
+          # this specific case, but this file doesn't assume 4.4+).
+          if [[ ${#distinct_raws[@]} -gt 0 ]]; then
+            for existing in "${distinct_raws[@]}"; do
+              [[ "$existing" == "$araw" ]] && { already=1; break; }
+            done
+          fi
           [[ "$already" == 0 ]] && distinct_raws+=("$araw")
           ;;
       esac
