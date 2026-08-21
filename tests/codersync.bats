@@ -371,31 +371,48 @@ setup() {
   [ "$PARSED_REST" = "0-host-foo" ]
 }
 
-@test "find_or_assign_id: allocates a fresh ID when nothing matches" {
+@test "find_or_assign_id: allocates a fresh session name when nothing matches" {
   CONFIG_DIR="$BATS_TEST_TMPDIR"
   NEXT_ID_FILE="$CONFIG_DIR/next_id"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
-  [ "$(find_or_assign_id "devbox.example.com" "devbox-example-com-foo")" = "1" ]
+  [ "$(find_or_assign_id "devbox.example.com" "devbox-example-com-foo")" = "1-devbox-example-com-foo" ]
 }
 
-@test "find_or_assign_id: reuses the existing ID for the same target+name" {
+@test "find_or_assign_id: reuses the existing entry's raw text for the same target+name" {
   CONFIG_DIR="$BATS_TEST_TMPDIR"
   NEXT_ID_FILE="$CONFIG_DIR/next_id"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\t5-devbox-example-com-foo\n' > "$REGISTRY"
-  [ "$(find_or_assign_id "devbox.example.com" "devbox-example-com-foo")" = "5" ]
+  [ "$(find_or_assign_id "devbox.example.com" "devbox-example-com-foo")" = "5-devbox-example-com-foo" ]
 }
 
-@test "find_or_assign_id: does not reuse an ID belonging to a different target" {
+@test "find_or_assign_id: preserves a leading zero instead of reconstructing the canonical form" {
+  # Regression test: this used to return only the CANONICAL id (e.g.
+  # "8" for a "08-..." entry), and the caller reconstructed
+  # "${id}-${suffix}" itself -- discarding the leading zero. A live
+  # session already reachable as "pair-08-devbox-example-com-foo" (e.g.
+  # after --adopt picked it up) then got a SECOND, differently-spelled
+  # session ("pair-8-devbox-example-com-foo") and registry entry every
+  # time `codersync foo` re-ran, instead of reattaching to the existing
+  # one -- breaking the exact idempotence this function exists to
+  # guarantee (confirmed live).
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t08-devbox-example-com-foo\n' > "$REGISTRY"
+  [ "$(find_or_assign_id "devbox.example.com" "devbox-example-com-foo")" = "08-devbox-example-com-foo" ]
+}
+
+@test "find_or_assign_id: does not reuse an entry belonging to a different target" {
   CONFIG_DIR="$BATS_TEST_TMPDIR"
   # shellcheck disable=SC2034 # read by next_session_id, called below.
   NEXT_ID_FILE="$CONFIG_DIR/next_id"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'some-other-box\t5-devbox-example-com-foo\n' > "$REGISTRY"
-  [ "$(find_or_assign_id "devbox.example.com" "devbox-example-com-foo")" = "1" ]
+  [ "$(find_or_assign_id "devbox.example.com" "devbox-example-com-foo")" = "1-devbox-example-com-foo" ]
 }
 
-@test "find_or_assign_id: mints a fresh ID instead of reusing a poisoned registry entry" {
+@test "find_or_assign_id: mints a fresh session name instead of reusing a poisoned registry entry" {
   # Regression test: a registry entry with a broken ID segment (leading
   # zero beyond what canonicalizes sanely, or literally 0) used to be
   # reused verbatim -- next_session_id itself would never assign such a
@@ -404,7 +421,7 @@ setup() {
   NEXT_ID_FILE="$CONFIG_DIR/next_id"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\t0-devbox-example-com-foo\n' > "$REGISTRY"
-  [ "$(find_or_assign_id "devbox.example.com" "devbox-example-com-foo")" = "1" ]
+  [ "$(find_or_assign_id "devbox.example.com" "devbox-example-com-foo")" = "1-devbox-example-com-foo" ]
 }
 
 # --- parse_kill_spec -----------------------------------------------------

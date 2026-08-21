@@ -464,18 +464,28 @@ parse_registry_line() {
   fi
 }
 
-# Reuses the ID already assigned to this exact target+raw-name
-# combination if the registry has one, otherwise allocates a fresh one.
-# Without this, re-running `codersync <name>` with the same name would
-# mint a NEW id and therefore a NEW session name every time (since the
-# id is a leading segment of the session name) instead of reattaching to
-# the existing one -- silently creating a duplicate session on every
-# repeat invocation rather than the idempotent reattach this tool
-# otherwise guarantees.
+# Reuses the EXISTING registry entry's raw text for this exact
+# target+raw-name combination if one exists, otherwise allocates a
+# fresh id and returns "${new_id}-${suffix}". Returns the FULL raw
+# session name, not just a bare id -- returning just the canonical id
+# (as this function used to) and letting the caller reconstruct
+# "${id}-${suffix}" itself discarded any leading zero (or other raw
+# formatting) an already-existing entry had: a registry entry
+# "08-devbox-example-com-foo" canonicalizes to id=8, but reconstructing
+# "8-devbox-example-com-foo" from that is a DIFFERENT raw string than
+# what's already registered and already live -- so re-running
+# `codersync foo` against a session already reachable this way (e.g.
+# after `--adopt` picked up a leading-zero live session) created a
+# SECOND, differently-spelled session and registry entry instead of
+# reattaching to the existing one, breaking the exact idempotence this
+# function exists to guarantee (confirmed live). Same bug shape
+# resolve_registered_session/rename_session/adopt_sessions already
+# avoid for their own lookups, by preserving raw text instead of
+# reconstructing it from canonical parts.
 find_or_assign_id() {
   local target="$1" suffix="$2"
   touch "$REGISTRY"
-  local line canon
+  local line
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     parse_registry_line "$line"
@@ -487,13 +497,13 @@ find_or_assign_id() {
       # here would let it right back out as a real session ID. Keep
       # scanning in case another (valid) entry matches this suffix;
       # otherwise fall through to minting a fresh one below.
-      if canon="$(canonicalize_session_id "${BASH_REMATCH[1]}")"; then
-        echo "$canon"
+      if canonicalize_session_id "${BASH_REMATCH[1]}" >/dev/null; then
+        echo "$ENTRY_NAME"
         return 0
       fi
     fi
   done < "$REGISTRY"
-  next_session_id
+  echo "$(next_session_id)-${suffix}"
 }
 
 # Strips one matching pair of surrounding single quotes, if present.
@@ -3057,8 +3067,7 @@ case "${1:-}" in
     acquire_id_lock || exit 1
     trap 'release_id_lock' EXIT
     SESSION_SUFFIX="${TARGET_LABEL}-${RAW_NAME}"
-    SESSION_ID="$(find_or_assign_id "$SSH_TARGET" "$SESSION_SUFFIX")"
-    SESSION="${SESSION_ID}-${SESSION_SUFFIX}"
+    SESSION="$(find_or_assign_id "$SSH_TARGET" "$SESSION_SUFFIX")"
     register_session "$SESSION"
     trap - EXIT
     release_id_lock
