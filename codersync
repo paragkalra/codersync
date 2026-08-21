@@ -2379,9 +2379,29 @@ adopt_sessions() {
   local live
   live="$(ssh "$SSH_TARGET" -- "tmux list-sessions -F '#{session_name}'" 2>/dev/null || true)"
 
+  # Pre-pass: builds a flat "id:rest:kind" record for EVERY live session
+  # (not just unregistered ones, and not deduped), so the main loop
+  # below can cheaply check whether a candidate's (id,rest) also shows
+  # up under the OPPOSITE kind -- using the CANONICAL id/rest, so a
+  # leading-zero "pair-08-host-foo" and an already-canonical
+  # "claude-8-host-foo" are correctly recognized as colliding even
+  # though their raw text differs (same underlying id, once
+  # canonicalized). Cheap: the number of live sessions on a box is
+  # always small.
+  local all_keys=$'\n'
+  local pre_line pre_prefix pre_kind
+  while IFS= read -r pre_line; do
+    [[ -z "$pre_line" ]] && continue
+    pre_prefix="$(session_prefix_for "$pre_line")" || continue
+    pre_kind="iterm"
+    [[ "$pre_prefix" == "pair-" ]] && pre_kind="tmux"
+    parse_numbered_session "$pre_prefix" "$pre_line"
+    all_keys+="${PARSED_ID}:${PARSED_REST}:${pre_kind}"$'\n'
+  done <<<"$live"
+
   local seen_keys=$'\n'
   local -a to_adopt=() to_adopt_ids=()
-  local line prefix kind key live_id live_rest
+  local line prefix kind key live_id live_rest raw_rest other_kind
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     prefix="$(session_prefix_for "$line")" || continue
@@ -2405,14 +2425,38 @@ adopt_sessions() {
     # actual one.
     live_id="$PARSED_ID"
     live_rest="$PARSED_REST"
+    raw_rest="${line#"$prefix"}"
     session_is_owned "$live_id" "$live_rest" && continue
     key="${kind}:${live_id}:${live_rest}"
     case "$seen_keys" in
       *$'\n'"$key"$'\n'*) continue ;;
     esac
     seen_keys+="$key"$'\n'
-    local entry_name="$live_rest"
-    [[ -n "$live_id" ]] && entry_name="${live_id}-${live_rest}"
+    # entry_name is the RAW post-prefix text, not reconstructed from
+    # the CANONICALIZED live_id -- a live "pair-08-host-foo" canonicalizes
+    # to id=8 (leading zero stripped), but the actual live tmux session
+    # is still literally named "pair-08-host-foo". Registering the
+    # reconstructed "8-host-foo" instead left every later lookup
+    # (attach_session/rename_session grep the LIVE list for
+    # "pair-8-host-foo", which never matches) reporting the
+    # just-adopted session as "registered but not alive" -- exactly
+    # the bug shape --kill's and --attach's own comments already
+    # describe and avoid the same way (confirmed live). live_id is
+    # still used below for bump_next_id_past and the dedup key above,
+    # both of which genuinely need the canonical numeric value.
+    local entry_name="$raw_rest"
+    # A raw post-prefix segment that LOOKS like an ID attempt but fails
+    # canonicalization (e.g. "0-host-foo", or a pathologically long
+    # digit run) is poisoned -- the exact shape session_is_owned() and
+    # restore_all already refuse to trust anywhere else. Skipped here
+    # too, rather than adopted: registering it made --adopt report
+    # success for a session that was never actually made manageable,
+    # since every ownership check that matters (session_is_owned,
+    # find_or_assign_id) already treats that shape as unauthorized.
+    if [[ "$entry_name" =~ ^([0-9]+)-(.*)$ ]] && ! canonicalize_session_id "${BASH_REMATCH[1]}" >/dev/null; then
+      echo "codersync: skipping poisoned live session name (invalid ID segment): ${prefix}${entry_name}" >&2
+      continue
+    fi
     # entry_name is built from a LIVE tmux session name, not something
     # this tool already validated at creation time -- a hand-created
     # or otherwise poisoned live session (e.g. "pair-x;touch /tmp/pwn")
@@ -2423,7 +2467,23 @@ adopt_sessions() {
     # live tmux name instead (confirmed live: "pair-x;touch /tmp/pwn"
     # got adopted verbatim as "x;touch /tmp/pwn" before this check).
     if ! validate_session_name "$entry_name"; then
-      echo "codersync: skipping unsafe live session name (contains characters outside a-z/0-9/_/- ): ${prefix}${line#"$prefix"}" >&2
+      echo "codersync: skipping unsafe live session name (contains characters outside a-z/0-9/_/- ): ${prefix}${entry_name}" >&2
+      continue
+    fi
+    # Ownership (session_is_owned) matches on id+rest alone, with no
+    # notion of WHICH prefix (pair- vs claude-/codex-) a live session
+    # actually uses -- the same gap --rename's own preflight check
+    # already guards against for renaming. Adopting one of two
+    # DIFFERENT live sessions (a tmux-mode "pair-X" and an unrelated
+    # iterm-mode "claude-X"/"codex-X" pair sharing the same id/rest,
+    # once canonicalized) would register a SINGLE entry that then
+    # satisfies ownership for BOTH, silently merging two unrelated
+    # sessions into one logical identity (confirmed live). Refused
+    # outright here rather than guessing which one the user meant.
+    other_kind="tmux"
+    [[ "$kind" == "tmux" ]] && other_kind="iterm"
+    if [[ "$all_keys" == *$'\n'"${live_id}:${live_rest}:${other_kind}"$'\n'* ]]; then
+      echo "codersync: skipping '${prefix}${raw_rest}' -- an unrelated ${other_kind} session shares the same id/rest on ${SSH_TARGET}, and adopting either would make --list-all/--attach/--kill treat them as the same session. Rename one of them first (plain tmux rename-session), then re-run --adopt." >&2
       continue
     fi
     to_adopt+=("$entry_name")

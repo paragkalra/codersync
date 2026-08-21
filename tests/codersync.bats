@@ -1592,6 +1592,100 @@ setup() {
   [[ "$(cat "$REGISTRY")" == "devbox.example.com"$'\t'"5-devbox-example-com-foo" ]]
 }
 
+@test "adopt_sessions: preserves a leading-zero ID's raw text, not the canonicalized form" {
+  # Regression test: entry_name used to be reconstructed from the
+  # CANONICALIZED live_id ("8"), not the raw post-prefix text ("08"
+  # in this case) -- so a live "pair-08-devbox-example-com-foo" got
+  # registered as "8-devbox-example-com-foo". The actual live tmux
+  # session is still literally named "pair-08-...", so every later
+  # lookup (attach_session/rename_session grep the live list for
+  # "pair-8-..." instead) reported the just-adopted session as
+  # "registered but not alive" (confirmed live).
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf 'pair-08-devbox-example-com-foo\n'; }
+  run adopt_sessions
+  [ "$status" -eq 0 ]
+  [[ "$(cat "$REGISTRY")" == "devbox.example.com"$'\t'"08-devbox-example-com-foo" ]]
+}
+
+@test "adopt_sessions: skips a poisoned invalid-ID live session instead of registering it" {
+  # Regression test: a raw post-prefix segment that LOOKS like an ID
+  # attempt but fails canonicalization (e.g. "0-...", 0 is never a
+  # valid ID) parses as PARSED_ID="" (parse_numbered_session treats it
+  # as "no ID", folding the whole thing into PARSED_REST) -- so the
+  # existing validate_session_name check alone doesn't catch it (the
+  # character set is perfectly safe). Registering it anyway made
+  # --adopt report success for a session that was never actually made
+  # manageable, since session_is_owned/find_or_assign_id already
+  # refuse to trust that exact shape everywhere else.
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf 'pair-0-devbox-example-com-foo\n'; }
+  run adopt_sessions
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"skipping poisoned live session name"* ]]
+  [[ "$output" != *"Adopted"* ]]
+  [ ! -s "$REGISTRY" ]
+}
+
+@test "adopt_sessions: refuses to adopt when an unrelated cross-kind session shares the same name" {
+  # Regression test: ownership (session_is_owned) matches on id+rest
+  # alone, with no notion of which prefix (pair- vs claude-/codex-) a
+  # live session actually uses. Adopting a tmux-mode "pair-same" while
+  # an UNRELATED iterm-mode "claude-same"/"codex-same" pair also
+  # exists live registered a single entry that then satisfied
+  # ownership for BOTH, silently merging two unrelated sessions into
+  # one logical identity (confirmed live).
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'pair-same\nclaude-same\ncodex-same\n'
+    fi
+  }
+  run adopt_sessions
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"skipping 'pair-same'"* ]]
+  [[ "$output" == *"skipping 'claude-same'"* || "$output" == *"skipping 'codex-same'"* ]]
+  [[ "$output" != *"Adopted"* ]]
+  [ ! -s "$REGISTRY" ]
+}
+
+@test "adopt_sessions: refuses a cross-kind collision even when the raw text differs (leading zero vs canonical)" {
+  # Same ambiguity as above, but the two live sessions have DIFFERENT
+  # raw text ("08-..." vs "8-...") that canonicalizes to the SAME
+  # id/rest -- confirming the check compares canonical id/rest, not
+  # just literal text equality.
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'pair-08-devbox-example-com-foo\nclaude-8-devbox-example-com-foo\ncodex-8-devbox-example-com-foo\n'
+    fi
+  }
+  run adopt_sessions
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"Adopted"* ]]
+  [ ! -s "$REGISTRY" ]
+}
+
 @test "adopt_sessions: advances next_id past an adopted numeric ID" {
   # Regression test: adopt_sessions preserved a live session's own
   # numeric ID into the registry without ever advancing this client's
