@@ -1334,6 +1334,46 @@ setup() {
   [[ "$(cat "$REGISTRY")" == "devbox.example.com"$'\t'"devbox-example-com-bar" ]]
 }
 
+# --- list_all_sessions ---------------------------------------------------
+
+@test "list_all_sessions: SESSION column strips the target-label prefix" {
+  # Regression test: this column used to show the raw PARSED_REST
+  # ("${TARGET_LABEL}-${RAW_NAME}"), which looked directly usable as a
+  # name for --attach/--rename but wasn't -- passing it back verbatim
+  # double-prefixed the lookup and never matched anything (confirmed
+  # live). --attach/--rename take the bare RAW_NAME and reconstruct the
+  # label internally themselves, so this column now strips it too.
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by list_all_sessions below, to
+  # strip it from each row's displayed rest.
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t3-devbox-example-com-my-feature\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by list_all_sessions below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf 'pair-3-devbox-example-com-my-feature\n'; }
+  run list_all_sessions
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"my-feature"* ]]
+  [[ "$output" != *"devbox-example-com-my-feature"* ]]
+}
+
+@test "list_all_sessions: leaves a rest untouched if it doesn't start with the target label" {
+  # A hand-created or pre-labeling legacy session's rest might not
+  # start with "${TARGET_LABEL}-" at all -- the strip must be a no-op
+  # then, not mangle it.
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by list_all_sessions below, to
+  # strip it from each row's displayed rest.
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\tsome-other-name\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by list_all_sessions below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf 'pair-some-other-name\n'; }
+  run list_all_sessions
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"some-other-name"* ]]
+}
+
 # --- session_is_owned / unrelated-session sweep defense ----------------
 
 @test "session_is_owned: true when a no-ID rest has a matching registry entry" {

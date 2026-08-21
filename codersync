@@ -1685,7 +1685,19 @@ list_all_sessions() {
     seen_keys+="$key"$'\n'
     local id_display="${PARSED_ID:--}"
     local id_sort="${PARSED_ID:-999999}"
-    rows+=("$(printf '%06d\t%s\t%s\t%s' "$id_sort" "$id_display" "$kind" "$PARSED_REST")")
+    # Strips the "${TARGET_LABEL}-" prefix for display, if present --
+    # PARSED_REST is always "${TARGET_LABEL}-${RAW_NAME}" for a session
+    # actually created by this tool (see the dispatch case's own
+    # SESSION_SUFFIX comment), but --attach/--rename take the bare
+    # RAW_NAME, reconstructing the label internally themselves.
+    # Without stripping it here, this column showed a string that
+    # looked directly attachable/renameable by name but wasn't --
+    # passing it back verbatim produced a double-prefixed, never-found
+    # lookup (confirmed live). A no-op for anything that doesn't
+    # actually start with that prefix (a hand-created or pre-labeling
+    # legacy session), via `#` removing nothing if it doesn't match.
+    local display_rest="${PARSED_REST#"${TARGET_LABEL}-"}"
+    rows+=("$(printf '%06d\t%s\t%s\t%s' "$id_sort" "$id_display" "$kind" "$display_rest")")
   done <<<"$live"
 
   if [[ ${#rows[@]} -eq 0 ]]; then

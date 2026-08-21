@@ -238,9 +238,15 @@ numeric ID and split mode:
 
 ```
 ID     MODE     SESSION
-1      tmux     devbox-example-com-my-feature
-2      iterm    devbox-example-com-another-task
+1      tmux     my-feature
+2      iterm    another-task
 ```
+
+The SESSION column shows the plain name (the target-label prefix is
+stripped, since it's implied by whichever box you're currently
+configured against) -- exactly what `--attach`/`-a` and `--rename`/`-R`
+expect when you pass a name instead of an ID, so you can copy it
+straight from here.
 
 This talks directly to the remote `tmux` server, so a session that's
 died (killed outside codersync, the box rebooted) correctly drops off
