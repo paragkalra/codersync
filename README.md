@@ -261,10 +261,12 @@ the list even if its registry entry is still there. Both checks are
 required, though: a session that's alive on the box but missing from
 *this* registry, because you're on a different machine than the one
 that created it or the registry was cleared, won't show up here.
-Its tmux session itself is completely unaffected; there's currently no
-built-in command to re-adopt it into the registry, so reattach to it
-directly with `ssh <ssh-target> -- tmux attach -t <session-name>`
-(get the exact name with `ssh <ssh-target> -- tmux list-sessions`).
+Its tmux session itself is completely unaffected. Run
+[`--adopt`](#codersync---adopt--d) to register it into this registry
+(covers any live session matching codersync's own naming pattern, not
+just ones from a different machine), or reattach to it directly with
+`ssh <ssh-target> -- tmux attach -t <session-name>` (get the exact
+name with `ssh <ssh-target> -- tmux list-sessions`).
 
 ### `codersync --kill|-k <ids>`
 

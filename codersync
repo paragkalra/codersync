@@ -149,6 +149,15 @@ CONFIG_DIR="$HOME/.config/codersync"
 CONFIG_FILE="$CONFIG_DIR/config"
 REGISTRY="$HOME/.codersync_sessions"
 NEXT_ID_FILE="$CONFIG_DIR/next_id"
+PENDING_FILE="$CONFIG_DIR/pending"
+
+# How long a pending marker (see mark_pending below) is honored before
+# restore_all treats it as stale and prunable like any other dead entry.
+# Needs to comfortably cover a normal remote_setup/remote_setup_tmux_mode
+# SSH round-trip, but not so long that a marker orphaned by a hard crash
+# (kill -9 -- the EXIT trap that would normally clear_pending never runs)
+# blocks --restore-all from ever pruning that entry again.
+PENDING_TTL_SECONDS=600
 
 # Input validation, all for the same reason: ssh-target, remote-dir, and
 # session names all eventually get interpolated UNQUOTED into a heredoc
@@ -500,6 +509,7 @@ find_or_assign_id() {
   touch "$REGISTRY"
   local line
   local -a id_suffix_matches=()
+  local seen=$'\n'
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     parse_registry_line "$line"
@@ -509,7 +519,21 @@ find_or_assign_id() {
       # pathologically long ID) is never reused -- next_session_id
       # itself would reject that exact value, so blindly returning it
       # here would let it right back out as a real session ID.
-      canonicalize_session_id "${BASH_REMATCH[1]}" >/dev/null && id_suffix_matches+=("$ENTRY_NAME")
+      if canonicalize_session_id "${BASH_REMATCH[1]}" >/dev/null; then
+        # Exact duplicate LINES (identical target+name, e.g. from a
+        # stale double-write before this check existed) are collapsed
+        # to a single candidate here -- without this, two identical
+        # entries counted as "2 matches", wrongly triggering the
+        # ambiguity error below even though there's really only one
+        # distinct session in play (confirmed live: --restore-all
+        # doesn't actually resolve this particular shape either, since
+        # it independently restores each duplicate LINE, leaving both
+        # intact -- see restore_all's own de-dup fix for that).
+        case "$seen" in
+          *$'\n'"$ENTRY_NAME"$'\n'*) ;;
+          *) seen+="$ENTRY_NAME"$'\n'; id_suffix_matches+=("$ENTRY_NAME") ;;
+        esac
+      fi
     fi
   done < "$REGISTRY"
   if [[ ${#id_suffix_matches[@]} -gt 1 ]]; then
@@ -1270,6 +1294,69 @@ release_id_lock() {
   rmdir "$CONFIG_DIR/id.lock" 2>/dev/null || true
 }
 
+# Marks a just-registered session as "still being created" -- the
+# normal creation path releases id.lock right after register_session
+# (deliberately, before the slow remote SSH setup -- see the dispatch
+# case's own comment), which opens a window where the registry has the
+# entry but no live tmux session exists yet. Without a marker covering
+# that window, restore_all/kill_all_sessions can't tell "just registered,
+# remote setup still running" apart from "genuinely dead", and prune the
+# brand-new entry -- confirmed live by registering an entry, holding off
+# on remote_setup, and running --restore-all in between: it deleted the
+# entry a split second before the real tmux session came up, leaving the
+# session alive but registry-orphaned. Appends rather than overwrites
+# since more than one creation can be in flight at once.
+mark_pending() {
+  local session="$1"
+  mkdir -p "$CONFIG_DIR"
+  printf '%s\n' "$(date +%s)"$'\t'"${SSH_TARGET}"$'\t'"${session}" >> "$PENDING_FILE"
+}
+
+# Removes this session's own pending marker once remote setup has
+# finished (or the creation path is giving up -- wired to an EXIT trap
+# so a crash/Ctrl-C still clears it, though a hard kill -9 skips traps
+# entirely, which is exactly what PENDING_TTL_SECONDS is for).
+clear_pending() {
+  local session="$1"
+  [[ -f "$PENDING_FILE" ]] || return 0
+  local line kept=()
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local ts="${line%%$'\t'*}" rest="${line#*$'\t'}"
+    local ptarget="${rest%%$'\t'*}" pname="${rest#*$'\t'}"
+    if [[ "$ptarget" == "$SSH_TARGET" && "$pname" == "$session" ]]; then
+      continue
+    fi
+    kept+=("${ts}"$'\t'"${ptarget}"$'\t'"${pname}")
+  done < "$PENDING_FILE"
+  if [[ ${#kept[@]} -gt 0 ]]; then
+    printf '%s\n' "${kept[@]}" > "$PENDING_FILE"
+  else
+    : > "$PENDING_FILE"
+  fi
+}
+
+# Whether (target, name) has an unexpired pending marker -- checked by
+# restore_all before pruning an entry with no live tmux session, so an
+# in-flight creation isn't mistaken for a dead one. Markers older than
+# PENDING_TTL_SECONDS are ignored (treated as an abandoned marker from a
+# crashed run, per clear_pending's comment) rather than protecting an
+# entry forever.
+is_pending() {
+  local target="$1" name="$2"
+  [[ -f "$PENDING_FILE" ]] || return 1
+  local now line
+  now="$(date +%s)"
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local ts="${line%%$'\t'*}" rest="${line#*$'\t'}"
+    local ptarget="${rest%%$'\t'*}" pname="${rest#*$'\t'}"
+    [[ "$ptarget" == "$target" && "$pname" == "$name" ]] || continue
+    (( now - ts < PENDING_TTL_SECONDS )) && return 0
+  done < "$PENDING_FILE"
+  return 1
+}
+
 # Reopens a tab for every registry entry that belongs to the currently
 # configured target and still has a live tmux session there, and prunes
 # entries that don't. Each entry might be either split mode -- detected
@@ -1297,10 +1384,29 @@ restore_all() {
   local restored=0
   local skipped_other_target=0
   local skipped_unsafe=0
+  local seen_lines=$'\n'
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     parse_registry_line "$line"
     local entry_target="$ENTRY_TARGET" entry_name="$ENTRY_NAME"
+
+    # Exact duplicate LINES (identical target+name -- e.g. a stale
+    # double-write from before find_or_assign_id's own de-dup existed)
+    # are collapsed to a single kept entry and a single restore
+    # attempt here. Without this, each duplicate independently looked
+    # "alive" against the same live session and got separately
+    # restored/opened -- a tab opened once PER duplicate line instead
+    # of once total, and the registry rewritten with the same
+    # duplicate still intact afterward (confirmed live with a stubbed
+    # remote: --restore-all opened the same session twice and never
+    # actually resolved the duplication, leaving find_or_assign_id's
+    # own "run --restore-all to fix this" advice pointing at something
+    # that didn't fix it).
+    local dup_key="${entry_target}"$'\t'"${entry_name}"
+    case "$seen_lines" in
+      *$'\n'"$dup_key"$'\n'*) continue ;;
+    esac
+    seen_lines+="$dup_key"$'\n'
 
     if [[ "$entry_target" != "$SSH_TARGET" ]]; then
       kept+=("${entry_target}"$'\t'"${entry_name}")
@@ -1366,6 +1472,14 @@ restore_all() {
       # would make a later restore-all forget about the surviving pane.
       echo "Skipping '$entry_name': only one of claude/codex is still alive -- not auto-recreating the other with default tools. Run codersync again with this session's name if you want both back."
       kept+=("${entry_target}"$'\t'"${entry_name}")
+    elif is_pending "$entry_target" "$entry_name"; then
+      # No live tmux session yet, but a creation for this exact entry is
+      # still in flight (see mark_pending) -- kept as-is rather than
+      # pruned, since the remote session may finish appearing a moment
+      # later. Not restored either: there's nothing to restore, the
+      # in-flight creation will open its own tab when it completes.
+      echo "Skipping '$entry_name': session creation still in progress, not pruning yet."
+      kept+=("${entry_target}"$'\t'"${entry_name}")
     else
       echo "Pruning stale entry (no live tmux session): $entry_name"
     fi
@@ -1416,6 +1530,7 @@ resolve_registered_session() {
       return 1
     fi
     local -a id_matches=()
+    local id_seen=$'\n'
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
       parse_registry_line "$line"
@@ -1434,7 +1549,13 @@ resolve_registered_session() {
           echo "codersync: registry entry for ID ${canon} contains unsafe characters ('${ENTRY_NAME}') -- refusing to use it. Run codersync --restore-all to prune unsafe entries." >&2
           return 1
         fi
-        id_matches+=("$ENTRY_NAME")
+        # Exact duplicate LINES don't count as a second candidate --
+        # see find_or_assign_id's own comment for why (a stale
+        # double-write, not a genuine ambiguity).
+        case "$id_seen" in
+          *$'\n'"$ENTRY_NAME"$'\n'*) ;;
+          *) id_seen+="$ENTRY_NAME"$'\n'; id_matches+=("$ENTRY_NAME") ;;
+        esac
       fi
     done < "$REGISTRY"
     # Collected ALL matches instead of stopping at the first -- a
@@ -1466,6 +1587,7 @@ resolve_registered_session() {
     fi
     local suffix="${TARGET_LABEL}-${arg}"
     local -a suffix_matches=()
+    local suffix_seen=$'\n'
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
       parse_registry_line "$line"
@@ -1482,7 +1604,12 @@ resolve_registered_session() {
           echo "codersync: registry entry for '${arg}' contains unsafe characters ('${ENTRY_NAME}') -- refusing to use it. Run codersync --restore-all to prune unsafe entries." >&2
           return 1
         fi
-        suffix_matches+=("$ENTRY_NAME")
+        # Exact duplicate LINES don't count as a second candidate --
+        # see find_or_assign_id's own comment for why.
+        case "$suffix_seen" in
+          *$'\n'"$ENTRY_NAME"$'\n'*) ;;
+          *) suffix_seen+="$ENTRY_NAME"$'\n'; suffix_matches+=("$ENTRY_NAME") ;;
+        esac
       fi
     done < "$REGISTRY"
     # Collected ALL matches instead of stopping at the first -- same
@@ -2038,19 +2165,46 @@ kill_all_sessions() {
   fi
 
   local count=0
+  local -a killed_pairs=()
+  local prefix2
   for name in "${matches[@]}"; do
     echo "Killing: $name"
     remote_kill_session "$name"
+    prefix2="$(session_prefix_for "$name")"
+    parse_numbered_session "$prefix2" "$name"
+    # Recorded as (id, rest) -- not the reconstructed raw string -- for
+    # the same reason kill_sessions does: the matching registry entry's
+    # raw text (e.g. a leading-zero ID like "08-...") can differ from
+    # "${PARSED_ID}-${PARSED_REST}", so the cleanup below compares each
+    # entry's OWN parsed (id, rest) instead of an exact string match.
+    killed_pairs+=("${PARSED_ID}"$'\t'"${PARSED_REST}")
     count=$((count + 1))
   done
 
   touch "$REGISTRY"
   local kept=()
-  local line
+  local line kp drop
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     parse_registry_line "$line"
-    [[ "$ENTRY_TARGET" != "$SSH_TARGET" ]] && kept+=("$line")
+    drop=0
+    if [[ "$ENTRY_TARGET" == "$SSH_TARGET" ]]; then
+      parse_numbered_session "" "$ENTRY_NAME"
+      for kp in "${killed_pairs[@]}"; do
+        if [[ "$kp" == "${PARSED_ID}"$'\t'"${PARSED_REST}" ]]; then
+          drop=1
+          break
+        fi
+      done
+    fi
+    # Only entries matching a session actually just killed are dropped --
+    # NOT every current-target entry unconditionally (the prior
+    # behavior). That unconditional drop would also wipe out a
+    # currently-in-flight creation's pending registry entry (see
+    # mark_pending) and a legitimately-preserved "half-alive pair" entry
+    # (see restore_all's own "only one of claude/codex is still alive"
+    # branch), neither of which this run actually killed.
+    [[ "$drop" == 0 ]] && kept+=("$line")
   done < "$REGISTRY"
   if [[ ${#kept[@]} -gt 0 ]]; then
     printf '%s\n' "${kept[@]}" > "$REGISTRY"
@@ -3118,6 +3272,16 @@ case "${1:-}" in
     register_session "$SESSION"
     trap - EXIT
     release_id_lock
+    # Marks the registry entry just written above as still-being-created
+    # (see mark_pending) and holds that marker through the remote setup
+    # below via an EXIT trap -- id.lock itself is already released by
+    # this point (see the comment above), so without this marker,
+    # restore_all/kill_all_sessions running in that exact window would
+    # see a registered-but-not-yet-live entry and prune it as if it were
+    # stale (see mark_pending's own comment for how this was confirmed
+    # live).
+    mark_pending "$SESSION"
+    trap 'clear_pending "$SESSION"' EXIT
     if [[ "$SPLIT_MODE" == "tmux" ]]; then
       remote_setup_tmux_mode "$SESSION" "$TOOL1" "$TOOL2" "$SAFE_MODE"
       open_tab_tmux_mode "$SESSION"
@@ -3125,6 +3289,8 @@ case "${1:-}" in
       remote_setup "$SESSION" "$TOOL1" "$TOOL2" "$SAFE_MODE"
       open_tab "$SESSION"
     fi
+    trap - EXIT
+    clear_pending "$SESSION"
     ;;
 esac
 fi

@@ -421,6 +421,21 @@ setup() {
   [[ "$output" == *"--restore-all"* ]]
 }
 
+@test "find_or_assign_id: exact duplicate lines don't count as ambiguous" {
+  # Regression test: two IDENTICAL registry lines (a stale double-write,
+  # not a genuine ambiguity between two different raw spellings) used
+  # to be counted as "2 matches" too, wrongly triggering the same
+  # ambiguity error as a real conflict -- confirmed live: --restore-all
+  # doesn't actually resolve this shape either (it independently
+  # restores each duplicate LINE, leaving both intact), so pointing the
+  # user there for THIS case was a dead end.
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t08-devbox-example-com-foo\ndevbox.example.com\t08-devbox-example-com-foo\n' > "$REGISTRY"
+  [ "$(find_or_assign_id "devbox.example.com" "devbox-example-com-foo")" = "08-devbox-example-com-foo" ]
+}
+
 @test "find_or_assign_id: does not reuse an entry belonging to a different target" {
   CONFIG_DIR="$BATS_TEST_TMPDIR"
   # shellcheck disable=SC2034 # read by next_session_id, called below.
@@ -1032,6 +1047,94 @@ setup() {
   [ ! -s "$REGISTRY" ]
 }
 
+@test "restore_all: collapses exact duplicate registry lines to a single restore" {
+  # Regression test: two IDENTICAL registry lines (a stale double-write
+  # from before this de-dup existed) each independently looked "alive"
+  # against the same live session and got separately restored/opened
+  # -- a tab opened once PER duplicate instead of once total, and the
+  # registry rewritten with the same duplicate still intact afterward
+  # (confirmed live with a stubbed remote: --restore-all restored/
+  # opened the same session TWICE and left both identical lines,
+  # meaning find_or_assign_id's own "run --restore-all to fix this"
+  # advice for the duplicate-entries case was a dead end for this
+  # exact shape).
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t08-devbox-example-com-foo\ndevbox.example.com\t08-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf 'pair-08-devbox-example-com-foo\n'; }
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all below.
+  remote_setup_tmux_mode() { echo "remote_setup_tmux_mode:$1"; }
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all below.
+  open_tab_tmux_mode() { echo "open_tab_tmux_mode:$1"; }
+  run restore_all
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Restored 1 session(s)."* ]]
+  # Restoring/opening called exactly once, not twice.
+  [ "$(grep -c "^remote_setup_tmux_mode:" <<< "$output")" -eq 1 ]
+  [ "$(grep -c "^open_tab_tmux_mode:" <<< "$output")" -eq 1 ]
+  [ "$(cat "$REGISTRY")" = "devbox.example.com"$'\t'"08-devbox-example-com-foo" ]
+}
+
+@test "restore_all: does not prune an entry with an unexpired pending marker" {
+  # Regression test: the normal creation path releases id.lock right
+  # after writing the registry entry, before the remote tmux session
+  # actually exists (deliberately, to avoid serializing unrelated
+  # invocations -- see the dispatch case's own comment). restore_all
+  # used to treat that exact window's registered-but-not-yet-live entry
+  # as indistinguishable from a genuinely dead one and prune it --
+  # confirmed live by registering an entry, then running --restore-all
+  # before the matching tmux session came up: it deleted the entry a
+  # moment before the real session appeared, orphaning it. A pending
+  # marker (mark_pending) now protects exactly this window.
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  PENDING_FILE="$CONFIG_DIR/pending"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t3-devbox-example-com-foo\n' > "$REGISTRY"
+  mark_pending "3-devbox-example-com-foo"
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf ''; }
+  run restore_all
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"session creation still in progress, not pruning yet"* ]]
+  [[ "$output" != *"Pruning stale entry"* ]]
+  [ "$(cat "$REGISTRY")" = "devbox.example.com"$'\t'"3-devbox-example-com-foo" ]
+}
+
+@test "restore_all: prunes an entry with an expired pending marker" {
+  # A pending marker left behind by a hard crash (kill -9 skips the EXIT
+  # trap that would normally clear_pending) must not protect a dead
+  # entry forever -- past PENDING_TTL_SECONDS it's treated as stale like
+  # any other marker-less dead entry.
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  PENDING_FILE="$CONFIG_DIR/pending"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t3-devbox-example-com-foo\n' > "$REGISTRY"
+  mkdir -p "$CONFIG_DIR"
+  printf '%s\n' "1"$'\t'"devbox.example.com"$'\t'"3-devbox-example-com-foo" > "$PENDING_FILE"
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf ''; }
+  run restore_all
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Pruning stale entry"* ]]
+  [ ! -s "$REGISTRY" ]
+}
+
+@test "mark_pending / is_pending / clear_pending round-trip" {
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  PENDING_FILE="$CONFIG_DIR/pending"
+  run ! is_pending "devbox.example.com" "3-devbox-example-com-foo"
+  mark_pending "3-devbox-example-com-foo"
+  is_pending "devbox.example.com" "3-devbox-example-com-foo"
+  run ! is_pending "devbox.example.com" "5-devbox-example-com-other"
+  run ! is_pending "other.example.com" "3-devbox-example-com-foo"
+  clear_pending "3-devbox-example-com-foo"
+  run ! is_pending "devbox.example.com" "3-devbox-example-com-foo"
+}
+
 # --- attach_session -----------------------------------------------------
 
 @test "attach_session: errors on an unregistered ID without touching the network" {
@@ -1221,6 +1324,37 @@ setup() {
   [[ "$output" == *"multiple registry entries match 'foo'"* ]]
   [[ "$output" == *"--restore-all"* ]]
   [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
+}
+
+@test "attach_session: exact duplicate lines don't count as ambiguous, by ID" {
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t08-devbox-example-com-foo\ndevbox.example.com\t08-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf 'pair-08-devbox-example-com-foo\n'; }
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  remote_setup_tmux_mode() { echo "remote_setup_tmux_mode:$1"; }
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  open_tab_tmux_mode() { echo "open_tab_tmux_mode:$1"; }
+  run attach_session "8"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"remote_setup_tmux_mode:08-devbox-example-com-foo"* ]]
+}
+
+@test "attach_session: exact duplicate lines don't count as ambiguous, by name" {
+  SSH_TARGET="devbox.example.com"
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t08-devbox-example-com-foo\ndevbox.example.com\t08-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf 'pair-08-devbox-example-com-foo\n'; }
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  remote_setup_tmux_mode() { echo "remote_setup_tmux_mode:$1"; }
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  open_tab_tmux_mode() { echo "open_tab_tmux_mode:$1"; }
+  run attach_session "foo"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"remote_setup_tmux_mode:08-devbox-example-com-foo"* ]]
 }
 
 # --- rename_session -------------------------------------------------------
@@ -2084,6 +2218,29 @@ setup() {
   }
   run kill_all_sessions <<<"n"
   [[ "$output" == *"pair-programming"* ]]
+}
+
+@test "kill_all_sessions: only removes registry entries for sessions it actually killed" {
+  # Regression test: the registry cleanup at the end of kill_all_sessions
+  # used to drop EVERY current-target entry unconditionally, not just
+  # the ones matching a session actually just killed. Here only ID 3 is
+  # live (and gets killed); ID 5 is registered for the same target but
+  # has no live tmux session (e.g. a creation still in flight, or a
+  # legitimately-preserved half-alive pair) -- it must survive.
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t3-devbox-example-com-foo\ndevbox.example.com\t5-devbox-example-com-bar\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by kill_all_sessions.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'pair-3-devbox-example-com-foo\n'
+    fi
+  }
+  run kill_all_sessions <<<"y"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Killed 1 session(s)."* ]]
+  [[ "$(cat "$REGISTRY")" != *"3-devbox-example-com-foo"* ]]
+  [[ "$(cat "$REGISTRY")" == *"5-devbox-example-com-bar"* ]]
 }
 
 @test "kill_sessions: does not kill an unrelated session sharing the requested ID" {
