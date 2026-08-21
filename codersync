@@ -1139,49 +1139,51 @@ session_prefix_for() {
   esac
 }
 
-# True if `id`+`rest` (already parsed out of a live tmux session name by
-# parse_numbered_session) are, together, a session codersync actually
-# manages for the CURRENTLY configured target -- true only if the
-# registry has an entry for this target whose OWN id/rest (parsed the
-# same way) match exactly. `id=""` correctly matches only an entry with
-# no ID segment either (a legacy, pre-numbering session).
+# True if `raw` (a live tmux session's own RAW post-prefix text --
+# e.g. "1-devbox-example-com-foo", or "devbox-example-com-foo" for a
+# no-ID legacy session -- NOT run through parse_numbered_session/
+# canonicalized) exactly matches some registry entry's own raw
+# ENTRY_NAME, for the CURRENTLY configured target.
 #
-# This used to trust an IDed session by naming SHAPE alone -- first "a
-# prefix plus any valid ID" (confirmed live: an unrelated session
-# literally named "pair-1-not-codersync" was still listed/killed), then
-# "a prefix plus a valid ID AND a rest starting with the target's
-# label" (confirmed live AGAIN: for a target labeled e.g. "host",
-# "pair-1-host-unregistered" still matched -- common target labels make
-# that prefix trivial to collide with by accident). Full registry-backing
-# is the only check narrow enough to avoid yet another naming collision,
-# and it costs no real functionality: register_session() always runs
-# BEFORE remote_setup/remote_setup_tmux_mode actually create the live
-# session (see the ID-lock comment in the dispatch code below), so any
-# session THIS tool creates is already registered by the time it exists
-# to be listed/killed at all.
+# Compared as RAW TEXT, not canonical id+rest -- deliberately. A
+# session actually created by this tool always has IDENTICAL raw text
+# in the registry and in its live tmux name, by construction
+# (register_session stores the exact same string remote_setup/
+# remote_setup_tmux_mode use to build the session name). Canonical
+# id+rest matching used to be the check instead, which meant two
+# DIFFERENT raw spellings that happen to canonicalize to the same
+# value -- e.g. a registry entry "08-devbox-example-com-foo" and an
+# unrelated live "pair-8-devbox-example-com-foo" that was never
+# actually registered -- were wrongly treated as the SAME session:
+# --list-all showed the live one as managed, --attach on it failed
+# ("registered but not alive", since --attach's own lookup DOES
+# compare raw text and correctly found no match), and --kill on the
+# shared canonical ID killed the live, unregistered session and then
+# deleted the unrelated registry entry it happened to collide with
+# (confirmed live, reproduced exactly this way).
+#
+# This used to also trust an IDed session by naming SHAPE alone --
+# first "a prefix plus any valid ID" (confirmed live: an unrelated
+# session literally named "pair-1-not-codersync" was still
+# listed/killed), then "a prefix plus a valid ID AND a rest starting
+# with the target's label" (confirmed live AGAIN: for a target labeled
+# e.g. "host", "pair-1-host-unregistered" still matched -- common
+# target labels make that prefix trivial to collide with by accident).
+# Full registry-backing is the only check narrow enough to avoid yet
+# another naming collision, and it costs no real functionality:
+# register_session() always runs BEFORE remote_setup/
+# remote_setup_tmux_mode actually create the live session (see the
+# ID-lock comment in the dispatch code below), so any session THIS
+# tool creates is already registered by the time it exists to be
+# listed/killed at all.
 #
 # A registry entry whose own first segment LOOKS like an ID attempt but
 # fails canonicalization (e.g. "0-host-foo") is poisoned -- skipped
 # outright, rather than being used to authorize anything (confirmed
 # live: without this, a poisoned entry and a live session sharing that
 # exact broken shape could authorize each other).
-#
-# CALLER WARNING: internally calls parse_numbered_session on every
-# registry line it checks, which -- like every call site of that
-# function -- sets the GLOBAL PARSED_ID/PARSED_REST as a side effect.
-# A caller that reads those globals again AFTER calling this function
-# (rather than capturing them into its own locals first) gets whatever
-# this function's own internal scan last left them as, not whatever
-# they held before the call. Harmless for a caller that only re-reads
-# them on the "found a match" branch (they'll coincidentally still
-# hold that exact matching line's own id/rest), but wrong on the
-# "no match" branch, where they're left holding the LAST scanned
-# registry line's id/rest instead (confirmed live: adopt_sessions,
-# which needs the no-match branch, adopted every session under its
-# registry's own last entry's name instead of its actual one, until
-# fixed to capture PARSED_ID/PARSED_REST into its own locals first).
 session_is_owned() {
-  local id="$1" rest="$2"
+  local raw="$1"
   touch "$REGISTRY"
   local line
   while IFS= read -r line; do
@@ -1191,8 +1193,7 @@ session_is_owned() {
     if [[ "$ENTRY_NAME" =~ ^([0-9]+)-(.*)$ ]] && ! canonicalize_session_id "${BASH_REMATCH[1]}" >/dev/null; then
       continue
     fi
-    parse_numbered_session "" "$ENTRY_NAME"
-    [[ "$PARSED_ID" == "$id" && "$PARSED_REST" == "$rest" ]] && return 0
+    [[ "$ENTRY_NAME" == "$raw" ]] && return 0
   done < "$REGISTRY"
   return 1
 }
@@ -1629,8 +1630,9 @@ rename_session() {
   #
   # Checked unconditionally across all three prefixes, NOT gated by
   # $has_claude/$has_codex/$has_pair (the SOURCE session's own mode) --
-  # session_is_owned only ever matches on id+rest, never on which
-  # prefix a live session actually uses, so an unrelated live session
+  # session_is_owned only ever matches on raw post-prefix text, never
+  # on which prefix a live session actually uses, so an unrelated live
+  # session
   # under a DIFFERENT prefix than the source's own mode would otherwise
   # get silently adopted as owned the moment the registry is rewritten
   # to the same id+rest. Confirmed live: renaming a tmux-mode (pair-only)
@@ -1748,7 +1750,7 @@ list_all_sessions() {
     kind="iterm"
     [[ "$prefix" == "pair-" ]] && kind="tmux"
     parse_numbered_session "$prefix" "$line"
-    session_is_owned "$PARSED_ID" "$PARSED_REST" || continue
+    session_is_owned "${line#"$prefix"}" || continue
     key="${kind}:${PARSED_ID}:${PARSED_REST}"
     case "$seen_keys" in
       *$'\n'"$key"$'\n'*) continue ;;
@@ -1881,7 +1883,7 @@ kill_sessions() {
       prefix="$(session_prefix_for "$cname")" || continue
       parse_numbered_session "$prefix" "$cname"
       [[ "$PARSED_ID" == "$id" ]] || continue
-      session_is_owned "$PARSED_ID" "$PARSED_REST" || continue
+      session_is_owned "${cname#"$prefix"}" || continue
       matches+="${cname}"$'\n'
     done <<<"$live"
     if [[ -z "$matches" ]]; then
@@ -1960,7 +1962,7 @@ kill_all_sessions() {
     [[ -z "$name" ]] && continue
     prefix="$(session_prefix_for "$name")" || continue
     parse_numbered_session "$prefix" "$name"
-    session_is_owned "$PARSED_ID" "$PARSED_REST" || continue
+    session_is_owned "${name#"$prefix"}" || continue
     matches+=("$name")
   done <<<"$live"
 
@@ -2419,30 +2421,44 @@ adopt_sessions() {
     kind="iterm"
     [[ "$prefix" == "pair-" ]] && kind="tmux"
     parse_numbered_session "$prefix" "$line"
-    # Captured into dedicated locals BEFORE calling session_is_owned,
-    # not read back from $PARSED_ID/$PARSED_REST afterward -- those are
-    # GLOBALS that session_is_owned's own internal scan (it calls
-    # parse_numbered_session itself, on every registry line it checks)
-    # overwrites as a side effect. list_all_sessions' `|| continue`
-    # never notices, because it only ever reads them again on the
-    # branch where session_is_owned found an actual match (which, by
-    # definition, leaves them holding that exact matching line's own
-    # id/rest -- coincidentally correct). This function's `&& continue`
-    # takes the OPPOSITE branch: reading them again after a "not
-    # owned" result meant reading whatever the LAST scanned registry
-    # line happened to parse to, not this live session's real id/rest
-    # -- confirmed live, every unregistered session got adopted under
-    # the wrong name (the registry's own last entry) instead of its
-    # actual one.
     live_id="$PARSED_ID"
     live_rest="$PARSED_REST"
     raw_rest="${line#"$prefix"}"
-    session_is_owned "$live_id" "$live_rest" && continue
+    # Checked by RAW text, same as every other session_is_owned call
+    # site -- see that function's own comment for why (canonical id/rest
+    # matching alone let an unrelated, never-registered live session
+    # with different raw text but the same canonical value get treated
+    # as owned). This is ALSO exactly the case adopt_sessions cares
+    # about most: a live session with different raw text than any
+    # existing registry entry is, by definition, not yet adopted, and
+    # should proceed to the checks below rather than being skipped as
+    # "already owned."
+    session_is_owned "$raw_rest" && continue
     key="${kind}:${live_id}:${live_rest}"
     case "$seen_keys" in
       *$'\n'"$key"$'\n'*) continue ;;
     esac
     seen_keys+="$key"$'\n'
+    # An iterm-mode candidate is only a genuine, complete split pair if
+    # its OTHER half is ALSO live under the exact same raw text -- a
+    # real codersync-created iterm session always creates claude-X and
+    # codex-X together (remote_setup's own all-or-nothing rollback
+    # never leaves just one behind on a FRESH create), so a lone
+    # claude-X or codex-X with no counterpart at all is either the
+    # surviving half of a pair whose other side was killed separately,
+    # or an unrelated live session that merely happens to start with
+    # "claude-"/"codex-". Registering it anyway made --adopt report
+    # success for something --attach immediately refused as "only one
+    # side alive" (confirmed live), and made it trivial to accidentally
+    # pull an unrelated claude-*/codex-* session into the registry.
+    if [[ "$kind" == "iterm" ]]; then
+      local other_prefix="codex-"
+      [[ "$prefix" == "codex-" ]] && other_prefix="claude-"
+      if ! grep -qxF "${other_prefix}${raw_rest}" <<<"$live"; then
+        echo "codersync: skipping '${prefix}${raw_rest}' -- no matching '${other_prefix}${raw_rest}' counterpart is alive on ${SSH_TARGET}, so this isn't a complete iterm-split pair." >&2
+        continue
+      fi
+    fi
     # entry_name is the RAW post-prefix text, not reconstructed from
     # the CANONICALIZED live_id -- a live "pair-08-host-foo" canonicalizes
     # to id=8 (leading zero stripped), but the actual live tmux session
@@ -2481,10 +2497,11 @@ adopt_sessions() {
       echo "codersync: skipping unsafe live session name (contains characters outside a-z/0-9/_/- ): ${prefix}${entry_name}" >&2
       continue
     fi
-    # Ownership (session_is_owned) matches on id+rest alone, with no
-    # notion of WHICH prefix (pair- vs claude-/codex-) a live session
-    # actually uses -- the same gap --rename's own preflight check
-    # already guards against for renaming. Adopting one of two
+    # Ownership (session_is_owned) matches on raw post-prefix text
+    # alone, with no notion of WHICH prefix (pair- vs claude-/codex-) a
+    # live session actually uses -- the same gap --rename's own
+    # preflight check already guards against for renaming. Adopting
+    # one of two
     # DIFFERENT live sessions (a tmux-mode "pair-X" and an unrelated
     # iterm-mode "claude-X"/"codex-X" pair sharing the same id/rest,
     # once canonicalized) would register a SINGLE entry that then

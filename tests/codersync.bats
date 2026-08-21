@@ -1411,6 +1411,22 @@ setup() {
   [[ "$output" == *"some-other-name"* ]]
 }
 
+@test "list_all_sessions: does not show a live session whose raw text differs from a canonically-matching entry" {
+  # End-to-end regression test for the reviewer-reported repro: a
+  # registry entry "08-devbox-example-com-foo" (canonical id=8) used to
+  # authorize an unrelated live "pair-8-devbox-example-com-foo" (also
+  # canonical id=8, but never actually registered under that raw
+  # text), showing it in --list-all as if it were the managed session.
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t08-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by list_all_sessions below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf 'pair-8-devbox-example-com-foo\n'; }
+  run list_all_sessions
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"devbox-example-com-foo"* ]]
+}
+
 # --- local_setup ----------------------------------------------------------
 #
 # Only the argument-validation paths, which all return before ever
@@ -1584,6 +1600,47 @@ setup() {
   # Exactly one registry line, not two -- confirms the claude-/codex-
   # pair collapsed into a single logical adoption.
   [ "$(wc -l < "$REGISTRY")" -eq 1 ]
+}
+
+@test "adopt_sessions: refuses a lone claude- half with no matching codex- counterpart" {
+  # Regression test: a real codersync-created iterm session always
+  # creates claude-X and codex-X together (remote_setup's own
+  # all-or-nothing rollback never leaves just one behind on a fresh
+  # create), so a lone "claude-my-orphan" with no "codex-my-orphan" at
+  # all is either the surviving half of a pair whose other side was
+  # killed separately, or an unrelated live session that merely
+  # happens to start with "claude-". Registering it anyway made
+  # --adopt report success for something --attach immediately refused
+  # as "only one side alive" (confirmed live), and made it trivial to
+  # accidentally pull an unrelated claude-*/codex-* session into the
+  # registry.
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf 'claude-my-orphan\n'; }
+  run adopt_sessions
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"skipping 'claude-my-orphan'"* ]]
+  [[ "$output" != *"Adopted"* ]]
+  [ ! -s "$REGISTRY" ]
+}
+
+@test "adopt_sessions: refuses a lone codex- half with no matching claude- counterpart" {
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf 'codex-my-orphan\n'; }
+  run adopt_sessions
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"skipping 'codex-my-orphan'"* ]]
+  [[ "$output" != *"Adopted"* ]]
+  [ ! -s "$REGISTRY" ]
 }
 
 @test "adopt_sessions: preserves a numeric ID on an unregistered session that already has one" {
@@ -1814,7 +1871,7 @@ setup() {
   SSH_TARGET="devbox.example.com"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\tdevbox-review-sam-1746\n' > "$REGISTRY"
-  session_is_owned "" "devbox-review-sam-1746"
+  session_is_owned "devbox-review-sam-1746"
 }
 
 @test "session_is_owned: false for a no-ID rest with no matching entry" {
@@ -1826,14 +1883,14 @@ setup() {
   SSH_TARGET="devbox.example.com"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\tdevbox-review-sam-1746\n' > "$REGISTRY"
-  run ! session_is_owned "" "programming"
+  run ! session_is_owned "programming"
 }
 
 @test "session_is_owned: false for an entry belonging to a different target" {
   SSH_TARGET="devbox.example.com"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'some-other-box\tprogramming\n' > "$REGISTRY"
-  run ! session_is_owned "" "programming"
+  run ! session_is_owned "programming"
 }
 
 @test "session_is_owned: skips a poisoned entry instead of authorizing a matching broken session" {
@@ -1846,7 +1903,7 @@ setup() {
   SSH_TARGET="devbox.example.com"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\t0-host-foo\n' > "$REGISTRY"
-  run ! session_is_owned "" "0-host-foo"
+  run ! session_is_owned "0-host-foo"
 }
 
 @test "session_is_owned: an IDed session needs a matching registry entry, not just a plausible-looking rest" {
@@ -1861,14 +1918,14 @@ setup() {
   SSH_TARGET="devbox.example.com"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\t1-host-registered\n' > "$REGISTRY"
-  run ! session_is_owned "1" "host-unregistered"
+  run ! session_is_owned "1-host-unregistered"
 }
 
 @test "session_is_owned: true for an IDed session with a matching registry entry" {
   SSH_TARGET="devbox.example.com"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
-  session_is_owned "1" "devbox-example-com-foo"
+  session_is_owned "1-devbox-example-com-foo"
 }
 
 @test "session_is_owned: an ID must match the entry's own ID too, not just the rest" {
@@ -1878,7 +1935,26 @@ setup() {
   SSH_TARGET="devbox.example.com"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\t2-devbox-example-com-foo\n' > "$REGISTRY"
-  run ! session_is_owned "1" "devbox-example-com-foo"
+  run ! session_is_owned "1-devbox-example-com-foo"
+}
+
+@test "session_is_owned: false for a different raw spelling that canonicalizes to the same id/rest" {
+  # Regression test: this used to compare CANONICAL id+rest, so a
+  # registry entry "08-devbox-example-com-foo" (canonical id=8) wrongly
+  # authorized an unrelated live "pair-8-devbox-example-com-foo" (also
+  # canonical id=8, but different raw text, and never actually
+  # registered). Confirmed live: --list-all showed the unregistered
+  # live session as managed, --attach on it then failed
+  # ("registered but not alive", since --attach's OWN lookup already
+  # compared raw text correctly and found no match), and --kill on the
+  # shared canonical ID killed the live session and deleted the
+  # unrelated registry entry it happened to collide with. Ownership
+  # must mean "this exact raw text is registered", not "some entry
+  # canonicalizes to the same number."
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t08-devbox-example-com-foo\n' > "$REGISTRY"
+  run ! session_is_owned "8-devbox-example-com-foo"
 }
 
 @test "kill_all_sessions: does not sweep in an unrelated session with a matching prefix" {
@@ -2027,6 +2103,31 @@ setup() {
   }
   run kill_sessions "8"
   [[ "$output" == *"Killing: pair-08-devbox-example-com-foo"* ]]
+}
+
+@test "kill_sessions: does not kill a live session whose raw text differs from a canonically-matching entry" {
+  # End-to-end regression test for the reviewer-reported repro: unlike
+  # the test above (registry AND live raw text both "08-...", a
+  # legitimate match), a registry entry "08-devbox-example-com-foo"
+  # must NOT authorize killing an unrelated live
+  # "pair-8-devbox-example-com-foo" that merely canonicalizes to the
+  # same ID -- confirmed live, --kill 8 used to kill that unrelated
+  # live session and then delete the "08-..." registry entry it
+  # happened to collide with, even though that session was never
+  # actually registered.
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t08-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by kill_sessions.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'pair-8-devbox-example-com-foo\n'
+    fi
+  }
+  run kill_sessions "8"
+  [[ "$output" == *"no session found for ID 8"* ]]
+  [[ "$output" != *"Killing:"* ]]
+  [[ "$(cat "$REGISTRY")" == "devbox.example.com"$'\t'"08-devbox-example-com-foo" ]]
 }
 
 # --- dispatch: rejects unexpected trailing arguments -------------------
