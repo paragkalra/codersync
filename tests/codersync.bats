@@ -1686,6 +1686,67 @@ setup() {
   [ ! -s "$REGISTRY" ]
 }
 
+@test "adopt_sessions: refuses an iterm pair whose two sides disagree on raw ID formatting" {
+  # Regression test: the dedup key (kind:live_id:live_rest) is
+  # canonical, but the OLD code registered whichever raw text the
+  # FIRST-encountered line happened to have, silently dropping the
+  # other side's raw text via that same dedup -- so
+  # "claude-08-devbox-example-com-foo" alongside
+  # "codex-8-devbox-example-com-foo" (same canonical id=8, but
+  # disagreeing raw text) registered only "08-devbox-example-com-foo".
+  # --attach 8 afterward found the registered entry's claude- side
+  # (grep for "claude-08-...") but not its codex- side (grep for
+  # "codex-08-...", which never matches the actual live
+  # "codex-8-..."), reporting a genuinely fully-live pair as half dead
+  # (confirmed live). The NORMAL claude-X/codex-X pair has IDENTICAL
+  # raw text on both sides, so this must NOT fire for that case (see
+  # the "registers ... as ONE entry" test above).
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'claude-08-devbox-example-com-foo\ncodex-8-devbox-example-com-foo\n'
+    fi
+  }
+  run adopt_sessions
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"Adopted"* ]]
+  [ ! -s "$REGISTRY" ]
+}
+
+@test "adopt_sessions: refuses two separate tmux-mode sessions that canonicalize to the same id/rest" {
+  # Regression test: unlike an iterm pair (two lines are EXPECTED for
+  # one logical session), tmux mode has exactly one live "pair-"
+  # session per logical session -- so "pair-08-devbox-example-com-foo"
+  # and "pair-8-devbox-example-com-foo" existing together are two
+  # GENUINELY SEPARATE, unrelated live sessions that merely collide
+  # once canonicalized. The old dedup key (canonical id+rest) treated
+  # the second as "already seen" and silently dropped it entirely --
+  # worse, once the first was registered, session_is_owned's own
+  # canonical matching meant --kill on that shared ID would kill BOTH
+  # live sessions even though only one was ever actually adopted
+  # (confirmed live).
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'pair-08-devbox-example-com-foo\npair-8-devbox-example-com-foo\n'
+    fi
+  }
+  run adopt_sessions
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"Adopted"* ]]
+  [ ! -s "$REGISTRY" ]
+}
+
 @test "adopt_sessions: advances next_id past an adopted numeric ID" {
   # Regression test: adopt_sessions preserved a live session's own
   # numeric ID into the registry without ever advancing this client's

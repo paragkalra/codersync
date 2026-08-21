@@ -2379,24 +2379,35 @@ adopt_sessions() {
   local live
   live="$(ssh "$SSH_TARGET" -- "tmux list-sessions -F '#{session_name}'" 2>/dev/null || true)"
 
-  # Pre-pass: builds a flat "id:rest:kind" record for EVERY live session
-  # (not just unregistered ones, and not deduped), so the main loop
-  # below can cheaply check whether a candidate's (id,rest) also shows
-  # up under the OPPOSITE kind -- using the CANONICAL id/rest, so a
-  # leading-zero "pair-08-host-foo" and an already-canonical
-  # "claude-8-host-foo" are correctly recognized as colliding even
-  # though their raw text differs (same underlying id, once
-  # canonicalized). Cheap: the number of live sessions on a box is
-  # always small.
+  # Pre-pass: builds a flat "id:rest:kind:raw_rest" record for EVERY
+  # live session (not just unregistered ones, and not deduped), so the
+  # main loop below can cheaply check two things using CANONICAL
+  # id/rest (so a leading-zero "pair-08-host-foo" and an
+  # already-canonical "claude-8-host-foo" are correctly recognized as
+  # related even though their raw text differs):
+  #   1. whether a candidate's (id,rest) also shows up under the
+  #      OPPOSITE kind (an unrelated tmux-mode/iterm-mode session
+  #      sharing the same canonical identity)
+  #   2. whether MULTIPLE DISTINCT raw names map to the exact same
+  #      (id,rest,kind) -- e.g. "claude-08-host-foo" alongside
+  #      "codex-8-host-foo" (same canonical id, but disagreeing raw
+  #      text -- the normal claude-X/codex-X pair has IDENTICAL raw
+  #      text on both sides, so this only fires when something's
+  #      actually wrong), or two separate live "pair-" sessions
+  #      ("pair-08-host-foo" and "pair-8-host-foo") that happen to
+  #      canonicalize to the same id/rest despite being two genuinely
+  #      different sessions.
+  # Cheap: the number of live sessions on a box is always small.
   local all_keys=$'\n'
-  local pre_line pre_prefix pre_kind
+  local pre_line pre_prefix pre_kind pre_raw
   while IFS= read -r pre_line; do
     [[ -z "$pre_line" ]] && continue
     pre_prefix="$(session_prefix_for "$pre_line")" || continue
     pre_kind="iterm"
     [[ "$pre_prefix" == "pair-" ]] && pre_kind="tmux"
     parse_numbered_session "$pre_prefix" "$pre_line"
-    all_keys+="${PARSED_ID}:${PARSED_REST}:${pre_kind}"$'\n'
+    pre_raw="${pre_line#"$pre_prefix"}"
+    all_keys+="${PARSED_ID}:${PARSED_REST}:${pre_kind}:${pre_raw}"$'\n'
   done <<<"$live"
 
   local seen_keys=$'\n'
@@ -2482,8 +2493,41 @@ adopt_sessions() {
     # outright here rather than guessing which one the user meant.
     other_kind="tmux"
     [[ "$kind" == "tmux" ]] && other_kind="iterm"
-    if [[ "$all_keys" == *$'\n'"${live_id}:${live_rest}:${other_kind}"$'\n'* ]]; then
+    if [[ "$all_keys" == *$'\n'"${live_id}:${live_rest}:${other_kind}:"* ]]; then
       echo "codersync: skipping '${prefix}${raw_rest}' -- an unrelated ${other_kind} session shares the same id/rest on ${SSH_TARGET}, and adopting either would make --list-all/--attach/--kill treat them as the same session. Rename one of them first (plain tmux rename-session), then re-run --adopt." >&2
+      continue
+    fi
+    # Same underlying ambiguity as the cross-kind check above, but
+    # within the SAME kind: multiple DISTINCT raw names can still
+    # canonicalize to this exact (id,rest,kind) -- either two separate
+    # live "pair-" sessions that happen to collide once canonicalized
+    # (tmux kind), or a claude-X/codex-X pair whose two sides disagree
+    # on raw formatting entirely (iterm kind; the NORMAL pair has
+    # IDENTICAL raw text on both sides, so this never fires for a
+    # correctly-matching pair). Registering just one of them anyway
+    # left the other permanently unaddressed by that raw text while
+    # STILL satisfying ownership for it (canonical id/rest matching
+    # doesn't care about raw text either) -- --attach reported a
+    # correctly-live pair as "half dead", and --kill on the shared ID
+    # killed a live tmux-mode session that was never actually adopted
+    # (confirmed live).
+    local prefix_key="${live_id}:${live_rest}:${kind}:"
+    local -a distinct_raws=()
+    local ak araw already existing
+    while IFS= read -r ak; do
+      case "$ak" in
+        "$prefix_key"*)
+          araw="${ak#"$prefix_key"}"
+          already=0
+          for existing in "${distinct_raws[@]}"; do
+            [[ "$existing" == "$araw" ]] && { already=1; break; }
+          done
+          [[ "$already" == 0 ]] && distinct_raws+=("$araw")
+          ;;
+      esac
+    done <<<"$all_keys"
+    if [[ ${#distinct_raws[@]} -gt 1 ]]; then
+      echo "codersync: skipping '${prefix}${raw_rest}' -- multiple live sessions with different raw names canonicalize to the same id/rest on ${SSH_TARGET}: ${distinct_raws[*]}. Rename one of them first (plain tmux rename-session) so they agree, then re-run --adopt." >&2
       continue
     fi
     to_adopt+=("$entry_name")
