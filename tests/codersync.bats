@@ -1111,6 +1111,43 @@ setup() {
   [[ "$output" == *"open_tab_tmux_mode:08-devbox-example-com-foo"* ]]
 }
 
+@test "attach_session: falls back to a label-less exact name match (a codersync --local session)" {
+  # Regression coverage for resolve_registered_session's fallback: a
+  # session created via `codersync --local` has no target-label prefix
+  # baked into its rest at all (unlike a normally client-created one),
+  # so the primary "${TARGET_LABEL}-${arg}" match can never find it --
+  # this confirms the unprefixed fallback does.
+  SSH_TARGET="devbox.example.com"
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\tmy-local-feature\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf 'pair-my-local-feature\n'; }
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  remote_setup_tmux_mode() { echo "remote_setup_tmux_mode:$1"; }
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  open_tab_tmux_mode() { echo "open_tab_tmux_mode:$1"; }
+  run attach_session "my-local-feature"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"remote_setup_tmux_mode:my-local-feature"* ]]
+}
+
+@test "attach_session: a labeled match still wins over a same-named label-less fallback" {
+  SSH_TARGET="devbox.example.com"
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\tdevbox-example-com-foo\ndevbox.example.com\tfoo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf 'pair-devbox-example-com-foo\npair-foo\n'; }
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  remote_setup_tmux_mode() { echo "remote_setup_tmux_mode:$1"; }
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  open_tab_tmux_mode() { echo "open_tab_tmux_mode:$1"; }
+  run attach_session "foo"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"remote_setup_tmux_mode:devbox-example-com-foo"* ]]
+}
+
 # --- rename_session -------------------------------------------------------
 
 @test "rename_session: rejects an invalid new name without touching the network" {
@@ -1372,6 +1409,146 @@ setup() {
   run list_all_sessions
   [ "$status" -eq 0 ]
   [[ "$output" == *"some-other-name"* ]]
+}
+
+# --- local_setup ----------------------------------------------------------
+#
+# Only the argument-validation paths, which all return before ever
+# calling a real `tmux` -- the actual session-creation/attach success
+# path needs a real tmux binary and is live-verified by hand instead
+# (see README.md's "Testing" section).
+
+@test "local_setup: rejects an invalid session name" {
+  run local_setup "bad;name"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Invalid session name"* ]]
+}
+
+@test "local_setup: --tools requires a value" {
+  run local_setup "myfeature" --tools
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"--tools/-t requires a value"* ]]
+}
+
+@test "local_setup: --tools followed immediately by another flag errors instead of swallowing it" {
+  run local_setup "myfeature" --tools --safe-mode
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"--tools/-t requires a value"* ]]
+}
+
+@test "local_setup: rejects a malformed --tools value" {
+  run local_setup "myfeature" --tools "claude,codex,aider"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"is malformed"* ]]
+}
+
+@test "local_setup: rejects an unknown flag" {
+  run local_setup "myfeature" --split-mode iterm
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Unknown argument"* ]]
+}
+
+# --- adopt_sessions ---------------------------------------------------------
+
+@test "adopt_sessions: registers an unregistered tmux-mode (pair-only) session" {
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf 'pair-my-local-feature\n'; }
+  run adopt_sessions
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Adopted: my-local-feature"* ]]
+  [[ "$(cat "$REGISTRY")" == "devbox.example.com"$'\t'"my-local-feature" ]]
+}
+
+@test "adopt_sessions: registers under the LIVE session's own name, not a pre-existing registry entry's" {
+  # Regression test: session_is_owned() calls parse_numbered_session()
+  # internally while scanning the registry -- like every call site of
+  # that function, it sets the GLOBAL PARSED_ID/PARSED_REST as a side
+  # effect. Reading those globals again right after a "not owned"
+  # result (this function's own `&& continue` takes that branch) used
+  # to pick up whatever the registry's LAST-scanned line happened to
+  # parse to, not the live session actually being considered here --
+  # confirmed live: an unrelated already-registered entry existing
+  # anywhere in the registry caused every genuinely-unregistered
+  # session to be "adopted" under THAT unrelated entry's name instead
+  # of its own, repeatedly, no-oping harmlessly via register_session's
+  # own dedup check rather than ever registering the right thing.
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t51-coder-pkbox-unrelated-existing-entry\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'pair-51-coder-pkbox-unrelated-existing-entry\npair-my-local-feature\n'
+    fi
+  }
+  run adopt_sessions
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Adopted: my-local-feature"* ]]
+  [[ "$output" != *"unrelated-existing-entry"* ]]
+  [[ "$(cat "$REGISTRY")" == *$'devbox.example.com\tmy-local-feature'* ]]
+  # Exactly two lines total: the pre-existing entry, untouched, plus
+  # the one genuinely new adoption -- not a duplicate of the first.
+  [ "$(wc -l < "$REGISTRY")" -eq 2 ]
+}
+
+@test "adopt_sessions: registers an unregistered iterm-mode (claude-/codex-) pair as ONE entry" {
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'claude-my-local-feature\ncodex-my-local-feature\n'
+    fi
+  }
+  run adopt_sessions
+  [ "$status" -eq 0 ]
+  [[ "$(cat "$REGISTRY")" == "devbox.example.com"$'\t'"my-local-feature" ]]
+  # Exactly one registry line, not two -- confirms the claude-/codex-
+  # pair collapsed into a single logical adoption.
+  [ "$(wc -l < "$REGISTRY")" -eq 1 ]
+}
+
+@test "adopt_sessions: preserves a numeric ID on an unregistered session that already has one" {
+  # Covers the case where a client machine's own creation raced ahead
+  # of --adopt somehow, or a registry was hand-edited/cleared -- the
+  # live session's own ID (baked into its literal tmux name) is kept
+  # as-is, not stripped or renumbered.
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf 'pair-5-devbox-example-com-foo\n'; }
+  run adopt_sessions
+  [ "$status" -eq 0 ]
+  [[ "$(cat "$REGISTRY")" == "devbox.example.com"$'\t'"5-devbox-example-com-foo" ]]
+}
+
+@test "adopt_sessions: skips a session that's already registered" {
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\tmy-local-feature\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf 'pair-my-local-feature\n'; }
+  run adopt_sessions
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Nothing new to adopt"* ]]
+  [[ "$output" != *"Adopted"* ]]
+  [ "$(wc -l < "$REGISTRY")" -eq 1 ]
+}
+
+@test "adopt_sessions: reports nothing to adopt when there's no live session at all" {
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf ''; }
+  run adopt_sessions
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Nothing new to adopt"* ]]
 }
 
 # --- session_is_owned / unrelated-session sweep defense ----------------
@@ -1780,4 +1957,31 @@ setup() {
   [ "$status" -eq 1 ]
   [[ "$output" == *"got extra"* ]]
   [[ "$output" == *"-R"* ]]
+}
+
+@test "dispatch: --local requires a session name" {
+  # Checked directly in the dispatch case, before local_setup (and so
+  # before any tmux call) is ever reached.
+  run "${BATS_TEST_DIRNAME}/../codersync" --local
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Usage: codersync --local|-L"* ]]
+}
+
+@test "dispatch: -L is accepted as a shorthand for --local" {
+  run "${BATS_TEST_DIRNAME}/../codersync" -L
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Usage: codersync --local|-L"* ]]
+}
+
+@test "dispatch: --adopt rejects extra trailing arguments" {
+  run "${BATS_TEST_DIRNAME}/../codersync" --adopt extra
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
+}
+
+@test "dispatch: -d is accepted as a shorthand for --adopt" {
+  run "${BATS_TEST_DIRNAME}/../codersync" -d extra
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
+  [[ "$output" == *"-d"* ]]
 }

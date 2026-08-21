@@ -9,6 +9,8 @@
 #        codersync --kill-all|-K
 #        codersync --paste-image|-p
 #        codersync --sync-skills|-y
+#        codersync --local|-L <session-name> [--tools|-t t1,t2] [--safe-mode|-s]
+#        codersync --adopt|-d
 #
 # Every flag above has a single-letter short form -- --setup/-s and
 # --safe-mode/-s share the letter "s" deliberately: they're parsed in
@@ -1134,6 +1136,21 @@ session_prefix_for() {
 # outright, rather than being used to authorize anything (confirmed
 # live: without this, a poisoned entry and a live session sharing that
 # exact broken shape could authorize each other).
+#
+# CALLER WARNING: internally calls parse_numbered_session on every
+# registry line it checks, which -- like every call site of that
+# function -- sets the GLOBAL PARSED_ID/PARSED_REST as a side effect.
+# A caller that reads those globals again AFTER calling this function
+# (rather than capturing them into its own locals first) gets whatever
+# this function's own internal scan last left them as, not whatever
+# they held before the call. Harmless for a caller that only re-reads
+# them on the "found a match" branch (they'll coincidentally still
+# hold that exact matching line's own id/rest), but wrong on the
+# "no match" branch, where they're left holding the LAST scanned
+# registry line's id/rest instead (confirmed live: adopt_sessions,
+# which needs the no-match branch, adopted every session under its
+# registry's own last entry's name instead of its actual one, until
+# fixed to capture PARSED_ID/PARSED_REST into its own locals first).
 session_is_owned() {
   local id="$1" rest="$2"
   touch "$REGISTRY"
@@ -1395,6 +1412,31 @@ resolve_registered_session() {
         break
       fi
     done < "$REGISTRY"
+    # Falls back to an EXACT, unprefixed match on $arg itself if no
+    # labeled one was found -- `codersync --local` (see its own
+    # comment) deliberately creates sessions with no target-label
+    # prefix at all, since the box has no way to know what alias a
+    # client will someday refer to it by. Checked only as a fallback,
+    # after the labeled check above has already had first refusal, so
+    # a normal client-created session with the same $arg text still
+    # wins if both happen to exist.
+    if [[ "$found" == 0 ]]; then
+      while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        parse_registry_line "$line"
+        [[ "$ENTRY_TARGET" != "$SSH_TARGET" ]] && continue
+        parse_numbered_session "" "$ENTRY_NAME"
+        if [[ "$PARSED_REST" == "$arg" ]]; then
+          if ! validate_session_name "$ENTRY_NAME"; then
+            echo "codersync: registry entry for '${arg}' contains unsafe characters ('${ENTRY_NAME}') -- refusing to use it. Run codersync --restore-all to prune unsafe entries." >&2
+            return 1
+          fi
+          found=1
+          entry_name="$ENTRY_NAME"
+          break
+        fi
+      done < "$REGISTRY"
+    fi
     if [[ "$found" == 0 ]]; then
       echo "codersync: no session named '${arg}' on ${SSH_TARGET}. Run codersync --list-all to see what's available." >&2
       return 1
@@ -2135,6 +2177,186 @@ sync_skills() {
   fi
 }
 
+# `codersync --local|-L <session-name> [--tools|-t t1,t2] [--safe-mode|-s]`
+# -- creates (or reattaches to) a two-pane tmux session directly on
+# THIS machine, no ssh involved at all. Meant to be run by hand after
+# you've already SSH'd into the remote box yourself (codersync
+# installed on both ends), so you can start working immediately
+# without waiting for a client machine to drive the setup. Detach
+# whenever (Ctrl-b d, ordinary tmux) -- `codersync --adopt`, run later
+# from a client machine pointed at this box, picks it up so
+# --list-all/--attach/--rename/--kill all work on it normally from
+# there too.
+#
+# Deliberately named WITHOUT a target-label or numeric-ID prefix (just
+# "pair-<name>", the same shape a pre-numbering legacy session has).
+# ID allocation is otherwise a per-client-machine sequence
+# (~/.config/codersync/next_id), and this box has no way to know what
+# alias a client will someday refer to it by, so there's no safe label
+# to bake in up front either. resolve_registered_session's name lookup
+# already falls back to matching a rest with no label prefix at all
+# specifically so a session created this way is still reachable by
+# plain name once adopted.
+#
+# Always the tmux-split shape (one session, two panes) -- iterm split
+# mode is inherently Mac+iTerm2-driven and meaningless to invoke
+# directly on the remote box itself, so there's no --split-mode here.
+local_setup() {
+  local name="$1"
+  shift
+  if ! validate_session_name "$name"; then
+    echo "Invalid session name '${name}': only letters, digits, '-', and '_' are allowed, and it can't start with '-'." >&2
+    exit 1
+  fi
+
+  local tools="claude,codex" safe=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tools|-t)
+        if [[ $# -lt 2 || "$2" == -* ]]; then
+          echo "--tools/-t requires a value (e.g. claude,codex)" >&2
+          exit 1
+        fi
+        tools="$2"
+        shift 2
+        ;;
+      --safe-mode|-s)
+        safe=1
+        shift
+        ;;
+      *)
+        echo "Unknown argument: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+  split_tools "$tools"
+  if ! tools_split_is_valid "$tools"; then
+    echo "codersync: --tools '${tools}' is malformed -- expected two comma-separated values (e.g. claude,codex) or a single value to use for both: no empty slot on either side of the comma, and no more than one comma total." >&2
+    exit 1
+  fi
+  local tool1="$TOOL1" tool2="$TOOL2"
+
+  local pair_tmux="pair-${name}"
+
+  # Idempotent, same as the normal client-driven creation path: re-running
+  # with the same name reattaches to what's already there instead of
+  # erroring or creating a duplicate.
+  if tmux has-session -t "$pair_tmux" 2>/dev/null; then
+    echo "Reattaching to existing local session '${name}'..."
+    exec tmux attach -t "$pair_tmux"
+  fi
+
+  local cmd1 cmd2 bin1 bin2
+  cmd1="$(resolve_tool "$tool1" "$name" "$safe")"
+  cmd2="$(resolve_tool "$tool2" "$name" "$safe")"
+  bin1="$(command_word_for "$cmd1")"
+  bin2="$(command_word_for "$cmd2")"
+
+  local missing=""
+  command -v "$bin1" >/dev/null 2>&1 || missing="${missing} ${bin1}"
+  command -v "$bin2" >/dev/null 2>&1 || missing="${missing} ${bin2}"
+  if [[ -n "$missing" ]]; then
+    echo "codersync: not found on $(hostname):${missing}" >&2
+    exit 1
+  fi
+
+  local script1 script2
+  script1="/tmp/codersync-${pair_tmux}-0-$(random_suffix).sh"
+  script2="/tmp/codersync-${pair_tmux}-1-$(random_suffix).sh"
+  # `set -C`/`umask 077` scoped to a subshell each, same protections the
+  # remote heredoc path uses (random filenames + noclobber stop another
+  # local user from planting/clobbering the file; umask keeps a
+  # --tools value containing its own secret from being world-readable),
+  # just without leaking either setting into the rest of this function.
+  # shellcheck disable=SC2016 # intentional: '$0' is meant to stay
+  # literal here -- it's evaluated later, by the script itself when
+  # `bash $script1`/`bash $script2` actually run it, not now.
+  if ! (umask 077; set -C; { echo 'rm -f -- "$0"'; printf '%s\n' "$cmd1"; } > "$script1") ||
+     ! (umask 077; set -C; { echo 'rm -f -- "$0"'; printf '%s\n' "$cmd2"; } > "$script2"); then
+    echo "codersync: failed to write local launch scripts for '${name}'." >&2
+    rm -f -- "$script1" "$script2"
+    exit 1
+  fi
+
+  local dir="$PWD"
+  trap 'tmux kill-session -t "$pair_tmux" 2>/dev/null; rm -f -- "$script1" "$script2"' EXIT
+  tmux new-session -d -s "$pair_tmux" -c "$dir"
+  tmux split-window -h -t "$pair_tmux" -c "$dir"
+  tmux send-keys -t "${pair_tmux}.0" "bash $script1" Enter
+  tmux send-keys -t "${pair_tmux}.1" "bash $script2" Enter
+  tmux set-option -t "$pair_tmux" status off
+  trap - EXIT
+
+  exec tmux attach -t "$pair_tmux"
+}
+
+# `codersync --adopt|-d` -- scans the currently configured target's
+# live tmux sessions for anything matching codersync's own naming
+# pattern (claude-/codex-/pair-, with or without a numeric ID) that
+# ISN'T already in the local registry, and registers it. This is what
+# makes `codersync --local` (see its own comment) useful from a client
+# machine afterward: without this, a session created directly on the
+# box is invisible to --list-all/--attach/--rename/--kill here, the
+# same as any other unregistered live session.
+#
+# Mirrors list_all_sessions' own dedup logic (an iterm-split pair is
+# TWO live tmux sessions for ONE logical entry) but inverted:
+# registers whatever ISN'T yet owned, instead of displaying whatever
+# already is.
+adopt_sessions() {
+  local live
+  live="$(ssh "$SSH_TARGET" -- "tmux list-sessions -F '#{session_name}'" 2>/dev/null || true)"
+
+  local seen_keys=$'\n'
+  local -a to_adopt=()
+  local line prefix kind key live_id live_rest
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    prefix="$(session_prefix_for "$line")" || continue
+    kind="iterm"
+    [[ "$prefix" == "pair-" ]] && kind="tmux"
+    parse_numbered_session "$prefix" "$line"
+    # Captured into dedicated locals BEFORE calling session_is_owned,
+    # not read back from $PARSED_ID/$PARSED_REST afterward -- those are
+    # GLOBALS that session_is_owned's own internal scan (it calls
+    # parse_numbered_session itself, on every registry line it checks)
+    # overwrites as a side effect. list_all_sessions' `|| continue`
+    # never notices, because it only ever reads them again on the
+    # branch where session_is_owned found an actual match (which, by
+    # definition, leaves them holding that exact matching line's own
+    # id/rest -- coincidentally correct). This function's `&& continue`
+    # takes the OPPOSITE branch: reading them again after a "not
+    # owned" result meant reading whatever the LAST scanned registry
+    # line happened to parse to, not this live session's real id/rest
+    # -- confirmed live, every unregistered session got adopted under
+    # the wrong name (the registry's own last entry) instead of its
+    # actual one.
+    live_id="$PARSED_ID"
+    live_rest="$PARSED_REST"
+    session_is_owned "$live_id" "$live_rest" && continue
+    key="${kind}:${live_id}:${live_rest}"
+    case "$seen_keys" in
+      *$'\n'"$key"$'\n'*) continue ;;
+    esac
+    seen_keys+="$key"$'\n'
+    local entry_name="$live_rest"
+    [[ -n "$live_id" ]] && entry_name="${live_id}-${live_rest}"
+    to_adopt+=("$entry_name")
+  done <<<"$live"
+
+  if [[ ${#to_adopt[@]} -eq 0 ]]; then
+    echo "Nothing new to adopt on ${SSH_TARGET}."
+    return 0
+  fi
+
+  local name
+  for name in "${to_adopt[@]}"; do
+    register_session "$name"
+    echo "Adopted: $name"
+  done
+}
+
 print_help() {
   cat <<'HELP'
 Usage:
@@ -2149,6 +2371,8 @@ Usage:
   codersync --kill-all|-K                                   Kill every codersync session (asks to confirm)
   codersync --paste-image|-p                                Upload a clipboard image, copy its remote path
   codersync --sync-skills|-y                                Copy local claude/codex skills to the remote box
+  codersync --local|-L <session-name>                       Start a session directly on this machine, no ssh
+  codersync --adopt|-d                                      Register sessions started via --local into this registry
   codersync --help|-h                                       Show this help
 
 <ssh-target> is a hostname, user@host, or an alias from ~/.ssh/config --
@@ -2259,6 +2483,25 @@ tools are covered -- agy, aider, and kimi have no confirmed
 skills-directory convention to sync against. A tool with nothing local
 to sync is skipped, not treated as an error. Re-run any time after
 adding or editing a skill locally; already-synced files are skipped.
+
+--local/-L <session-name> [--tools/-t t1,t2] [--safe-mode/-s]: creates
+(or reattaches to) a two-pane tmux session directly on THIS machine --
+no ssh at all. Meant to be run by hand after you've already SSH'd into
+the remote box yourself (codersync installed on both ends), so you can
+start working immediately without waiting for a client machine to
+drive the setup. Detach whenever with ordinary tmux (Ctrl-b d); see
+--adopt/-d for picking it up from a client machine afterward. Always
+the tmux-split shape (one session, two panes) -- there's no
+--split-mode here, since iterm mode is inherently Mac+iTerm2-driven.
+Session names created this way have no target-label or numeric-ID
+prefix, unlike ones created the normal way.
+
+--adopt/-d: scans the current target's live tmux sessions for anything
+matching codersync's naming pattern that isn't already in this local
+registry, and registers it. This is what makes --local/-L useful from
+a client machine afterward -- without it, a session created directly
+on the box is invisible to --list-all/--attach/--rename/--kill here,
+same as any other unregistered live session.
 HELP
 }
 
@@ -2510,12 +2753,32 @@ case "${1:-}" in
     sync_skills
     exit 0
     ;;
+  --local|-L)
+    # No load_config here -- local_setup never touches SSH_TARGET/
+    # REMOTE_DIR at all, by design (see its own comment).
+    if [[ -z "${2:-}" ]]; then
+      echo "Usage: codersync --local|-L <session-name> [--tools|-t t1,t2] [--safe-mode|-s]" >&2
+      exit 1
+    fi
+    shift
+    local_setup "$@"
+    exit 0
+    ;;
+  --adopt|-d)
+    if [[ $# -gt 1 ]]; then
+      echo "codersync: $1 takes no arguments -- got extra: ${*:2}" >&2
+      exit 1
+    fi
+    load_config
+    adopt_sessions
+    exit 0
+    ;;
   --help|-h)
     print_help
     exit 0
     ;;
   "")
-    echo "Usage: codersync --setup|-s <ssh-target> [remote-dir] | codersync <session-name> | codersync --attach|-a <id-or-name> | codersync --rename|-R <id-or-name> <new-name> | codersync --restore-all|-r | codersync --list-all|-l | codersync --kill|-k <ids> | codersync --kill-all|-K | codersync --paste-image|-p | codersync --sync-skills|-y" >&2
+    echo "Usage: codersync --setup|-s <ssh-target> [remote-dir] | codersync <session-name> | codersync --attach|-a <id-or-name> | codersync --rename|-R <id-or-name> <new-name> | codersync --restore-all|-r | codersync --list-all|-l | codersync --kill|-k <ids> | codersync --kill-all|-K | codersync --paste-image|-p | codersync --sync-skills|-y | codersync --local|-L <session-name> | codersync --adopt|-d" >&2
     echo "Run 'codersync --help' for more." >&2
     exit 1
     ;;

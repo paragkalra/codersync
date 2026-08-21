@@ -71,6 +71,11 @@ prompts. `codersync` exists to make all of that a non-issue.
 - **Fails loudly, not silently.** A missing tool or unreachable box
   produces a clear error before anything is created, not a tab that
   quietly does nothing.
+- **Start work directly on the box, adopt it later.** Already SSH'd
+  into the remote box yourself? `codersync --local <name>` starts a
+  session right there, no client machine needed. Detach, and later run
+  `codersync --adopt` from a client pointed at that box to make it
+  visible to `--list-all`/`--attach`/`--rename`/`--kill` from there too.
 
 ## Prerequisites
 
@@ -126,6 +131,8 @@ codersync --kill|-k <ids>
 codersync --kill-all|-K
 codersync --paste-image|-p
 codersync --sync-skills|-y
+codersync --local|-L <session-name> [--tools|-t t1,t2] [--safe-mode|-s]
+codersync --adopt|-d
 codersync --help|-h
 ```
 
@@ -334,6 +341,52 @@ silently rather than treated as an error. Re-run any time after
 adding or editing a skill; already-synced files are skipped.
 `agy`/`aider`/`kimi` aren't covered: none has a confirmed
 skills-directory convention to sync against.
+
+### `codersync --local|-L <session-name> [--tools|-t t1,t2] [--safe-mode|-s]`
+
+Starts (or reattaches to) a two-pane session directly on whatever
+machine you run this on, no SSH at all. Meant for when you've already
+SSH'd into the remote box yourself (with `codersync` installed there
+too) and just want to start working right away, rather than waiting on
+a client machine to drive the setup:
+
+```
+# already SSH'd into the box
+$ codersync --local my-feature
+```
+
+This attaches you to the new session immediately, in whatever
+directory you were already in. Detach normally (`Ctrl-b d`) whenever;
+the session keeps running on the box exactly like any other. Later,
+from a client machine that has this box configured (`--setup`), run
+[`--adopt`](#codersync---adopt--d) to make it visible to
+`--list-all`/`--attach`/`--rename`/`--kill` from there too.
+
+Always the two-pane, one-session shape; there's no `--split-mode`
+here, since the iTerm-split mode is inherently Mac+iTerm2-driven and
+meaningless to invoke directly on the remote box. Idempotent like the
+normal creation flow: running this again with the same name reattaches
+to what's already there instead of erroring or duplicating it.
+Sessions created this way have no target-label or numeric-ID prefix
+(unlike ones created the usual way), since the box has no way to know
+what alias a client will someday refer to it by.
+
+### `codersync --adopt|-d`
+
+Scans the current target's live tmux sessions for anything matching
+`codersync`'s own naming pattern that isn't already in this local
+registry, and registers it:
+
+```
+$ codersync --adopt
+Adopted: my-feature
+```
+
+This is what makes [`--local`](#codersync---local--l-session-name---toolst-t1t2---safe-modes)
+useful from a client machine afterward: without it, a session created
+directly on the box is invisible here, the same as any other
+unregistered live session. Reports "Nothing new to adopt" if there's
+nothing to pick up.
 
 ## Supported tools
 
