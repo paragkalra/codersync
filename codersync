@@ -392,6 +392,35 @@ next_session_id() {
   echo "$id"
 }
 
+# Ensures the persisted next_id counter is at least one past `id`, so a
+# future next_session_id() call can never re-mint an ID that
+# adopt_sessions just preserved from a live, already-numbered session
+# -- one that exists independently of this client's own counter
+# (created on a different client machine's registry, or hand-created).
+# Without this, adopting e.g. "pair-1-host-foo" while this client's own
+# counter was still at its default of 1 left the very next
+# `codersync <name>` invocation minting ID 1 again -- two different
+# registry entries for the same target both claiming ID 1, which
+# --list-all then shows as a duplicate and --kill 1 matches both
+# (confirmed live/reproduced with a stub). A no-op if the counter is
+# already past `id`.
+bump_next_id_past() {
+  local id="$1"
+  mkdir -p "$CONFIG_DIR"
+  local current canon
+  if [[ -f "$NEXT_ID_FILE" ]]; then
+    current="$(cat "$NEXT_ID_FILE")"
+    if ! canon="$(canonicalize_session_id "$current")"; then
+      canon=1
+    fi
+  else
+    canon=1
+  fi
+  if (( id + 1 > canon )); then
+    echo "$((id + 1))" > "$NEXT_ID_FILE"
+  fi
+}
+
 # Parses a live tmux session name like "claude-<id>-<rest>" into
 # PARSED_ID/PARSED_REST globals. `prefix` is "claude-", "codex-", or
 # "pair-" (pass "" to parse a bare registry entry name, which has no
@@ -2208,6 +2237,17 @@ local_setup() {
     echo "Invalid session name '${name}': only letters, digits, '-', and '_' are allowed, and it can't start with '-'." >&2
     exit 1
   fi
+  # Rejected for the same reason rename_session rejects a purely-
+  # numeric new name: --attach/--kill always read a numeric argument as
+  # an ID, never a name, and a --local session has no ID of its own to
+  # fall back to (it's deliberately created label-less, see this
+  # function's own comment) -- so a session named this way would be
+  # permanently unaddressable by name (and unaddressable by ID, since
+  # it was never assigned one) once adopted.
+  if [[ "$name" =~ ^[0-9]+$ ]]; then
+    echo "codersync: '${name}' can't be a plain number -- --attach/--kill always read a numeric argument as an ID, never a name, and a --local session has no ID to fall back to." >&2
+    exit 1
+  fi
 
   local tools="claude,codex" safe=0
   while [[ $# -gt 0 ]]; do
@@ -2280,8 +2320,39 @@ local_setup() {
   fi
 
   local dir="$PWD"
-  trap 'tmux kill-session -t "$pair_tmux" 2>/dev/null; rm -f -- "$script1" "$script2"' EXIT
-  tmux new-session -d -s "$pair_tmux" -c "$dir"
+  # The cleanup trap is armed ONLY after `tmux new-session` has
+  # actually succeeded, never before -- the earlier `tmux has-session`
+  # check above and this call aren't atomic, so another invocation
+  # could win a race and create "$pair_tmux" in between. If that
+  # happens, `new-session` here fails (this script's own `set -e`,
+  # active globally, would otherwise exit right here anyway), and
+  # since the trap was never armed, nothing kills the session the
+  # OTHER process just legitimately created. Confirmed live with a
+  # stubbed tmux: arming the trap before this call let exactly that
+  # race kill an unrelated, already-existing session under the same
+  # name.
+  if ! tmux new-session -d -s "$pair_tmux" -c "$dir"; then
+    echo "codersync: couldn't create local session '${pair_tmux}' -- it may have just been created by another invocation. Try again, or attach directly with: tmux attach -t ${pair_tmux}" >&2
+    rm -f -- "$script1" "$script2"
+    exit 1
+  fi
+  # Double-quoted, not single-quoted -- bakes the CURRENT values of
+  # $pair_tmux/$script1/$script2 into the trap's command text literally,
+  # right now, rather than leaving `$variable` references to be resolved
+  # later, when the trap actually fires. Bash runs an EXIT trap only
+  # after the function that armed it has already returned and its own
+  # `local` variables have gone out of scope -- confirmed directly: a
+  # single-quoted version of this exact trap, fired by a later command
+  # failing under this script's own `set -e`, crashed with "unbound
+  # variable" instead of ever running its kill-session/rm at all,
+  # since by fire time $pair_tmux itself no longer existed to expand.
+  # All three values are already known-safe (validate_session_name'd,
+  # or built from validated components plus random_suffix's safe
+  # charset), so baking them in as literal text here isn't a quoting
+  # hazard the way it would be for arbitrary/untrusted input.
+  # shellcheck disable=SC2064 # intentional: expanding NOW, not at
+  # signal time, is the entire point -- see the comment above.
+  trap "tmux kill-session -t \"$pair_tmux\" 2>/dev/null; rm -f -- \"$script1\" \"$script2\"" EXIT
   tmux split-window -h -t "$pair_tmux" -c "$dir"
   tmux send-keys -t "${pair_tmux}.0" "bash $script1" Enter
   tmux send-keys -t "${pair_tmux}.1" "bash $script2" Enter
@@ -2309,7 +2380,7 @@ adopt_sessions() {
   live="$(ssh "$SSH_TARGET" -- "tmux list-sessions -F '#{session_name}'" 2>/dev/null || true)"
 
   local seen_keys=$'\n'
-  local -a to_adopt=()
+  local -a to_adopt=() to_adopt_ids=()
   local line prefix kind key live_id live_rest
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
@@ -2342,7 +2413,21 @@ adopt_sessions() {
     seen_keys+="$key"$'\n'
     local entry_name="$live_rest"
     [[ -n "$live_id" ]] && entry_name="${live_id}-${live_rest}"
+    # entry_name is built from a LIVE tmux session name, not something
+    # this tool already validated at creation time -- a hand-created
+    # or otherwise poisoned live session (e.g. "pair-x;touch /tmp/pwn")
+    # would otherwise be written straight into the registry, which
+    # every other write path (register_session's own callers) already
+    # only ever does with pre-validated values. Same defense restore_all
+    # applies to registry entries it's about to keep, applied here to a
+    # live tmux name instead (confirmed live: "pair-x;touch /tmp/pwn"
+    # got adopted verbatim as "x;touch /tmp/pwn" before this check).
+    if ! validate_session_name "$entry_name"; then
+      echo "codersync: skipping unsafe live session name (contains characters outside a-z/0-9/_/- ): ${prefix}${line#"$prefix"}" >&2
+      continue
+    fi
     to_adopt+=("$entry_name")
+    to_adopt_ids+=("$live_id")
   done <<<"$live"
 
   if [[ ${#to_adopt[@]} -eq 0 ]]; then
@@ -2350,11 +2435,32 @@ adopt_sessions() {
     return 0
   fi
 
-  local name
-  for name in "${to_adopt[@]}"; do
+  # Locked the same way the normal creation path and rename_session
+  # lock their own registry/next_id mutations -- register_session and
+  # bump_next_id_past below both touch state a concurrent `codersync
+  # <name>` invocation reads/writes too.
+  acquire_id_lock || exit 1
+  trap 'release_id_lock' EXIT
+  local i name id
+  for ((i = 0; i < ${#to_adopt[@]}; i++)); do
+    name="${to_adopt[$i]}"
+    id="${to_adopt_ids[$i]}"
     register_session "$name"
+    # Preserves this live session's own numeric ID as-is (never
+    # renumbered -- it's already baked into the literal tmux session
+    # name), but ensures THIS client's own next_session_id() counter
+    # can never re-mint it for something else afterward. Without this,
+    # a client whose counter was still behind (e.g. its default of 1)
+    # adopted a live "pair-1-host-foo" and then minted ID 1 again on
+    # the very next `codersync <name>` -- two registry entries for the
+    # same target both claiming ID 1, which --list-all showed as a
+    # duplicate and --kill 1 matched both (confirmed live/reproduced
+    # with a stub).
+    [[ -n "$id" ]] && bump_next_id_past "$id"
     echo "Adopted: $name"
   done
+  trap - EXIT
+  release_id_lock
 }
 
 print_help() {

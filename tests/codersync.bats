@@ -1424,6 +1424,17 @@ setup() {
   [[ "$output" == *"Invalid session name"* ]]
 }
 
+@test "local_setup: rejects a purely-numeric session name" {
+  # Regression test: a --local session is created label-less (no
+  # numeric-ID prefix), so a numeric NAME would be permanently
+  # unaddressable once adopted -- resolve_registered_session always
+  # reads a purely-numeric argument as wanting an ID lookup, never a
+  # name, and this session was never assigned an ID at all.
+  run local_setup "42"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"can't be a plain number"* ]]
+}
+
 @test "local_setup: --tools requires a value" {
   run local_setup "myfeature" --tools
   [ "$status" -eq 1 ]
@@ -1448,10 +1459,38 @@ setup() {
   [[ "$output" == *"Unknown argument"* ]]
 }
 
+@test "local_setup: does not kill another session if new-session loses a create race" {
+  # Regression test: `tmux has-session` and `tmux new-session` aren't
+  # atomic -- another invocation can create "$pair_tmux" in between.
+  # Stubs tmux so has-session reports "doesn't exist yet" (this
+  # invocation's own view, a moment before the race), but new-session
+  # still fails (the other invocation won in between) -- confirms the
+  # cleanup trap, which this script's own `set -e` fires immediately
+  # on that failure, never calls kill-session at all: it's only armed
+  # AFTER new-session succeeds, precisely so a lost race can't kill
+  # the winner's own, now-live session under the same name (confirmed
+  # live: arming it before new-session let exactly that happen, with a
+  # stubbed tmux reproducing the reported race).
+  # shellcheck disable=SC2329 # invoked indirectly, by local_setup below.
+  tmux() {
+    case "$1" in
+      has-session) return 1 ;;
+      new-session) return 1 ;;
+      *) echo "unexpected tmux call: $*" >> "$BATS_TEST_TMPDIR/unexpected_tmux_calls"; return 1 ;;
+    esac
+  }
+  run local_setup "race-test"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"couldn't create local session"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_tmux_calls" ]
+}
+
 # --- adopt_sessions ---------------------------------------------------------
 
 @test "adopt_sessions: registers an unregistered tmux-mode (pair-only) session" {
   SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   : > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
@@ -1476,6 +1515,8 @@ setup() {
   # of its own, repeatedly, no-oping harmlessly via register_session's
   # own dedup check rather than ever registering the right thing.
   SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\t51-coder-pkbox-unrelated-existing-entry\n' > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
@@ -1494,8 +1535,30 @@ setup() {
   [ "$(wc -l < "$REGISTRY")" -eq 2 ]
 }
 
+@test "adopt_sessions: refuses to register a live session with an unsafe name" {
+  # Regression test: entry_name is built from a LIVE tmux session
+  # name, not something this tool already validated at creation time
+  # -- a hand-created or otherwise poisoned live session used to get
+  # written straight into the registry unvalidated (confirmed live:
+  # "pair-x;touch /tmp/pwn" got adopted verbatim as "x;touch /tmp/pwn").
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf 'pair-x;touch /tmp/pwn\n'; }
+  run adopt_sessions
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"skipping unsafe live session name"* ]]
+  [[ "$output" != *"Adopted"* ]]
+  [ ! -s "$REGISTRY" ]
+}
+
 @test "adopt_sessions: registers an unregistered iterm-mode (claude-/codex-) pair as ONE entry" {
   SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   : > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
@@ -1518,6 +1581,8 @@ setup() {
   # live session's own ID (baked into its literal tmux name) is kept
   # as-is, not stripped or renumbered.
   SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   : > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
@@ -1527,8 +1592,32 @@ setup() {
   [[ "$(cat "$REGISTRY")" == "devbox.example.com"$'\t'"5-devbox-example-com-foo" ]]
 }
 
+@test "adopt_sessions: advances next_id past an adopted numeric ID" {
+  # Regression test: adopt_sessions preserved a live session's own
+  # numeric ID into the registry without ever advancing this client's
+  # own next_session_id() counter -- so the very next `codersync
+  # <name>` invocation could mint that SAME ID again, producing two
+  # registry entries for the same target both claiming it (confirmed
+  # live/reproduced with a stub: adopting "pair-1-..." while the
+  # counter was still at its default of 1 left find_or_assign_id
+  # returning 1 again for a brand-new session).
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  echo "1" > "$NEXT_ID_FILE"
+  # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf 'pair-5-devbox-example-com-foo\n'; }
+  run adopt_sessions
+  [ "$status" -eq 0 ]
+  [ "$(cat "$NEXT_ID_FILE")" = "6" ]
+}
+
 @test "adopt_sessions: skips a session that's already registered" {
   SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\tmy-local-feature\n' > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
@@ -1542,6 +1631,8 @@ setup() {
 
 @test "adopt_sessions: reports nothing to adopt when there's no live session at all" {
   SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   : > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by adopt_sessions below.
