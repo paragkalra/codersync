@@ -1231,6 +1231,64 @@ setup() {
   chmod 644 "$PENDING_FILE"
 }
 
+@test "mark_pending: does not clobber an outer id.lock EXIT trap" {
+  # Regression test reproducing the dispatch path's EXACT structure:
+  # `acquire_id_lock; trap 'release_id_lock' EXIT; ...; mark_pending
+  # ...` (see the dispatch case). An earlier version of mark_pending
+  # armed its OWN `trap ... EXIT` around its write -- bash EXIT traps
+  # are a single global slot, not a stack, so that silently replaced
+  # this outer trap, and disarming back to `trap - EXIT` at the end
+  # erased it rather than restoring it. If the write then failed, only
+  # pending.lock got released; id.lock was left behind with no trap
+  # left at all to release it (confirmed live: status=1,
+  # id_lock_exists=yes, pending_lock_exists=no).
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  run bash -c '
+    set -euo pipefail
+    source "'"${BATS_TEST_DIRNAME}"'/../codersync"
+    SSH_TARGET="devbox.example.com"
+    CONFIG_DIR="'"$CONFIG_DIR"'"
+    acquire_id_lock || exit 1
+    trap "release_id_lock" EXIT
+    PENDING_FILE="$CONFIG_DIR/nonexistent-subdir/pending"
+    mark_pending "3-devbox-example-com-foo"
+    trap - EXIT
+    release_id_lock
+  '
+  [ "$status" -ne 0 ]
+  [ ! -d "$CONFIG_DIR/id.lock" ]
+  [ ! -d "$CONFIG_DIR/pending.lock" ]
+}
+
+@test "clear_pending: does not clobber an outer id.lock EXIT trap-string" {
+  # Same regression as mark_pending's test above, for the OTHER call
+  # shape: the dispatch case's cleanup trap is exactly
+  # `clear_pending "$SESSION" || true; release_id_lock` (see the
+  # dispatch code) -- confirmed live with BOTH id.lock and pending.lock
+  # left behind before this fix, since clear_pending's own trap
+  # clobbered this one too. Triggers the trap via a plain `false`
+  # (standing in for remote setup failing), rather than calling
+  # clear_pending directly, to exercise the real trap-string shape.
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  PENDING_FILE="$CONFIG_DIR/pending"
+  printf '%s\n' "1"$'\t'"devbox.example.com"$'\t'"3-devbox-example-com-foo" > "$PENDING_FILE"
+  chmod 000 "$PENDING_FILE"
+  run bash -c '
+    set -euo pipefail
+    source "'"${BATS_TEST_DIRNAME}"'/../codersync"
+    SSH_TARGET="devbox.example.com"
+    CONFIG_DIR="'"$CONFIG_DIR"'"
+    PENDING_FILE="'"$PENDING_FILE"'"
+    acquire_id_lock || exit 1
+    trap "clear_pending \"3-devbox-example-com-foo\" || true; release_id_lock" EXIT
+    false
+  '
+  [ "$status" -ne 0 ]
+  [ ! -d "$CONFIG_DIR/id.lock" ]
+  [ ! -d "$CONFIG_DIR/pending.lock" ]
+  chmod 644 "$PENDING_FILE"
+}
+
 @test "is_pending: returns status 2 (not 1) when the pending lock is contended, distinct from not-pending" {
   # Regression test: is_pending used to `return 1` for BOTH "definitely
   # not pending" and "couldn't acquire the lock to check" -- callers had
@@ -2781,6 +2839,28 @@ setup() {
   release_line="$(awk -v start="$mark_line" 'NR > start && /^[[:space:]]*release_id_lock$/ { print NR; exit }' "$script")"
   [ -n "$release_line" ]
   [ "$mark_line" -lt "$release_line" ]
+}
+
+@test "dispatch: clear_pending's cleanup trap absorbs its own failure so release_id_lock still runs" {
+  # Regression test: the dispatch case's cleanup trap used to be the
+  # bare semicolon chain `clear_pending "$SESSION"; release_id_lock`.
+  # If clear_pending itself failed (e.g. a failed rewrite) while this
+  # trap was firing, `set -e` abandons the REST of that same trap
+  # string too -- release_id_lock never ran, leaving id.lock behind
+  # (confirmed live: reproduced with both id.lock AND pending.lock left
+  # behind). Confirmed in isolation too: a plain `false; echo
+  # never_runs` as a trap body never prints never_runs under set -e --
+  # a failing first command aborts everything after it in the same
+  # trap string, trap chaining or not. `|| true` right after
+  # clear_pending absorbs its own exit status so release_id_lock is
+  # unconditionally reached regardless of whether clear_pending
+  # succeeded. This is inline dispatch code, not a sourced function
+  # (see the mark_pending ordering test above for the same reason), so
+  # this asserts the source text directly rather than driving it.
+  script="${BATS_TEST_DIRNAME}/../codersync"
+  # shellcheck disable=SC2016 # single-quoted on purpose: matching the
+  # literal text `$SESSION` in codersync's own source, not expanding it.
+  grep -qF 'clear_pending "$SESSION" || true; release_id_lock' "$script"
 }
 
 # --- dispatch: rejects unexpected trailing arguments -------------------

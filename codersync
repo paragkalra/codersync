@@ -1338,59 +1338,91 @@ release_pending_lock() {
 # --restore-all delete a registered-but-not-yet-pending entry in that
 # exact gap). Appends rather than overwrites since more than one
 # creation can be in flight at once.
+# Deliberately does NOT use a `trap ... EXIT` around the write below,
+# unlike what an earlier version of this function did -- this is
+# called from the dispatch case's creation path WHILE that case's own
+# `trap 'release_id_lock' EXIT` is already armed (see the dispatch
+# code's own comment), and bash EXIT traps are a single global slot,
+# not a stack: arming one here and disarming it with `trap - EXIT`
+# afterward doesn't restore the caller's trap, it erases it -- so if
+# THIS write failed, only pending.lock got released; id.lock was left
+# behind with no trap left to ever release it (confirmed live: status=1,
+# id_lock_exists=yes, pending_lock_exists=no -- the exact same
+# clobbering bug already fixed once for is_pending, missed here because
+# this call site's outer trap is armed earlier in the dispatch case,
+# before register_session, not right before this call). Instead, the
+# write's own failure is captured explicitly (`|| rc=$?`, which doesn't
+# trigger `set -e` since it's the left side of `||`) so
+# release_pending_lock unconditionally runs either way, and the
+# ORIGINAL failure status is still returned to the caller -- letting
+# the caller's own untouched, still-armed EXIT trap do its job normally
+# if this fails.
 mark_pending() {
-  local session="$1"
+  local session="$1" rc=0
   mkdir -p "$CONFIG_DIR"
   acquire_pending_lock || return 1
-  # Armed only after the lock is actually held, so a Ctrl-C, a `set -e`
-  # exit from the write below failing, or any other interruption while
-  # the lock is held still releases it -- without this, the lock
-  # directory was left behind and blocked every later codersync
-  # invocation that touches pending state for 5s until someone noticed
-  # and removed it by hand.
-  trap 'release_pending_lock' EXIT
-  printf '%s\n' "$(date +%s)"$'\t'"${SSH_TARGET}"$'\t'"${session}" >> "$PENDING_FILE"
-  trap - EXIT
+  printf '%s\n' "$(date +%s)"$'\t'"${SSH_TARGET}"$'\t'"${session}" >> "$PENDING_FILE" || rc=$?
   release_pending_lock
+  return "$rc"
 }
 
 # Removes this session's own pending marker once remote setup has
-# finished (or the creation path is giving up -- wired to an EXIT trap
-# so a crash/Ctrl-C still clears it, though a hard kill -9 skips traps
-# entirely, which is exactly what PENDING_TTL_SECONDS is for). Locked
-# the same as mark_pending/is_pending: this does a full
-# read-then-rewrite of the whole file, which without a lock could race
-# a concurrent mark_pending/clear_pending for a DIFFERENT in-flight
-# session -- e.g. this read the file before that session's mark_pending
-# appended its line, then this rewrite wrote back a stale snapshot that
-# silently dropped the other session's marker (confirmed live with two
+# finished (or the creation path is giving up). Locked the same as
+# mark_pending/is_pending: this does a full read-then-rewrite of the
+# whole file, which without a lock could race a concurrent
+# mark_pending/clear_pending for a DIFFERENT in-flight session -- e.g.
+# this read the file before that session's mark_pending appended its
+# line, then this rewrite wrote back a stale snapshot that silently
+# dropped the other session's marker (confirmed live with two
 # overlapping creations racing this exact read-modify-write).
+#
+# Deliberately does NOT use a `trap ... EXIT` around the rewrite --
+# same reason as mark_pending: this is called from the dispatch case's
+# creation path either directly (with NO outer trap active, at normal
+# completion) or from INSIDE that case's own EXIT trap
+# (`clear_pending "$SESSION" || true; release_id_lock` -- see the
+# dispatch code), which fires if remote setup itself fails. A `trap
+# ... EXIT` armed here would clobber whichever of those is in effect
+# the same way it did for mark_pending (confirmed live: reproduced with
+# both id.lock AND pending.lock left behind afterward).
+#
+# The read-then-rewrite below runs inside a `( ... ) || rc=$?` subshell
+# rather than guarding the write alone -- the READ can fail too (e.g. a
+# $PENDING_FILE with its permissions corrupted to unreadable), and a
+# redirection failure on `done < "$PENDING_FILE"` isn't exempt from
+# `set -e` the way a while-loop's own condition test is; guarding only
+# the write left this exact case unguarded, still exiting straight past
+# release_pending_lock below (confirmed: first attempt at this fix
+# still failed the "releases the lock even when it fails" test, for
+# read failure rather than write failure). Wrapping the whole risky
+# block catches either failure uniformly, and reports it back to the
+# caller the same way mark_pending's `|| rc=$?` does for its own single
+# risky line.
 clear_pending() {
-  local session="$1"
+  local session="$1" rc=0
   acquire_pending_lock || return 1
-  # See mark_pending's comment: armed only once the lock is held, so an
-  # interruption mid-rewrite still releases it instead of leaving
-  # pending.lock behind.
-  trap 'release_pending_lock' EXIT
-  if [[ -f "$PENDING_FILE" ]]; then
-    local line kept=()
-    while IFS= read -r line; do
-      [[ -z "$line" ]] && continue
-      local ts="${line%%$'\t'*}" rest="${line#*$'\t'}"
-      local ptarget="${rest%%$'\t'*}" pname="${rest#*$'\t'}"
-      if [[ "$ptarget" == "$SSH_TARGET" && "$pname" == "$session" ]]; then
-        continue
+  (
+    set -e
+    if [[ -f "$PENDING_FILE" ]]; then
+      local line kept=()
+      while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local ts="${line%%$'\t'*}" rest="${line#*$'\t'}"
+        local ptarget="${rest%%$'\t'*}" pname="${rest#*$'\t'}"
+        if [[ "$ptarget" == "$SSH_TARGET" && "$pname" == "$session" ]]; then
+          continue
+        fi
+        kept+=("${ts}"$'\t'"${ptarget}"$'\t'"${pname}")
+      done < "$PENDING_FILE"
+      if [[ ${#kept[@]} -gt 0 ]]; then
+        printf '%s\n' "${kept[@]}" > "$PENDING_FILE"
+      else
+        : > "$PENDING_FILE"
       fi
-      kept+=("${ts}"$'\t'"${ptarget}"$'\t'"${pname}")
-    done < "$PENDING_FILE"
-    if [[ ${#kept[@]} -gt 0 ]]; then
-      printf '%s\n' "${kept[@]}" > "$PENDING_FILE"
-    else
-      : > "$PENDING_FILE"
     fi
-  fi
-  trap - EXIT
+  ) || rc=$?
   release_pending_lock
+  return "$rc"
 }
 
 # Whether (target, name) has an unexpired pending marker -- checked by
@@ -3526,9 +3558,25 @@ case "${1:-}" in
     # --restore-all delete the entry in that exact gap). mark_pending
     # takes its own separate pending.lock internally rather than
     # id.lock -- mkdir-based locks aren't reentrant, and id.lock is
-    # still held here.
+    # still held here. If mark_pending's own write fails, it returns
+    # non-zero WITHOUT touching this trap (see its own comment for why
+    # it can't safely arm one of its own here) -- `set -e` then exits
+    # right here, and the `release_id_lock` trap armed just above is
+    # still exactly what fires.
     mark_pending "$SESSION"
-    trap 'clear_pending "$SESSION"; release_id_lock' EXIT
+    # `clear_pending "$SESSION" || true` -- NOT a bare
+    # `clear_pending "$SESSION"` -- because this whole string runs as
+    # ONE trap action: if clear_pending itself failed (and, like
+    # mark_pending, it deliberately doesn't arm its own trap here) and
+    # `set -e` re-triggers partway through evaluating this trap string,
+    # bash abandons the REST of that same string too, skipping
+    # release_id_lock entirely and leaving id.lock behind (confirmed:
+    # a plain `false; echo never_runs` as a trap body never prints
+    # never_runs under set -e). The `|| true` absorbs clear_pending's
+    # own exit status right here so release_id_lock is unconditionally
+    # reached -- clear_pending has already done its own best-effort
+    # pending.lock release internally by the time it returns either way.
+    trap 'clear_pending "$SESSION" || true; release_id_lock' EXIT
     release_id_lock
     if [[ "$SPLIT_MODE" == "tmux" ]]; then
       remote_setup_tmux_mode "$SESSION" "$TOOL1" "$TOOL2" "$SAFE_MODE"
