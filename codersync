@@ -1342,7 +1342,15 @@ mark_pending() {
   local session="$1"
   mkdir -p "$CONFIG_DIR"
   acquire_pending_lock || return 1
+  # Armed only after the lock is actually held, so a Ctrl-C, a `set -e`
+  # exit from the write below failing, or any other interruption while
+  # the lock is held still releases it -- without this, the lock
+  # directory was left behind and blocked every later codersync
+  # invocation that touches pending state for 5s until someone noticed
+  # and removed it by hand.
+  trap 'release_pending_lock' EXIT
   printf '%s\n' "$(date +%s)"$'\t'"${SSH_TARGET}"$'\t'"${session}" >> "$PENDING_FILE"
+  trap - EXIT
   release_pending_lock
 }
 
@@ -1360,25 +1368,28 @@ mark_pending() {
 clear_pending() {
   local session="$1"
   acquire_pending_lock || return 1
-  if [[ ! -f "$PENDING_FILE" ]]; then
-    release_pending_lock
-    return 0
-  fi
-  local line kept=()
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    local ts="${line%%$'\t'*}" rest="${line#*$'\t'}"
-    local ptarget="${rest%%$'\t'*}" pname="${rest#*$'\t'}"
-    if [[ "$ptarget" == "$SSH_TARGET" && "$pname" == "$session" ]]; then
-      continue
+  # See mark_pending's comment: armed only once the lock is held, so an
+  # interruption mid-rewrite still releases it instead of leaving
+  # pending.lock behind.
+  trap 'release_pending_lock' EXIT
+  if [[ -f "$PENDING_FILE" ]]; then
+    local line kept=()
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      local ts="${line%%$'\t'*}" rest="${line#*$'\t'}"
+      local ptarget="${rest%%$'\t'*}" pname="${rest#*$'\t'}"
+      if [[ "$ptarget" == "$SSH_TARGET" && "$pname" == "$session" ]]; then
+        continue
+      fi
+      kept+=("${ts}"$'\t'"${ptarget}"$'\t'"${pname}")
+    done < "$PENDING_FILE"
+    if [[ ${#kept[@]} -gt 0 ]]; then
+      printf '%s\n' "${kept[@]}" > "$PENDING_FILE"
+    else
+      : > "$PENDING_FILE"
     fi
-    kept+=("${ts}"$'\t'"${ptarget}"$'\t'"${pname}")
-  done < "$PENDING_FILE"
-  if [[ ${#kept[@]} -gt 0 ]]; then
-    printf '%s\n' "${kept[@]}" > "$PENDING_FILE"
-  else
-    : > "$PENDING_FILE"
   fi
+  trap - EXIT
   release_pending_lock
 }
 
@@ -1408,6 +1419,24 @@ clear_pending() {
 # failure and "no marker found" were indistinguishable. Callers must
 # treat 2 as "don't know" and default to NOT pruning, same as if it
 # were pending.
+#
+# Deliberately does NOT arm its own EXIT trap around the lock hold,
+# unlike mark_pending/clear_pending -- bash EXIT traps are a single
+# global slot, not a stack, so a nested `trap '...' EXIT` here would
+# silently clobber an OUTER caller's own trap the instant it's armed,
+# and disarming back to `trap - EXIT` at the end doesn't restore
+# whatever was there before, it just erases it (confirmed live:
+# restore_all arms `release_id_lock` as its own EXIT trap around its
+# final registry write, then calls is_pending from inside that same
+# section -- with a trap here, THAT call silently replaced
+# release_id_lock with release_pending_lock and then blanked it
+# entirely, so by the time the write later failed there was no trap
+# left at all to release id.lock). Safe to leave untrapped: unlike
+# mark_pending/clear_pending, this function never WRITES anything --
+# only reads plus in-memory string/arithmetic ops -- so the realistic
+# odds of it failing mid-lock (as opposed to failing the up-front
+# acquire, which is already handled) are low enough not to justify
+# reintroducing that clobbering risk.
 is_pending() {
   local target="$1" name="$2"
   [[ -f "$PENDING_FILE" ]] || return 1
@@ -1493,6 +1522,7 @@ restore_all() {
   local skipped_other_target=0
   local skipped_unsafe=0
   local seen_lines=$'\n'
+  local -a provisional_prune=()
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     parse_registry_line "$line"
@@ -1603,19 +1633,62 @@ restore_all() {
         echo "Skipping '$entry_name': couldn't check its pending status (pending-file lock contended) -- not pruning it this run." >&2
         kept+=("${entry_target}"$'\t'"${entry_name}")
       else
-        echo "Pruning stale entry (no live tmux session): $entry_name"
+        # NOT pruned yet, even though this check just came back
+        # "confirmed not pending" -- this read of $REGISTRY (and this
+        # is_pending check) both happened without id.lock, so a
+        # concurrent creation's register_session (which writes the
+        # registry row this loop just saw) can land BEFORE its own
+        # mark_pending (both happen under id.lock, in that order, but
+        # this loop isn't synchronized against either write) -- i.e.
+        # this entry can be legitimately mid-creation RIGHT NOW even
+        # though the marker didn't exist yet at the instant we checked.
+        # Deferred to a final recheck under id.lock instead of pruning
+        # immediately here (confirmed live: this exact gap left the
+        # registry empty while a fresh pending marker for the pruned
+        # entry remained).
+        provisional_prune+=("${entry_target}"$'\t'"${entry_name}")
       fi
     fi
   done < "$REGISTRY"
 
-  # Held only for this final re-read-and-write, not the whole function
+  # Held from here through the final write, not the whole function
   # (which made all those slow remote restore calls above) -- see
-  # merge_concurrent_registry_additions's own comment for why this
-  # exists at all: without it, a `codersync <name>` invocation whose
-  # register_session append landed anywhere during this function's run
-  # would have that append silently wiped out by the stale rewrite
-  # below.
+  # merge_concurrent_registry_additions's own comment for why the merge
+  # step exists. Armed only now that the lock is actually held, so a
+  # Ctrl-C or a failed write below still releases it instead of leaving
+  # id.lock behind for 5s.
   acquire_id_lock || exit 1
+  trap 'release_id_lock' EXIT
+
+  # Final say on every entry provisionally marked stale above -- this
+  # is the FIRST point in this function where that decision is made
+  # under id.lock, serialized against any `codersync <name>` invocation
+  # that might be reusing this exact row. A creation always writes its
+  # registry row and its pending marker in that order, BOTH while
+  # holding id.lock, before ever releasing it -- so by the time this
+  # acquire above succeeds, any such invocation has either not started
+  # yet (nothing written), or has fully finished both writes (marker
+  # exists) before we got the lock. There's no in-between state left to
+  # observe here, unlike the un-locked check during the loop above.
+  if [[ ${#provisional_prune[@]} -gt 0 ]]; then
+    local pp_key pp_target pp_name pending_status
+    for pp_key in "${provisional_prune[@]}"; do
+      pp_target="${pp_key%%$'\t'*}"
+      pp_name="${pp_key#*$'\t'}"
+      pending_status=0
+      is_pending "$pp_target" "$pp_name" || pending_status=$?
+      if [[ "$pending_status" == 0 ]]; then
+        echo "Skipping '$pp_name': session creation still in progress, not pruning yet."
+        kept+=("${pp_target}"$'\t'"${pp_name}")
+      elif [[ "$pending_status" == 2 ]]; then
+        echo "Skipping '$pp_name': couldn't check its pending status (pending-file lock contended) -- not pruning it this run." >&2
+        kept+=("${pp_target}"$'\t'"${pp_name}")
+      else
+        echo "Pruning stale entry (no live tmux session): $pp_name"
+      fi
+    done
+  fi
+
   while IFS= read -r line; do
     [[ -n "$line" ]] && kept+=("$line")
   done < <(merge_concurrent_registry_additions "$seen_lines")
@@ -1624,6 +1697,7 @@ restore_all() {
   else
     : > "$REGISTRY"
   fi
+  trap - EXIT
   release_id_lock
   if [[ "$skipped_other_target" -gt 0 ]]; then
     echo "Skipped ${skipped_other_target} entry/entries for a different configured box -- re-run --setup for that box, then --restore-all again, to check those."
@@ -2175,6 +2249,23 @@ kill_sessions() {
   local ids
   ids="$(parse_kill_spec "$spec")" || exit 1
 
+  # Held across the WHOLE kill (every remote_kill_session call below,
+  # not just the final registry cleanup that used to be all that took
+  # it) -- a targeted kill drops the registry row for whatever it just
+  # killed, but find_or_assign_id reuses an existing row's raw text for
+  # a matching target+suffix, so a brand-new `codersync <same-name>`
+  # invocation started right after the kill (but before this cleanup)
+  # can legitimately re-claim -- and re-mark-pending, or even fully
+  # recreate as live again -- that EXACT row before we get to drop it.
+  # Re-checking just the pending marker under the lock wouldn't cover
+  # the "already alive again" case, so instead of that, the lock is
+  # held across the entire operation: no such invocation can even start
+  # writing to the registry until this one releases it (confirmed live:
+  # a targeted kill left registry_bytes=0 with a fresh pending marker
+  # for the exact row it had just dropped).
+  acquire_id_lock || exit 1
+  trap 'release_id_lock' EXIT
+
   local live
   live="$(ssh "$SSH_TARGET" -- "tmux list-sessions -F '#{session_name}'" 2>/dev/null || true)"
 
@@ -2235,13 +2326,6 @@ kill_sessions() {
   done <<<"$ids"
 
   if [[ ${#killed_pairs[@]} -gt 0 ]]; then
-    # Locked from the read through the write -- the same registry
-    # read-modify-write shape creation/rename_session/adopt_sessions
-    # already guard with id.lock, but this one used to run completely
-    # unsynchronized: a register_session append landing in the gap
-    # between this read and this write got silently overwritten by the
-    # stale rewrite (confirmed live).
-    acquire_id_lock || exit 1
     local -a kept=()
     local line kp drop
     while IFS= read -r line; do
@@ -2264,8 +2348,10 @@ kill_sessions() {
     else
       : > "$REGISTRY"
     fi
-    release_id_lock
   fi
+
+  trap - EXIT
+  release_id_lock
 
   if [[ "$any_killed" == 0 ]]; then
     echo "Nothing killed."
@@ -2307,6 +2393,23 @@ kill_all_sessions() {
     return 0
   fi
 
+  # Held across the WHOLE kill (every remote_kill_session call below,
+  # not just the final registry cleanup) -- NOT across the confirmation
+  # prompt above, which waits on a human and could block a concurrent
+  # invocation for however long that takes. Same reason as
+  # kill_sessions holds it this wide: find_or_assign_id reuses an
+  # existing row's raw text for a matching target+suffix, so a
+  # brand-new `codersync <same-name>` invocation started right after a
+  # kill but before this cleanup could re-claim -- and re-mark-pending,
+  # or even fully recreate as live again -- the exact row this is about
+  # to drop. Re-checking just the pending marker wouldn't cover the
+  # "already alive again" case, so the lock covers the whole operation
+  # instead: no such invocation can start writing until this releases
+  # it (confirmed live: --kill-all left registry_bytes=0 with a fresh
+  # pending marker for a row it had just dropped).
+  acquire_id_lock || exit 1
+  trap 'release_id_lock' EXIT
+
   local count=0
   local -a killed_pairs=()
   local prefix2
@@ -2324,12 +2427,6 @@ kill_all_sessions() {
     count=$((count + 1))
   done
 
-  # Locked from the read through the write, same as kill_sessions and
-  # for the same reason -- this used to run completely unsynchronized,
-  # so a register_session append landing in the gap between this read
-  # and this write got silently overwritten by the stale rewrite
-  # (confirmed live).
-  acquire_id_lock || exit 1
   touch "$REGISTRY"
   local kept=()
   local line kp drop
@@ -2360,6 +2457,7 @@ kill_all_sessions() {
   else
     : > "$REGISTRY"
   fi
+  trap - EXIT
   release_id_lock
 
   echo "Killed ${count} session(s)."

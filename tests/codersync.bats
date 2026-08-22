@@ -1174,6 +1174,63 @@ setup() {
   [ "$(cat "$PENDING_FILE")" = "1"$'\t'"devbox.example.com"$'\t'"3-devbox-example-com-foo" ]
 }
 
+@test "mark_pending: releases the pending-file lock even when the write itself fails" {
+  # Regression test: the acquire-lock/do-work/release-lock sequence had
+  # no trap -- a write failure (or a Ctrl-C) between acquiring the lock
+  # and the explicit release at the end left pending.lock behind,
+  # blocking every later pending-file operation for 5s until someone
+  # noticed and removed it by hand. Forces the write itself to fail (a
+  # PENDING_FILE whose parent directory doesn't exist) to prove the
+  # trap, not the normal code path, is what cleans up here.
+  #
+  # Run in a genuinely separate `bash -c` subshell, NOT via bats' `run`
+  # on the function directly -- bats' `run` suppresses errexit around
+  # whatever it invokes (that's how it captures a failing exit code
+  # without killing the whole test process), so calling mark_pending
+  # straight from a `run` never actually triggers the `set -e` exit
+  # this test exists to cover: the failed printf's non-zero status was
+  # silently ignored and execution just continued on to the explicit
+  # trap disarm + release at the end, passing for the wrong reason.
+  # Calling it directly without `run` isn't an option either -- that
+  # DOES trigger real errexit, but it kills the whole bats worker
+  # process outright (confirmed: "Executed 0 instead of expected 1
+  # tests") since nothing in the bats harness itself is set up to catch
+  # that. A separate `bash -c` process is a real, independent `set -e`
+  # script; `run` only captures ITS exit code, without touching
+  # errexit inside it.
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  run bash -c '
+    set -euo pipefail
+    source "'"${BATS_TEST_DIRNAME}"'/../codersync"
+    SSH_TARGET="devbox.example.com"
+    CONFIG_DIR="'"$CONFIG_DIR"'"
+    PENDING_FILE="$CONFIG_DIR/nonexistent-subdir/pending"
+    mark_pending "3-devbox-example-com-foo"
+  '
+  [ "$status" -ne 0 ]
+  [ ! -d "$CONFIG_DIR/pending.lock" ]
+}
+
+@test "clear_pending: releases the pending-file lock even when the write itself fails" {
+  # See mark_pending's test above for why this runs in a separate
+  # `bash -c` subshell instead of `run clear_pending ...` directly.
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  PENDING_FILE="$CONFIG_DIR/pending"
+  printf '%s\n' "1"$'\t'"devbox.example.com"$'\t'"3-devbox-example-com-foo" > "$PENDING_FILE"
+  chmod 000 "$PENDING_FILE"
+  run bash -c '
+    set -euo pipefail
+    source "'"${BATS_TEST_DIRNAME}"'/../codersync"
+    SSH_TARGET="devbox.example.com"
+    CONFIG_DIR="'"$CONFIG_DIR"'"
+    PENDING_FILE="'"$PENDING_FILE"'"
+    clear_pending "3-devbox-example-com-foo"
+  '
+  [ "$status" -ne 0 ]
+  [ ! -d "$CONFIG_DIR/pending.lock" ]
+  chmod 644 "$PENDING_FILE"
+}
+
 @test "is_pending: returns status 2 (not 1) when the pending lock is contended, distinct from not-pending" {
   # Regression test: is_pending used to `return 1` for BOTH "definitely
   # not pending" and "couldn't acquire the lock to check" -- callers had
@@ -1273,24 +1330,110 @@ setup() {
   [[ "$output" == *"couldn't acquire the session-ID lock"* ]]
 }
 
-@test "kill_sessions: fails clearly (does not silently proceed) when id.lock is contended at the registry write" {
+@test "restore_all: rechecks pending status under id.lock instead of trusting the initial unlocked scan" {
+  # Regression test: the main scan loop's is_pending check (and the
+  # $REGISTRY read that fed it) both run WITHOUT id.lock. A concurrent
+  # creation writes its registry row (register_session) and its
+  # pending marker (mark_pending) in that order, both while holding
+  # id.lock -- so this loop can see the freshly-written row (that's how
+  # it got into $REGISTRY for the loop to read at all) an instant before
+  # the SAME invocation's marker exists, mistake it for genuinely dead,
+  # and queue it for pruning. Reproduced here by stubbing is_pending to
+  # answer "not pending" on its FIRST call (the un-locked scan) and
+  # "pending" on every call after (the marker having since appeared by
+  # the time of the locked recheck) -- confirmed live, this exact gap
+  # left the registry empty while a fresh pending marker for the pruned
+  # entry remained.
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t3-devbox-example-com-foo\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf ''; }
+  is_pending_calls=0
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all below.
+  is_pending() {
+    is_pending_calls=$((is_pending_calls + 1))
+    [[ "$is_pending_calls" -eq 1 ]] && return 1
+    return 0
+  }
+  run restore_all
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"session creation still in progress, not pruning yet."* ]]
+  [[ "$output" != *"Pruning stale entry"* ]]
+  [ "$(cat "$REGISTRY")" = "devbox.example.com"$'\t'"3-devbox-example-com-foo" ]
+}
+
+@test "restore_all: releases id.lock even when the final registry write fails" {
+  # Regression test: the acquire-lock/do-work/release-lock sequence
+  # around the final merge+write had no trap -- a write failure (or a
+  # Ctrl-C) between acquiring id.lock and the explicit release left it
+  # behind, blocking every later id.lock operation for 5s. Forces the
+  # final write to fail (a read-only $REGISTRY) to prove the trap, not
+  # the normal code path, is what releases the lock here.
+  #
+  # Run in a genuinely separate `bash -c` subshell, NOT via bats' `run`
+  # on the function directly -- same reason as mark_pending's test
+  # above (bats' `run` suppresses errexit, so it would never actually
+  # trigger the `set -e` exit this test exists to cover). No live
+  # session for the one registry entry, so it's the "prune" path (no
+  # remote_setup_tmux_mode/open_tab_tmux_mode calls to stub) that hits
+  # the failing write.
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
+  chmod 444 "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf ''; }
+  export -f ssh
+  run bash -c '
+    set -euo pipefail
+    source "'"${BATS_TEST_DIRNAME}"'/../codersync"
+    SSH_TARGET="devbox.example.com"
+    CONFIG_DIR="'"$CONFIG_DIR"'"
+    REGISTRY="'"$REGISTRY"'"
+    restore_all
+  '
+  [ "$status" -ne 0 ]
+  [ ! -d "$CONFIG_DIR/id.lock" ]
+  chmod 644 "$REGISTRY"
+}
+
+@test "kill_sessions: fails clearly, before killing anything, when id.lock is already held" {
+  # Regression test: id.lock used to be acquired only around the final
+  # registry cleanup, AFTER remote_kill_session had already run --
+  # meaning a concurrent creation could reuse and re-mark-pending (or
+  # even fully recreate as live again) the exact row this cleanup was
+  # about to drop, since nothing blocked it from starting during the
+  # kill itself. Locked across the WHOLE operation now, proven here by
+  # holding id.lock from before this even starts: if the lock still
+  # only covered the cleanup, ssh would get called (list-sessions, then
+  # the kill itself) and "Killing:" would appear before the eventual
+  # lock failure at the end -- confirmed live, a targeted kill left
+  # registry_bytes=0 with a fresh pending marker for the row it had
+  # just dropped.
   SSH_TARGET="devbox.example.com"
   CONFIG_DIR="$BATS_TEST_TMPDIR"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
   mkdir -p "$CONFIG_DIR/id.lock"
   # shellcheck disable=SC2329 # invoked indirectly, by kill_sessions below.
-  ssh() {
-    if [[ "$*" == *"list-sessions"* ]]; then
-      printf 'pair-1-devbox-example-com-foo\n'
-    fi
-  }
+  ssh() { echo "unexpected: $*" >> "$BATS_TEST_TMPDIR/unexpected_ssh_calls"; }
   run kill_sessions "1"
   [ "$status" -eq 1 ]
   [[ "$output" == *"couldn't acquire the session-ID lock"* ]]
+  [[ "$output" != *"Killing:"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
 }
 
-@test "kill_all_sessions: fails clearly (does not silently proceed) when id.lock is contended at the registry write" {
+@test "kill_all_sessions: fails clearly, before killing anything, when id.lock is already held" {
+  # Same regression as kill_sessions above, for --kill-all. The lock is
+  # acquired only after the confirmation prompt (not held across a wait
+  # on human input), but before the first remote_kill_session call --
+  # ssh is stubbed to return the live list (needed so `matches` is
+  # non-empty and the prompt is even reached), and the reply is "y", so
+  # if the lock were still only around the final cleanup, killing would
+  # proceed before the eventual lock failure.
   SSH_TARGET="devbox.example.com"
   CONFIG_DIR="$BATS_TEST_TMPDIR"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
@@ -1300,11 +1443,81 @@ setup() {
   ssh() {
     if [[ "$*" == *"list-sessions"* ]]; then
       printf 'pair-1-devbox-example-com-foo\n'
+    else
+      echo "unexpected: $*" >> "$BATS_TEST_TMPDIR/unexpected_ssh_calls"
     fi
   }
   run kill_all_sessions <<<"y"
   [ "$status" -eq 1 ]
   [[ "$output" == *"couldn't acquire the session-ID lock"* ]]
+  [[ "$output" != *"Killing:"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
+}
+
+@test "kill_sessions: releases id.lock even when the final registry write fails" {
+  # Regression test: no trap around the acquire-lock/kill/write
+  # sequence -- a write failure (or Ctrl-C) after the kill but before
+  # the explicit release left id.lock behind, blocking every later
+  # id.lock operation for 5s. Forces the final write to fail (a
+  # read-only $REGISTRY) to prove the trap, not the normal code path,
+  # is what releases the lock here.
+  #
+  # Run in a genuinely separate `bash -c` subshell, NOT via bats' `run`
+  # on the function directly -- same reason as mark_pending's test
+  # above (bats' `run` suppresses errexit, so it would never actually
+  # trigger the `set -e` exit this test exists to cover). The `ssh`
+  # stub is exported so the subshell's own `source codersync` (which
+  # doesn't define `ssh` itself, unlike remote_setup_tmux_mode etc.)
+  # still sees it.
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
+  chmod 444 "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by kill_sessions below.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'pair-1-devbox-example-com-foo\n'
+    fi
+  }
+  export -f ssh
+  run bash -c '
+    set -euo pipefail
+    source "'"${BATS_TEST_DIRNAME}"'/../codersync"
+    SSH_TARGET="devbox.example.com"
+    CONFIG_DIR="'"$CONFIG_DIR"'"
+    REGISTRY="'"$REGISTRY"'"
+    kill_sessions "1"
+  '
+  [ "$status" -ne 0 ]
+  [ ! -d "$CONFIG_DIR/id.lock" ]
+  chmod 644 "$REGISTRY"
+}
+
+@test "kill_all_sessions: releases id.lock even when the final registry write fails" {
+  # See kill_sessions's identical test above for why this runs in a
+  # separate `bash -c` subshell.
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
+  chmod 444 "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by kill_all_sessions.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'pair-1-devbox-example-com-foo\n'
+    fi
+  }
+  export -f ssh
+  run bash -c '
+    set -euo pipefail
+    source "'"${BATS_TEST_DIRNAME}"'/../codersync"
+    SSH_TARGET="devbox.example.com"
+    CONFIG_DIR="'"$CONFIG_DIR"'"
+    REGISTRY="'"$REGISTRY"'"
+    kill_all_sessions <<<"y"
+  '
+  [ "$status" -ne 0 ]
+  [ ! -d "$CONFIG_DIR/id.lock" ]
+  chmod 644 "$REGISTRY"
 }
 
 # --- attach_session -----------------------------------------------------
