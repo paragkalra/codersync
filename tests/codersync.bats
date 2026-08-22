@@ -1459,6 +1459,13 @@ setup() {
   [[ "$output" == *"couldn't check its pending status"* ]]
   [[ "$output" != *"Pruning stale entry"* ]]
   [ "$(cat "$REGISTRY")" = "devbox.example.com"$'\t'"3-devbox-example-com-foo" ]
+  # Regression test: an earlier version of this message named ONLY
+  # "pending-file lock contended" -- correct for the lock-contention
+  # case, but misleading here (the pending FILE is unreadable, not the
+  # lock), pointing the user toward waiting out a lock that was never
+  # actually the problem. The message is now generic enough to cover
+  # both causes of status 2.
+  [[ "$output" == *"pending-file lock contended, or the pending file itself couldn't be read"* ]]
 }
 
 @test "is_pending: ignores a malformed (non-numeric) timestamp instead of crashing" {

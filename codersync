@@ -1711,14 +1711,19 @@ restore_all() {
         echo "Skipping '$entry_name': session creation still in progress, not pruning yet."
         kept+=("${entry_target}"$'\t'"${entry_name}")
       elif [[ "$pending_status" == 2 ]]; then
-        # is_pending couldn't acquire the pending-file lock, so there's
-        # no way to tell pending apart from not-pending here -- kept
-        # rather than pruned, on the same "don't destroy what you
-        # haven't verified" principle as everywhere else in this
-        # function. Without this, a merely-contended lock looked
-        # identical to "definitely not pending" and pruned a genuinely
-        # in-flight entry (confirmed live).
-        echo "Skipping '$entry_name': couldn't check its pending status (pending-file lock contended) -- not pruning it this run." >&2
+        # is_pending returns 2 for TWO distinct reasons -- the
+        # pending-file lock was contended, OR $PENDING_FILE itself
+        # couldn't be read (e.g. corrupted permissions) -- and doesn't
+        # (and can't cleanly) tell this caller which. Either way,
+        # there's no way to tell pending apart from not-pending here,
+        # so it's kept rather than pruned, on the same "don't destroy
+        # what you haven't verified" principle as everywhere else in
+        # this function. The message stays generic rather than naming
+        # "lock contended" specifically -- an earlier version did, which
+        # pointed the user at the wrong recovery path (waiting out a
+        # lock) for the unreadable-file case, where the actual fix is
+        # checking $PENDING_FILE's permissions instead.
+        echo "Skipping '$entry_name': couldn't check its pending status (pending-file lock contended, or the pending file itself couldn't be read) -- not pruning it this run." >&2
         kept+=("${entry_target}"$'\t'"${entry_name}")
       else
         # NOT pruned yet, even though this check just came back
@@ -1769,7 +1774,12 @@ restore_all() {
         echo "Skipping '$pp_name': session creation still in progress, not pruning yet."
         kept+=("${pp_target}"$'\t'"${pp_name}")
       elif [[ "$pending_status" == 2 ]]; then
-        echo "Skipping '$pp_name': couldn't check its pending status (pending-file lock contended) -- not pruning it this run." >&2
+        # See the identical branch in the main scan loop above for why
+        # this message stays generic (status 2 covers both lock
+        # contention and an unreadable $PENDING_FILE, and naming only
+        # "lock contended" pointed the user at the wrong recovery path
+        # for the other case).
+        echo "Skipping '$pp_name': couldn't check its pending status (pending-file lock contended, or the pending file itself couldn't be read) -- not pruning it this run." >&2
         kept+=("${pp_target}"$'\t'"${pp_name}")
       else
         echo "Pruning stale entry (no live tmux session): $pp_name"
