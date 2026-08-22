@@ -1008,6 +1008,7 @@ setup() {
   # remote_setup_tmux_mode actually trying to (re)create it -- gets
   # recorded, so the test can confirm that never happens.
   SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\t0-devbox-example-com-foo\n' > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by restore_all below.
@@ -1036,6 +1037,7 @@ setup() {
   # entry were treated as safe, remote_setup would call it, so an empty
   # stub proves it never reaches that point.
   SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\tpair-x; touch /tmp/pwn\n' > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by restore_all below.
@@ -1059,6 +1061,7 @@ setup() {
   # advice for the duplicate-entries case was a dead end for this
   # exact shape).
   SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\t08-devbox-example-com-foo\ndevbox.example.com\t08-devbox-example-com-foo\n' > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by restore_all below.
@@ -1171,6 +1174,47 @@ setup() {
   [ "$(cat "$PENDING_FILE")" = "1"$'\t'"devbox.example.com"$'\t'"3-devbox-example-com-foo" ]
 }
 
+@test "is_pending: returns status 2 (not 1) when the pending lock is contended, distinct from not-pending" {
+  # Regression test: is_pending used to `return 1` for BOTH "definitely
+  # not pending" and "couldn't acquire the lock to check" -- callers had
+  # no way to tell a contended lock apart from a confirmed-absent
+  # marker. Status 2 is a distinct third outcome callers must treat as
+  # "don't know" (see the restore_all test below for the consequence of
+  # not distinguishing this).
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  PENDING_FILE="$CONFIG_DIR/pending"
+  printf '%s\n' "$(date +%s)"$'\t'"devbox.example.com"$'\t'"3-devbox-example-com-foo" > "$PENDING_FILE"
+  mkdir -p "$CONFIG_DIR/pending.lock"
+  run is_pending "devbox.example.com" "3-devbox-example-com-foo"
+  [ "$status" -eq 2 ]
+}
+
+@test "restore_all: does not prune an entry when the pending lock is contended (can't tell if it's pending)" {
+  # Regression test: restore_all treated is_pending's status 1 as an
+  # unconditional "safe to prune" signal -- but status 1 used to also
+  # mean "the pending-file lock was contended, couldn't check at all".
+  # A FRESH, valid pending marker for this exact entry plus a
+  # pre-held pending.lock reproduced the reviewer's exact repro: the
+  # registry entry got deleted anyway, even though it was genuinely
+  # still being created (confirmed live). Held rather than pruned now,
+  # the same "don't know -> don't destroy" rule as an unexpired marker.
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  PENDING_FILE="$CONFIG_DIR/pending"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t3-devbox-example-com-foo\n' > "$REGISTRY"
+  printf '%s\n' "$(date +%s)"$'\t'"devbox.example.com"$'\t'"3-devbox-example-com-foo" > "$PENDING_FILE"
+  mkdir -p "$CONFIG_DIR/pending.lock"
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf ''; }
+  run restore_all
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"couldn't check its pending status"* ]]
+  [[ "$output" != *"Pruning stale entry"* ]]
+  [ "$(cat "$REGISTRY")" = "devbox.example.com"$'\t'"3-devbox-example-com-foo" ]
+}
+
 @test "is_pending: ignores a malformed (non-numeric) timestamp instead of crashing" {
   # Regression test: is_pending fed the timestamp field straight into
   # `(( now - ts ))` with no validation -- a hand-edited or corrupted
@@ -1199,6 +1243,68 @@ setup() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"Pruning stale entry"* ]]
   [ ! -s "$REGISTRY" ]
+}
+
+@test "merge_concurrent_registry_additions: reports a registry line not in the caller's seen set" {
+  # Direct unit test of the helper restore_all/kill_sessions/
+  # kill_all_sessions now use right before their final registry write --
+  # confirms it correctly identifies which current on-disk lines the
+  # caller's earlier read never saw (a concurrent register_session
+  # append), and leaves already-seen ones out.
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-foo\ndevbox.example.com\t2-devbox-example-com-bar\n' > "$REGISTRY"
+  seen=$'\n'"devbox.example.com"$'\t'"1-devbox-example-com-foo"$'\n'
+  result="$(merge_concurrent_registry_additions "$seen")"
+  [ "$result" = "devbox.example.com"$'\t'"2-devbox-example-com-bar" ]
+}
+
+@test "restore_all: fails clearly (does not silently proceed) when id.lock is contended at the final write" {
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
+  mkdir -p "$CONFIG_DIR/id.lock"
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf ''; }
+  run restore_all
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"couldn't acquire the session-ID lock"* ]]
+}
+
+@test "kill_sessions: fails clearly (does not silently proceed) when id.lock is contended at the registry write" {
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
+  mkdir -p "$CONFIG_DIR/id.lock"
+  # shellcheck disable=SC2329 # invoked indirectly, by kill_sessions below.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'pair-1-devbox-example-com-foo\n'
+    fi
+  }
+  run kill_sessions "1"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"couldn't acquire the session-ID lock"* ]]
+}
+
+@test "kill_all_sessions: fails clearly (does not silently proceed) when id.lock is contended at the registry write" {
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
+  mkdir -p "$CONFIG_DIR/id.lock"
+  # shellcheck disable=SC2329 # invoked indirectly, by kill_all_sessions.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      printf 'pair-1-devbox-example-com-foo\n'
+    fi
+  }
+  run kill_all_sessions <<<"y"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"couldn't acquire the session-ID lock"* ]]
 }
 
 # --- attach_session -----------------------------------------------------
@@ -2244,6 +2350,7 @@ setup() {
   # "n" at the confirmation prompt -- this test only needs to check
   # what's OFFERED (the printed list), not actually kill anything.
   SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   : > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by kill_all_sessions.
@@ -2260,6 +2367,7 @@ setup() {
 
 @test "kill_all_sessions: still includes a registry-backed IDed session" {
   SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\t3-devbox-example-com-foo\n' > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by kill_all_sessions.
@@ -2274,6 +2382,7 @@ setup() {
 
 @test "kill_all_sessions: still includes a registry-backed legacy session" {
   SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\tprogramming\n' > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by kill_all_sessions.
@@ -2294,6 +2403,7 @@ setup() {
   # has no live tmux session (e.g. a creation still in flight, or a
   # legitimately-preserved half-alive pair) -- it must survive.
   SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\t3-devbox-example-com-foo\ndevbox.example.com\t5-devbox-example-com-bar\n' > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by kill_all_sessions.
@@ -2315,6 +2425,7 @@ setup() {
   # confirmed live, an unrelated session literally named
   # "pair-1-not-codersync" was killed by `--kill 1`.
   SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   : > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by kill_sessions.
@@ -2334,6 +2445,7 @@ setup() {
   # only required the rest to start with the target's label) -- still
   # not owned without an actual registry entry to back it.
   SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   : > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by kill_sessions.
@@ -2349,6 +2461,7 @@ setup() {
 
 @test "kill_sessions: still kills a session with a matching registry entry" {
   SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\t1-devbox-example-com-foo\n' > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by kill_sessions.
@@ -2370,6 +2483,7 @@ setup() {
   # was left behind after every kill (confirmed live). Entries are now
   # compared by their own PARSED (id, rest), not a reconstructed string.
   SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\t08-devbox-example-com-foo\n' > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by kill_sessions.
@@ -2391,6 +2505,7 @@ setup() {
   # --list-all had just shown as killable. Candidates are now found by
   # parsing/canonicalizing every live session instead.
   SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\t08-devbox-example-com-foo\n' > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by kill_sessions.
@@ -2414,6 +2529,7 @@ setup() {
   # happened to collide with, even though that session was never
   # actually registered.
   SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\t08-devbox-example-com-foo\n' > "$REGISTRY"
   # shellcheck disable=SC2329 # invoked indirectly, by kill_sessions.

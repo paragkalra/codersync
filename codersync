@@ -1396,10 +1396,22 @@ clear_pending() {
 # (confirmed live); such a row is now just treated as not-pending
 # (falling through to whatever restore_all would otherwise do with no
 # marker at all) rather than trusted or crashing.
+#
+# Three distinct return codes, NOT just true/false -- 0 (pending), 1
+# (not pending), and 2 (couldn't tell: the pending-file lock was
+# contended). Collapsing 2 into 1 used to mean a merely-CONTENDED lock
+# looked identical to "definitely not pending" to every caller, so
+# restore_all would prune a genuinely in-flight entry the instant this
+# lock happened to be held by another invocation at the wrong moment --
+# confirmed live: a fresh, valid pending marker plus a pre-held
+# pending.lock still got the registry entry deleted, because the lock
+# failure and "no marker found" were indistinguishable. Callers must
+# treat 2 as "don't know" and default to NOT pruning, same as if it
+# were pending.
 is_pending() {
   local target="$1" name="$2"
   [[ -f "$PENDING_FILE" ]] || return 1
-  acquire_pending_lock || return 1
+  acquire_pending_lock || return 2
   local now line found=1
   now="$(date +%s)"
   while IFS= read -r line; do
@@ -1415,6 +1427,42 @@ is_pending() {
   done < "$PENDING_FILE"
   release_pending_lock
   return "$found"
+}
+
+# Prints (one per line, normalized to "target<TAB>name") every current
+# $REGISTRY entry NOT already accounted for in $1 -- a $'\n'-delimited
+# set of "target<TAB>name" keys the caller collected while reading its
+# OWN (now possibly stale) snapshot of the registry earlier. Meant to
+# be called right before a prune/kill function's final registry
+# rewrite, under id.lock, so a concurrent register_session append that
+# landed after that snapshot was read but before the rewrite commits
+# isn't silently lost -- restore_all/kill_sessions/kill_all_sessions
+# read the registry once (restore_all's read is spread across a whole
+# loop of slow remote calls; kill_sessions/kill_all_sessions's kill
+# calls happen before their one read), decide what to prune/keep from
+# that snapshot, and only THEN rewrite -- id.lock isn't held for that
+# entire span (it would otherwise serialize creation against these,
+# often much slower, commands for far too long), so a `codersync <name>`
+# invocation's register_session append could land in the gap and get
+# silently overwritten by the stale rewrite (confirmed live: an append
+# landing in exactly this window disappeared the moment the reader's
+# rewrite committed). Newly-arrived lines are kept as-is here, not
+# pruned/killed, since nothing in the caller's original pass ever
+# checked their liveness -- the same "don't destroy what you haven't
+# verified" rule as everywhere else in this file.
+merge_concurrent_registry_additions() {
+  local already_seen="$1"
+  touch "$REGISTRY"
+  local line key
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    parse_registry_line "$line"
+    key="${ENTRY_TARGET}"$'\t'"${ENTRY_NAME}"
+    case "$already_seen" in
+      *$'\n'"$key"$'\n'*) continue ;;
+    esac
+    printf '%s\n' "$key"
+  done < "$REGISTRY"
 }
 
 # Reopens a tab for every registry entry that belongs to the currently
@@ -1532,24 +1580,51 @@ restore_all() {
       # would make a later restore-all forget about the surviving pane.
       echo "Skipping '$entry_name': only one of claude/codex is still alive -- not auto-recreating the other with default tools. Run codersync again with this session's name if you want both back."
       kept+=("${entry_target}"$'\t'"${entry_name}")
-    elif is_pending "$entry_target" "$entry_name"; then
-      # No live tmux session yet, but a creation for this exact entry is
-      # still in flight (see mark_pending) -- kept as-is rather than
-      # pruned, since the remote session may finish appearing a moment
-      # later. Not restored either: there's nothing to restore, the
-      # in-flight creation will open its own tab when it completes.
-      echo "Skipping '$entry_name': session creation still in progress, not pruning yet."
-      kept+=("${entry_target}"$'\t'"${entry_name}")
     else
-      echo "Pruning stale entry (no live tmux session): $entry_name"
+      local pending_status=0
+      is_pending "$entry_target" "$entry_name" || pending_status=$?
+      if [[ "$pending_status" == 0 ]]; then
+        # No live tmux session yet, but a creation for this exact entry
+        # is still in flight (see mark_pending) -- kept as-is rather
+        # than pruned, since the remote session may finish appearing a
+        # moment later. Not restored either: there's nothing to
+        # restore, the in-flight creation will open its own tab when it
+        # completes.
+        echo "Skipping '$entry_name': session creation still in progress, not pruning yet."
+        kept+=("${entry_target}"$'\t'"${entry_name}")
+      elif [[ "$pending_status" == 2 ]]; then
+        # is_pending couldn't acquire the pending-file lock, so there's
+        # no way to tell pending apart from not-pending here -- kept
+        # rather than pruned, on the same "don't destroy what you
+        # haven't verified" principle as everywhere else in this
+        # function. Without this, a merely-contended lock looked
+        # identical to "definitely not pending" and pruned a genuinely
+        # in-flight entry (confirmed live).
+        echo "Skipping '$entry_name': couldn't check its pending status (pending-file lock contended) -- not pruning it this run." >&2
+        kept+=("${entry_target}"$'\t'"${entry_name}")
+      else
+        echo "Pruning stale entry (no live tmux session): $entry_name"
+      fi
     fi
   done < "$REGISTRY"
 
+  # Held only for this final re-read-and-write, not the whole function
+  # (which made all those slow remote restore calls above) -- see
+  # merge_concurrent_registry_additions's own comment for why this
+  # exists at all: without it, a `codersync <name>` invocation whose
+  # register_session append landed anywhere during this function's run
+  # would have that append silently wiped out by the stale rewrite
+  # below.
+  acquire_id_lock || exit 1
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && kept+=("$line")
+  done < <(merge_concurrent_registry_additions "$seen_lines")
   if [[ ${#kept[@]} -gt 0 ]]; then
     printf '%s\n' "${kept[@]}" > "$REGISTRY"
   else
     : > "$REGISTRY"
   fi
+  release_id_lock
   if [[ "$skipped_other_target" -gt 0 ]]; then
     echo "Skipped ${skipped_other_target} entry/entries for a different configured box -- re-run --setup for that box, then --restore-all again, to check those."
   fi
@@ -2160,6 +2235,13 @@ kill_sessions() {
   done <<<"$ids"
 
   if [[ ${#killed_pairs[@]} -gt 0 ]]; then
+    # Locked from the read through the write -- the same registry
+    # read-modify-write shape creation/rename_session/adopt_sessions
+    # already guard with id.lock, but this one used to run completely
+    # unsynchronized: a register_session append landing in the gap
+    # between this read and this write got silently overwritten by the
+    # stale rewrite (confirmed live).
+    acquire_id_lock || exit 1
     local -a kept=()
     local line kp drop
     while IFS= read -r line; do
@@ -2182,6 +2264,7 @@ kill_sessions() {
     else
       : > "$REGISTRY"
     fi
+    release_id_lock
   fi
 
   if [[ "$any_killed" == 0 ]]; then
@@ -2241,6 +2324,12 @@ kill_all_sessions() {
     count=$((count + 1))
   done
 
+  # Locked from the read through the write, same as kill_sessions and
+  # for the same reason -- this used to run completely unsynchronized,
+  # so a register_session append landing in the gap between this read
+  # and this write got silently overwritten by the stale rewrite
+  # (confirmed live).
+  acquire_id_lock || exit 1
   touch "$REGISTRY"
   local kept=()
   local line kp drop
@@ -2271,6 +2360,7 @@ kill_all_sessions() {
   else
     : > "$REGISTRY"
   fi
+  release_id_lock
 
   echo "Killed ${count} session(s)."
 }
