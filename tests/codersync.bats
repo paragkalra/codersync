@@ -1231,6 +1231,43 @@ setup() {
   chmod 644 "$PENDING_FILE"
 }
 
+@test "clear_pending: does not truncate the file when the READ fails but the write would have succeeded" {
+  # Regression test: the previous fix wrapped the read+rewrite in
+  # `( set -e; ... ) || rc=$?` -- looks like it should catch either
+  # failure, but a subshell used as the operand of `||` doesn't
+  # reliably honor an explicit `set -e` for INTERMEDIATE command
+  # failures inside it (confirmed in isolation: `( set -e; false; echo
+  # reached_anyway ) || true` prints reached_anyway). A write-only
+  # $PENDING_FILE (chmod 200 -- plausible from a partial/corrupted
+  # permission change, unlike chmod 000 which blocks everything) makes
+  # the READ fail but leaves the file WRITABLE -- so with the subshell
+  # version, execution carried on past the failed read with an empty
+  # `kept`, and the still-succeeding write then truncated the file to
+  # empty, silently discarding this OTHER in-flight session's marker
+  # too, while still returning status 0 (confirmed live: two markers
+  # in the file, "Permission denied" printed, but status=0 and
+  # pending_bytes=0 afterward). The fix attaches `|| rc=$?` directly to
+  # the read and skips the write entirely if the read didn't succeed,
+  # rather than ever risking a rewrite built from an incomplete read.
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  PENDING_FILE="$CONFIG_DIR/pending"
+  printf '%s\n%s\n' \
+    "1"$'\t'"devbox.example.com"$'\t'"3-devbox-example-com-foo" \
+    "2"$'\t'"devbox.example.com"$'\t'"5-devbox-example-com-bar" \
+    > "$PENDING_FILE"
+  chmod 200 "$PENDING_FILE"
+  run clear_pending "3-devbox-example-com-foo"
+  chmod 644 "$PENDING_FILE"
+  [ "$status" -ne 0 ]
+  [ ! -d "$CONFIG_DIR/pending.lock" ]
+  # Both markers survive untouched -- not just "something non-empty":
+  # a truncate-then-partial-rewrite could still pass a bare
+  # non-emptiness check while having lost data.
+  [[ "$(cat "$PENDING_FILE")" == *"3-devbox-example-com-foo"* ]]
+  [[ "$(cat "$PENDING_FILE")" == *"5-devbox-example-com-bar"* ]]
+}
+
 @test "mark_pending: does not clobber an outer id.lock EXIT trap" {
   # Regression test reproducing the dispatch path's EXACT structure:
   # `acquire_id_lock; trap 'release_id_lock' EXIT; ...; mark_pending

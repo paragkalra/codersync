@@ -1386,41 +1386,53 @@ mark_pending() {
 # the same way it did for mark_pending (confirmed live: reproduced with
 # both id.lock AND pending.lock left behind afterward).
 #
-# The read-then-rewrite below runs inside a `( ... ) || rc=$?` subshell
-# rather than guarding the write alone -- the READ can fail too (e.g. a
-# $PENDING_FILE with its permissions corrupted to unreadable), and a
-# redirection failure on `done < "$PENDING_FILE"` isn't exempt from
-# `set -e` the way a while-loop's own condition test is; guarding only
-# the write left this exact case unguarded, still exiting straight past
-# release_pending_lock below (confirmed: first attempt at this fix
-# still failed the "releases the lock even when it fails" test, for
-# read failure rather than write failure). Wrapping the whole risky
-# block catches either failure uniformly, and reports it back to the
-# caller the same way mark_pending's `|| rc=$?` does for its own single
-# risky line.
+# The read and the rewrite below are each individually guarded with
+# their OWN direct `|| rc=$?` (attached straight to the compound
+# `while...done < file` / `printf ... >` statement itself), NOT by
+# wrapping the whole block in a `( set -e; ... ) || rc=$?` subshell --
+# that looks equivalent but isn't: bash's `errexit` exemption for "a
+# compound command used as the operand of `||`" reaches INSIDE a
+# subshell too, silently overriding even an explicit `set -e` inside
+# it, for any INTERMEDIATE command failure that isn't the subshell's
+# very last one. Confirmed directly: `( set -e; false; echo
+# reached_anyway ) || true` prints reached_anyway, despite `set -e`
+# supposedly being active inside the subshell the whole time. With that
+# shape, a $PENDING_FILE that's write-only (chmod 200, plausible from a
+# partial/corrupted permission change, not just the fully-inaccessible
+# chmod 000 case) made the READ below fail, but execution carried on
+# with an empty `kept` regardless -- then the write (which succeeds,
+# since the file IS writable) truncated the file to empty, silently
+# discarding every OTHER in-flight session's marker too, and returned
+# status 0 as if nothing had gone wrong (confirmed live: two markers in
+# the file, "Permission denied" printed, but status=0 and
+# pending_bytes=0 afterward). Attaching `|| rc=$?` directly to each
+# statement instead reliably captures ITS OWN real exit status without
+# relying on `errexit` propagating through anything, and the write is
+# now explicitly skipped entirely if the read already failed -- rather
+# than ever rewriting the file from a `kept` list that might be missing
+# entries the read never got to see.
 clear_pending() {
   local session="$1" rc=0
   acquire_pending_lock || return 1
-  (
-    set -e
-    if [[ -f "$PENDING_FILE" ]]; then
-      local line kept=()
-      while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        local ts="${line%%$'\t'*}" rest="${line#*$'\t'}"
-        local ptarget="${rest%%$'\t'*}" pname="${rest#*$'\t'}"
-        if [[ "$ptarget" == "$SSH_TARGET" && "$pname" == "$session" ]]; then
-          continue
-        fi
-        kept+=("${ts}"$'\t'"${ptarget}"$'\t'"${pname}")
-      done < "$PENDING_FILE"
+  if [[ -f "$PENDING_FILE" ]]; then
+    local line kept=()
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      local ts="${line%%$'\t'*}" rest="${line#*$'\t'}"
+      local ptarget="${rest%%$'\t'*}" pname="${rest#*$'\t'}"
+      if [[ "$ptarget" == "$SSH_TARGET" && "$pname" == "$session" ]]; then
+        continue
+      fi
+      kept+=("${ts}"$'\t'"${ptarget}"$'\t'"${pname}")
+    done < "$PENDING_FILE" || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
       if [[ ${#kept[@]} -gt 0 ]]; then
-        printf '%s\n' "${kept[@]}" > "$PENDING_FILE"
+        printf '%s\n' "${kept[@]}" > "$PENDING_FILE" || rc=$?
       else
-        : > "$PENDING_FILE"
+        : > "$PENDING_FILE" || rc=$?
       fi
     fi
-  ) || rc=$?
+  fi
   release_pending_lock
   return "$rc"
 }
