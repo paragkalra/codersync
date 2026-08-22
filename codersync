@@ -504,13 +504,30 @@ parse_registry_line() {
 # runs (it checks each entry's OWN liveness independently and prunes
 # whichever isn't), so this points there rather than trying to also
 # guess correctly here.
+# `|| [[ -n "$line" ]]` on every REGISTRY/PENDING_FILE read loop in
+# this file (not just this one) -- plain `while IFS= read -r line; do`
+# silently skips the FINAL line of a file with no trailing newline:
+# `read` populates `$line` with whatever it got before hitting EOF, but
+# still returns non-zero (no delimiter found), which the bare `while`
+# treats as "nothing more to read" and discards that last line
+# entirely. $REGISTRY/$PENDING_FILE end up without a trailing newline
+# whenever ANY writer uses `printf '%s'` instead of `printf '%s\n'`,
+# or a manual edit doesn't end in a newline -- confirmed live: with a
+# final registry row missing its trailing newline, find_or_assign_id
+# never saw it and minted a fresh duplicate ID instead of reusing it,
+# and separately, is_pending returned "not pending" for a valid final
+# marker, with clear_pending then truncating that exact marker away
+# while clearing a DIFFERENT session's. This is safe to skip on loops
+# reading a herestring (`<<<"$var"`) instead of a real file -- `<<<`
+# always appends its own trailing newline, so this specific failure
+# mode can't happen there.
 find_or_assign_id() {
   local target="$1" suffix="$2"
   touch "$REGISTRY"
   local line
   local -a id_suffix_matches=()
   local seen=$'\n'
-  while IFS= read -r line; do
+  while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" ]] && continue
     parse_registry_line "$line"
     [[ "$ENTRY_TARGET" != "$target" ]] && continue
@@ -1237,7 +1254,7 @@ session_is_owned() {
   local raw="$1"
   touch "$REGISTRY"
   local line
-  while IFS= read -r line; do
+  while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" ]] && continue
     parse_registry_line "$line"
     [[ "$ENTRY_TARGET" != "$SSH_TARGET" ]] && continue
@@ -1411,12 +1428,17 @@ mark_pending() {
 # now explicitly skipped entirely if the read already failed -- rather
 # than ever rewriting the file from a `kept` list that might be missing
 # entries the read never got to see.
+# See find_or_assign_id's comment for why the read loop below needs
+# `|| [[ -n "$line" ]]` -- confirmed live for this exact function: a
+# final marker with no trailing newline got silently truncated away
+# while clearing a DIFFERENT session's marker, since the read never
+# saw it at all and `kept` was rebuilt without it.
 clear_pending() {
   local session="$1" rc=0
   acquire_pending_lock || return 1
   if [[ -f "$PENDING_FILE" ]]; then
     local line kept=()
-    while IFS= read -r line; do
+    while IFS= read -r line || [[ -n "$line" ]]; do
       [[ -z "$line" ]] && continue
       local ts="${line%%$'\t'*}" rest="${line#*$'\t'}"
       local ptarget="${rest%%$'\t'*}" pname="${rest#*$'\t'}"
@@ -1481,13 +1503,19 @@ clear_pending() {
 # odds of it failing mid-lock (as opposed to failing the up-front
 # acquire, which is already handled) are low enough not to justify
 # reintroducing that clobbering risk.
+#
+# See find_or_assign_id's comment for why the read loop below needs
+# `|| [[ -n "$line" ]]` -- confirmed live for this exact function: a
+# valid, unexpired marker with no trailing newline was never seen at
+# all, so this returned "not pending" for a genuinely in-flight
+# session.
 is_pending() {
   local target="$1" name="$2"
   [[ -f "$PENDING_FILE" ]] || return 1
   acquire_pending_lock || return 2
   local now line found=1
   now="$(date +%s)"
-  while IFS= read -r line; do
+  while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" ]] && continue
     local ts="${line%%$'\t'*}" rest="${line#*$'\t'}"
     local ptarget="${rest%%$'\t'*}" pname="${rest#*$'\t'}"
@@ -1527,7 +1555,7 @@ merge_concurrent_registry_additions() {
   local already_seen="$1"
   touch "$REGISTRY"
   local line key
-  while IFS= read -r line; do
+  while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" ]] && continue
     parse_registry_line "$line"
     key="${ENTRY_TARGET}"$'\t'"${ENTRY_NAME}"
@@ -1567,7 +1595,7 @@ restore_all() {
   local skipped_unsafe=0
   local seen_lines=$'\n'
   local -a provisional_prune=()
-  while IFS= read -r line; do
+  while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" ]] && continue
     parse_registry_line "$line"
     local entry_target="$ENTRY_TARGET" entry_name="$ENTRY_NAME"
@@ -1784,7 +1812,7 @@ resolve_registered_session() {
     fi
     local -a id_matches=()
     local id_seen=$'\n'
-    while IFS= read -r line; do
+    while IFS= read -r line || [[ -n "$line" ]]; do
       [[ -z "$line" ]] && continue
       parse_registry_line "$line"
       [[ "$ENTRY_TARGET" != "$SSH_TARGET" ]] && continue
@@ -1841,7 +1869,7 @@ resolve_registered_session() {
     local suffix="${TARGET_LABEL}-${arg}"
     local -a suffix_matches=()
     local suffix_seen=$'\n'
-    while IFS= read -r line; do
+    while IFS= read -r line || [[ -n "$line" ]]; do
       [[ -z "$line" ]] && continue
       parse_registry_line "$line"
       [[ "$ENTRY_TARGET" != "$SSH_TARGET" ]] && continue
@@ -1888,7 +1916,7 @@ resolve_registered_session() {
     # a normal client-created session with the same $arg text still
     # wins if both happen to exist.
     if [[ "$found" == 0 ]]; then
-      while IFS= read -r line; do
+      while IFS= read -r line || [[ -n "$line" ]]; do
         [[ -z "$line" ]] && continue
         parse_registry_line "$line"
         [[ "$ENTRY_TARGET" != "$SSH_TARGET" ]] && continue
@@ -2032,7 +2060,7 @@ rename_session() {
   # what actually needs rejecting here.
   touch "$REGISTRY"
   local line new_suffix="${TARGET_LABEL}-${new_name}"
-  while IFS= read -r line; do
+  while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" ]] && continue
     parse_registry_line "$line"
     [[ "$ENTRY_TARGET" != "$SSH_TARGET" ]] && continue
@@ -2137,7 +2165,7 @@ EOF
   fi
 
   local -a kept=()
-  while IFS= read -r line; do
+  while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" ]] && continue
     parse_registry_line "$line"
     if [[ "$ENTRY_TARGET" == "$SSH_TARGET" && "$ENTRY_NAME" == "$old_entry_name" ]]; then
@@ -2372,7 +2400,7 @@ kill_sessions() {
   if [[ ${#killed_pairs[@]} -gt 0 ]]; then
     local -a kept=()
     local line kp drop
-    while IFS= read -r line; do
+    while IFS= read -r line || [[ -n "$line" ]]; do
       [[ -z "$line" ]] && continue
       parse_registry_line "$line"
       drop=0
@@ -2474,7 +2502,7 @@ kill_all_sessions() {
   touch "$REGISTRY"
   local kept=()
   local line kp drop
-  while IFS= read -r line; do
+  while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" ]] && continue
     parse_registry_line "$line"
     drop=0

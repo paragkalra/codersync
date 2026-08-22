@@ -386,6 +386,26 @@ setup() {
   [ "$(find_or_assign_id "devbox.example.com" "devbox-example-com-foo")" = "5-devbox-example-com-foo" ]
 }
 
+@test "find_or_assign_id: reuses an existing entry even when the registry has no trailing newline" {
+  # Regression test: `while IFS= read -r line; do ... done < "$REGISTRY"`
+  # silently skips the FINAL line of a file that doesn't end in a
+  # newline -- `read` still populates `$line` with what it read before
+  # hitting EOF, but returns non-zero (no delimiter found), which a
+  # bare `while` treats as "nothing left" and drops that line
+  # entirely. $REGISTRY ends up without a trailing newline whenever any
+  # writer uses `printf '%s'` instead of `printf '%s\n'` for its LAST
+  # line (this test uses `printf '%s'` deliberately, to reproduce
+  # exactly that shape) -- confirmed live: with a final registry row
+  # missing its trailing newline, find_or_assign_id never saw it and
+  # minted a fresh duplicate ID ("1-...") instead of reusing the
+  # existing one ("2-...").
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  NEXT_ID_FILE="$CONFIG_DIR/next_id"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf '%s' "devbox.example.com"$'\t'"2-devbox-example-com-bar" > "$REGISTRY"
+  [ "$(find_or_assign_id "devbox.example.com" "devbox-example-com-bar")" = "2-devbox-example-com-bar" ]
+}
+
 @test "find_or_assign_id: preserves a leading zero instead of reconstructing the canonical form" {
   # Regression test: this used to return only the CANONICAL id (e.g.
   # "8" for a "08-..." entry), and the caller reconstructed
@@ -1136,6 +1156,38 @@ setup() {
   run ! is_pending "other.example.com" "3-devbox-example-com-foo"
   clear_pending "3-devbox-example-com-foo"
   run ! is_pending "devbox.example.com" "3-devbox-example-com-foo"
+}
+
+@test "is_pending: sees a valid marker even when the pending file has no trailing newline" {
+  # Regression test: see find_or_assign_id's identical test for the
+  # general shape of this bug (`while IFS= read -r line; do ... done <
+  # file` silently drops a file's final line if it doesn't end in a
+  # newline). Confirmed live for this exact function: a valid,
+  # unexpired marker with no trailing newline (this test's
+  # `printf '%s'`, deliberately without the usual trailing \n) was
+  # never seen by the read loop at all, so this returned "not pending"
+  # for a genuinely in-flight session.
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  PENDING_FILE="$CONFIG_DIR/pending"
+  printf '%s' "$(date +%s)"$'\t'"devbox.example.com"$'\t'"3-devbox-example-com-foo" > "$PENDING_FILE"
+  is_pending "devbox.example.com" "3-devbox-example-com-foo"
+}
+
+@test "clear_pending: does not lose a DIFFERENT session's marker with no trailing newline" {
+  # Same underlying bug as is_pending's test above, with a more severe
+  # consequence here: the OTHER session's marker (no trailing newline,
+  # this test's `printf '%s'`) was never read at all, so it was simply
+  # missing from `kept` when the file got rewritten -- silently
+  # discarding a genuinely in-flight session's marker while clearing a
+  # completely unrelated one's.
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  PENDING_FILE="$CONFIG_DIR/pending"
+  printf '%s\n' "$(date +%s)"$'\t'"devbox.example.com"$'\t'"3-devbox-example-com-foo" > "$PENDING_FILE"
+  printf '%s' "$(date +%s)"$'\t'"devbox.example.com"$'\t'"5-devbox-example-com-bar" >> "$PENDING_FILE"
+  clear_pending "3-devbox-example-com-foo"
+  is_pending "devbox.example.com" "5-devbox-example-com-bar"
 }
 
 @test "mark_pending: fails clearly when the pending-file lock is already held, without touching the file" {
@@ -2560,6 +2612,18 @@ setup() {
   SSH_TARGET="devbox.example.com"
   REGISTRY="$BATS_TEST_TMPDIR/registry"
   printf 'devbox.example.com\tdevbox-review-sam-1746\n' > "$REGISTRY"
+  session_is_owned "devbox-review-sam-1746"
+}
+
+@test "session_is_owned: true for a matching entry even when the registry has no trailing newline" {
+  # Regression test: see find_or_assign_id's identical test for the
+  # general shape of this bug (a `while IFS= read -r line; do ...` loop
+  # over $REGISTRY silently drops the file's final line if it doesn't
+  # end in a newline). If that final, unseen line happens to be the
+  # only entry matching this session, it's wrongly treated as unowned.
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf '%s' "devbox.example.com"$'\t'"devbox-review-sam-1746" > "$REGISTRY"
   session_is_owned "devbox-review-sam-1746"
 }
 
