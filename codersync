@@ -1513,7 +1513,7 @@ is_pending() {
   local target="$1" name="$2"
   [[ -f "$PENDING_FILE" ]] || return 1
   acquire_pending_lock || return 2
-  local now line found=1
+  local now line found=1 read_rc=0
   now="$(date +%s)"
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" ]] && continue
@@ -1525,9 +1525,25 @@ is_pending() {
       found=0
       break
     fi
-  done < "$PENDING_FILE"
+  done < "$PENDING_FILE" || read_rc=$?
   release_pending_lock
-  return "$found"
+  # A read failure (e.g. $PENDING_FILE existing but unreadable -- chmod
+  # 000, or permissions otherwise corrupted) used to be indistinguishable
+  # from "read the whole file, found nothing": `found` just stayed at
+  # its default of 1, so this returned 1 ("confirmed not pending") the
+  # same as a clean, successful read that legitimately found no marker.
+  # restore_all then pruned the row outright -- confirmed live: a valid,
+  # fresh marker plus a chmod 000 $PENDING_FILE still got the registry
+  # entry deleted, status 0, no different from every other "genuinely
+  # dead" case. `found` is checked FIRST, before `read_rc` -- a match
+  # found via `break` before a LATER read attempt might have failed
+  # still counts as a definite "yes, pending", the same as ignoring
+  # read_rc entirely would for that case; only "found nothing" is
+  # ambiguous between "confirmed absent" and "couldn't tell", and only
+  # THEN does read_rc decide which.
+  [[ "$found" -eq 0 ]] && return 0
+  [[ "$read_rc" -ne 0 ]] && return 2
+  return 1
 }
 
 # Prints (one per line, normalized to "target<TAB>name") every current

@@ -1419,6 +1419,48 @@ setup() {
   [ "$(cat "$REGISTRY")" = "devbox.example.com"$'\t'"3-devbox-example-com-foo" ]
 }
 
+@test "is_pending: returns status 2 (not 1) when the pending file itself is unreadable" {
+  # Regression test: distinct from the lock-contention case above --
+  # this is $PENDING_FILE existing but unreadable (chmod 000), which a
+  # PREVIOUS round's fix for the lock-contention case didn't cover.
+  # `found` stayed at its default of 1 when the read failed outright
+  # (couldn't even open the file), so this returned 1 ("confirmed not
+  # pending") -- indistinguishable from a clean read that legitimately
+  # found nothing (confirmed live, again: a valid, fresh marker plus a
+  # chmod 000 $PENDING_FILE still returned 1).
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  PENDING_FILE="$CONFIG_DIR/pending"
+  printf '%s\n' "$(date +%s)"$'\t'"devbox.example.com"$'\t'"3-devbox-example-com-foo" > "$PENDING_FILE"
+  chmod 000 "$PENDING_FILE"
+  run is_pending "devbox.example.com" "3-devbox-example-com-foo"
+  chmod 644 "$PENDING_FILE"
+  [ "$status" -eq 2 ]
+}
+
+@test "restore_all: does not prune an entry when the pending file itself is unreadable" {
+  # Same regression as is_pending's test above, end-to-end: a FRESH,
+  # valid pending marker for this exact entry plus a chmod 000
+  # $PENDING_FILE reproduced the reviewer's exact repro -- the registry
+  # entry got deleted anyway (status 0), even though it was genuinely
+  # still being created (confirmed live).
+  SSH_TARGET="devbox.example.com"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  PENDING_FILE="$CONFIG_DIR/pending"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t3-devbox-example-com-foo\n' > "$REGISTRY"
+  printf '%s\n' "$(date +%s)"$'\t'"devbox.example.com"$'\t'"3-devbox-example-com-foo" > "$PENDING_FILE"
+  chmod 000 "$PENDING_FILE"
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf ''; }
+  run restore_all
+  chmod 644 "$PENDING_FILE"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"couldn't check its pending status"* ]]
+  [[ "$output" != *"Pruning stale entry"* ]]
+  [ "$(cat "$REGISTRY")" = "devbox.example.com"$'\t'"3-devbox-example-com-foo" ]
+}
+
 @test "is_pending: ignores a malformed (non-numeric) timestamp instead of crashing" {
   # Regression test: is_pending fed the timestamp field straight into
   # `(( now - ts ))` with no validation -- a hand-edited or corrupted
