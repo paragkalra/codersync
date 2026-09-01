@@ -646,7 +646,7 @@ setup() {
   CONFIG_FILE="$BATS_TEST_TMPDIR/config"
   printf 'SSH_TARGET=devbox.example.com\nREMOTE_DIR=~/custom\n' > "$CONFIG_FILE"
   TARGET_OVERRIDE="otherbox.example.com"
-  REMOTE_DIR_OVERRIDE=""
+  SAW_TARGET_OVERRIDE=1
   load_config
   # shellcheck disable=SC2031 # set by load_config above, not visible
   # statically to this checker.
@@ -659,9 +659,11 @@ setup() {
   CONFIG_FILE="$BATS_TEST_TMPDIR/config"
   printf 'SSH_TARGET=devbox.example.com\n' > "$CONFIG_FILE"
   TARGET_OVERRIDE="otherbox.example.com"
+  SAW_TARGET_OVERRIDE=1
   # shellcheck disable=SC2088 # intentional: literal `~`, expanded later
   # by the REMOTE shell, not by this one -- same as REMOTE_DIR itself.
   REMOTE_DIR_OVERRIDE="~/otherdir"
+  SAW_REMOTE_DIR_OVERRIDE=1
   load_config
   # shellcheck disable=SC2031 # set by load_config above, not visible
   # statically to this checker.
@@ -675,9 +677,9 @@ setup() {
   CONFIG_FILE="$BATS_TEST_TMPDIR/config"
   # shellcheck disable=SC2088 # intentional: testing the literal string.
   printf 'SSH_TARGET=devbox.example.com\nREMOTE_DIR=~/original\n' > "$CONFIG_FILE"
-  TARGET_OVERRIDE=""
   # shellcheck disable=SC2088 # intentional literal, see above.
   REMOTE_DIR_OVERRIDE="~/onceoff"
+  SAW_REMOTE_DIR_OVERRIDE=1
   load_config
   # shellcheck disable=SC2031 # set by load_config above, not visible
   # statically to this checker.
@@ -691,9 +693,7 @@ setup() {
   CONFIG_FILE="$BATS_TEST_TMPDIR/config"
   printf 'SSH_TARGET=devbox.example.com\n' > "$CONFIG_FILE"
   TARGET_OVERRIDE="bad;target"
-  # shellcheck disable=SC2034 # read by load_config below, not visible
-  # statically to this checker.
-  REMOTE_DIR_OVERRIDE=""
+  SAW_TARGET_OVERRIDE=1
   run load_config
   [ "$status" -eq 1 ]
   [[ "$output" == *"invalid -T/--target"* ]]
@@ -702,10 +702,42 @@ setup() {
 @test "load_config: rejects an invalid REMOTE_DIR_OVERRIDE" {
   CONFIG_FILE="$BATS_TEST_TMPDIR/config"
   printf 'SSH_TARGET=devbox.example.com\n' > "$CONFIG_FILE"
+  REMOTE_DIR_OVERRIDE='bad;dir'
+  SAW_REMOTE_DIR_OVERRIDE=1
+  run load_config
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"invalid --remote-dir"* ]]
+}
+
+@test "load_config: -T '' (empty value) is rejected, not silently treated as no override" {
+  # Regression test: the pre-pass only checked for a MISSING value or an
+  # option-shaped one ("$2" == -*) -- a bare -T with an empty string
+  # slipped through both checks, setting TARGET_OVERRIDE to an empty
+  # value. load_config used to gate applying the override on
+  # `-n "$TARGET_OVERRIDE"`, which reads an empty string the same as
+  # "not provided" and skipped validating it entirely -- a bare
+  # `-T ''` before --list-all ran against the configured default with
+  # no error at all (confirmed live). SAW_TARGET_OVERRIDE=1 means the
+  # flag really was given, so this must now reach validate_ssh_target
+  # (which correctly rejects an empty string) instead of being ignored.
+  CONFIG_FILE="$BATS_TEST_TMPDIR/config"
+  printf 'SSH_TARGET=devbox.example.com\n' > "$CONFIG_FILE"
+  TARGET_OVERRIDE=""
   # shellcheck disable=SC2034 # read by load_config below, not visible
   # statically to this checker.
-  TARGET_OVERRIDE=""
-  REMOTE_DIR_OVERRIDE='bad;dir'
+  SAW_TARGET_OVERRIDE=1
+  run load_config
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"invalid -T/--target"* ]]
+}
+
+@test "load_config: --remote-dir '' (empty value) is rejected, not silently treated as no override" {
+  CONFIG_FILE="$BATS_TEST_TMPDIR/config"
+  printf 'SSH_TARGET=devbox.example.com\n' > "$CONFIG_FILE"
+  REMOTE_DIR_OVERRIDE=""
+  # shellcheck disable=SC2034 # read by load_config below, not visible
+  # statically to this checker.
+  SAW_REMOTE_DIR_OVERRIDE=1
   run load_config
   [ "$status" -eq 1 ]
   [[ "$output" == *"invalid --remote-dir"* ]]
@@ -1096,12 +1128,84 @@ setup() {
   [ "$ENTRY_NAME" = "my-session" ]
 }
 
-@test "parse_registry_line: bare (pre-migration) entry takes the current target" {
+@test "parse_registry_line: bare (pre-migration) entry falls back to SSH_TARGET when DEFAULT_SSH_TARGET is unset" {
+  # DEFAULT_SSH_TARGET is what load_config() actually populates in real
+  # usage (see the next test) -- this covers the fallback path for
+  # callers that set SSH_TARGET directly without going through
+  # load_config at all (e.g. most of the other tests in this file).
   # shellcheck disable=SC2034 # read by parse_registry_line below.
   SSH_TARGET="devbox.example.com"
   parse_registry_line "my-session"
   [ "$ENTRY_TARGET" = "devbox.example.com" ]
   [ "$ENTRY_NAME" = "my-session" ]
+}
+
+@test "parse_registry_line: bare entry binds to DEFAULT_SSH_TARGET, not SSH_TARGET, when -T is in effect" {
+  # Regression test: -T reassigns $SSH_TARGET for the rest of the
+  # current command (see load_config's own comment), but a bare legacy
+  # row predates -T entirely and has nothing to do with whichever OTHER
+  # box a given -T invocation happens to be reaching this time. Using
+  # $SSH_TARGET here let a bare row bound to the real configured
+  # default get silently reattributed to whatever box -T pointed at
+  # instead -- confirmed live: with a bare row already registered on
+  # the configured default (boxA), `codersync -T boxB.example.com
+  # --restore-all` saw that row as belonging to boxB, found no live
+  # session for it there, and pruned it outright, deleting a
+  # perfectly live boxA registration because of an unrelated one-off
+  # command aimed at a completely different box. DEFAULT_SSH_TARGET
+  # (captured by load_config before applying -T) is what this must
+  # resolve to instead.
+  # shellcheck disable=SC2030,SC2034 # SC2030: bats-subshell false
+  # positive, not actually isolated here. SC2034: read by
+  # parse_registry_line below.
+  SSH_TARGET="boxB.example.com"
+  # shellcheck disable=SC2030,SC2034 # see above.
+  DEFAULT_SSH_TARGET="boxA.example.com"
+  parse_registry_line "my-session"
+  [ "$ENTRY_TARGET" = "boxA.example.com" ]
+  [ "$ENTRY_NAME" = "my-session" ]
+}
+
+@test "load_config: DEFAULT_SSH_TARGET is the configured default, unaffected by -T" {
+  CONFIG_FILE="$BATS_TEST_TMPDIR/config"
+  printf 'SSH_TARGET=boxA.example.com\n' > "$CONFIG_FILE"
+  # shellcheck disable=SC2034 # read by load_config below, not visible
+  # statically to this checker.
+  TARGET_OVERRIDE="boxB.example.com"
+  # shellcheck disable=SC2034 # read by load_config below, not visible
+  # statically to this checker.
+  SAW_TARGET_OVERRIDE=1
+  load_config
+  # shellcheck disable=SC2031 # set by load_config above, not visible
+  # statically to this checker.
+  [ "$SSH_TARGET" = "boxB.example.com" ]
+  # shellcheck disable=SC2031 # set by load_config above, not visible
+  # statically to this checker.
+  [ "$DEFAULT_SSH_TARGET" = "boxA.example.com" ]
+}
+
+@test "restore_all: a bare legacy row on the real default survives a -T run against a different box" {
+  # End-to-end version of parse_registry_line's own test above --
+  # confirms the fix actually closes the reviewer's exact reproduction:
+  # a bare (no-tab) row that predates the per-target registry format,
+  # sitting on the CONFIGURED DEFAULT (boxA), must not be mistaken for
+  # a boxB entry (and pruned as "not live there") just because THIS one
+  # command happens to be aimed at boxB via -T.
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'my-old-job\n' > "$REGISTRY"
+  SSH_TARGET="boxB.example.com"
+  TARGET_LABEL="boxb-example-com"
+  DEFAULT_SSH_TARGET="boxA.example.com"
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf ''; }
+  run restore_all
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"Pruning stale entry"* ]]
+  # Kept, not pruned -- and normalized to the per-target tagged format
+  # in the process (existing behavior for any "different target" entry
+  # restore_all preserves, bare or not; the row's SURVIVAL is what this
+  # test is actually about).
+  [ "$(cat "$REGISTRY")" = "boxA.example.com"$'\t'"my-old-job" ]
 }
 
 # --- restore_all: unsafe-entry defense --------------------------------
@@ -3617,6 +3721,55 @@ setup() {
   run "${BATS_TEST_DIRNAME}/../codersync" --remote-dir
   [ "$status" -eq 1 ]
   [[ "$output" == *"--remote-dir requires a value"* ]]
+}
+
+@test "dispatch: -T with an empty value is rejected, not silently ignored" {
+  # Regression test: `-T ""` has a value (an empty string), so the
+  # pre-pass's own arity check (`$# -lt 2 || "$2" == -*`) doesn't catch
+  # it -- it slips through as a "provided" flag with an empty value.
+  # `codersync -T "" --list-all` used to just run against the
+  # configured default with no error, since load_config's `-n
+  # "$TARGET_OVERRIDE"` check reads an empty string the same as "-T
+  # wasn't given at all" (confirmed live). Uses FAKE_HOME, not
+  # CONFIG_DIR directly -- see the -T position-independence tests above
+  # for why (codersync runs as a genuinely separate process here, not
+  # sourced).
+  FAKE_HOME="$BATS_TEST_TMPDIR/home"
+  mkdir -p "$FAKE_HOME/.config/codersync"
+  printf 'SSH_TARGET=devbox.example.com\n' > "$FAKE_HOME/.config/codersync/config"
+  : > "$FAKE_HOME/.codersync_sessions"
+  run bash -c '
+    set -euo pipefail
+    HOME="'"$FAKE_HOME"'"
+    "'"${BATS_TEST_DIRNAME}"'/../codersync" -T "" --list-all
+  '
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"invalid -T/--target"* ]]
+}
+
+@test "dispatch: --remote-dir with an empty value is rejected, not silently ignored" {
+  FAKE_HOME="$BATS_TEST_TMPDIR/home"
+  mkdir -p "$FAKE_HOME/.config/codersync"
+  printf 'SSH_TARGET=devbox.example.com\n' > "$FAKE_HOME/.config/codersync/config"
+  : > "$FAKE_HOME/.codersync_sessions"
+  run bash -c '
+    set -euo pipefail
+    HOME="'"$FAKE_HOME"'"
+    "'"${BATS_TEST_DIRNAME}"'/../codersync" --remote-dir "" --list-all
+  '
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"invalid --remote-dir"* ]]
+}
+
+@test "dispatch: --setup rejects -T \"\" the same as a real -T value" {
+  # Regression test: `codersync --setup host.example.com -T ""` used to
+  # succeed (the empty value made SAW_TARGET_OVERRIDE's predecessor,
+  # `-n "$TARGET_OVERRIDE"`, false, so the --setup/--local rejection
+  # check never fired) instead of being rejected the same way a real
+  # -T value is for --setup (confirmed live).
+  run "${BATS_TEST_DIRNAME}/../codersync" --setup host.example.com -T ""
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"doesn't support -T/--target or --remote-dir"* ]]
 }
 
 @test "dispatch: -T overrides the target regardless of position (before the subcommand)" {

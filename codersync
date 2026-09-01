@@ -151,14 +151,35 @@ REGISTRY="$HOME/.codersync_sessions"
 NEXT_ID_FILE="$CONFIG_DIR/next_id"
 PENDING_FILE="$CONFIG_DIR/pending"
 
-# Set (non-empty) only when -T/--target or --remote-dir is given on the
-# command line -- see the dispatch case's own pre-pass comment for how
-# these get populated, and load_config()'s own comment for how they're
-# applied. Declared here (empty) so `set -u` doesn't choke on referencing
-# them before that pre-pass runs, e.g. when a test sources this file
-# directly without going through the dispatch case at all.
+# Populated by the dispatch case's own pre-pass when -T/--target or
+# --remote-dir is given on the command line -- see that pre-pass's own
+# comment for how, and load_config()'s own comment for how they're
+# applied. Declared here (empty/0) so `set -u` doesn't choke on
+# referencing them before that pre-pass runs, e.g. when a test sources
+# this file directly without going through the dispatch case at all.
+#
+# SAW_TARGET_OVERRIDE/SAW_REMOTE_DIR_OVERRIDE are separate booleans, NOT
+# just "is TARGET_OVERRIDE/REMOTE_DIR_OVERRIDE non-empty" -- `-T ""` is a
+# real, explicit (if useless) command-line argument, distinct from -T
+# not being given at all, and the two need to be told apart: an empty
+# VALUE should still be validated and rejected (an empty string is never
+# a valid ssh-target or remote-dir), not silently treated the same as
+# "no override requested" the way a plain `-n` check on the value would
+# (confirmed live: `codersync -T "" --list-all` ran against the
+# configured default with no error at all, and
+# `codersync --setup host.example.com -T ""` succeeded instead of being
+# rejected the same way a real -T value is for --setup).
 TARGET_OVERRIDE=""
 REMOTE_DIR_OVERRIDE=""
+SAW_TARGET_OVERRIDE=0
+SAW_REMOTE_DIR_OVERRIDE=0
+
+# The SSH_TARGET that was actually configured (via --setup, i.e. what's
+# on disk in $CONFIG_FILE), captured by load_config() BEFORE it applies
+# any -T override -- see parse_registry_line()'s own comment for why
+# this needs to be tracked separately from $SSH_TARGET, which -T
+# reassigns for the rest of the current command.
+DEFAULT_SSH_TARGET=""
 
 # How long a pending marker (see mark_pending below) is honored before
 # restore_all treats it as stale and prunable like any other dead entry.
@@ -482,16 +503,34 @@ parse_numbered_session() {
 
 # Parses one registry line into ENTRY_TARGET/ENTRY_NAME globals. Lines
 # from before the per-target format existed are bare names with no tab
-# -- treated as belonging to the current target (a one-time migration
-# assumption; see register_session()/restore_all() below). Pulled out
-# as its own function so it's unit-testable in isolation.
+# -- treated as belonging to $DEFAULT_SSH_TARGET (a one-time migration
+# assumption; see register_session()/restore_all() below), falling back
+# to $SSH_TARGET if DEFAULT_SSH_TARGET was never set (load_config()
+# never ran -- e.g. a test that sets $SSH_TARGET directly without going
+# through it, matching this function's behavior before
+# DEFAULT_SSH_TARGET existed). Pulled out as its own function so it's
+# unit-testable in isolation.
+#
+# Deliberately $DEFAULT_SSH_TARGET, NOT $SSH_TARGET -- -T reassigns
+# $SSH_TARGET for the rest of the current command, but a bare legacy
+# row predates -T entirely and has nothing to do with whichever OTHER
+# box a given -T invocation happens to be reaching this time. Using
+# $SSH_TARGET here let a bare row bound to your real configured default
+# get silently reattributed to whatever box -T pointed at instead --
+# confirmed live: with a bare row already registered on the configured
+# default (boxA), `codersync -T boxB.example.com --restore-all` saw
+# that row as belonging to boxB (since ENTRY_TARGET was being read as
+# $SSH_TARGET, which -T had just reassigned to boxB), found no live
+# session for it on boxB, and pruned it outright -- deleting a
+# perfectly live boxA registration because of an unrelated one-off
+# command aimed at a completely different box.
 parse_registry_line() {
   local line="$1"
   if [[ "$line" == *$'\t'* ]]; then
     ENTRY_TARGET="${line%%$'\t'*}"
     ENTRY_NAME="${line#*$'\t'}"
   else
-    ENTRY_TARGET="$SSH_TARGET"
+    ENTRY_TARGET="${DEFAULT_SSH_TARGET:-$SSH_TARGET}"
     ENTRY_NAME="$line"
   fi
 }
@@ -643,6 +682,14 @@ load_config() {
     echo "Config at $CONFIG_FILE has an invalid SSH_TARGET ('${SSH_TARGET}'). Re-run: codersync --setup <ssh-target> [remote-dir]" >&2
     exit 1
   fi
+  # Captured BEFORE any -T override is applied below -- this is what
+  # parse_registry_line() uses for legacy bare (no-tab) registry rows,
+  # deliberately NOT $SSH_TARGET itself (see that function's own
+  # comment for the live bug this fixed: -T reassigning $SSH_TARGET for
+  # the rest of this command used to make a bare row look like it
+  # belonged to whatever OTHER box -T was reaching this time, getting
+  # it silently pruned as "not live there").
+  DEFAULT_SSH_TARGET="$SSH_TARGET"
 
   if [[ "$saw_dir" == 1 && -n "$raw_dir" ]]; then
     # setup() writes this value via `printf '%q'`, which backslash-
@@ -673,7 +720,19 @@ load_config() {
   # target already calls load_config() first. Validated the same way
   # setup() validates a brand-new target/remote-dir, since these never
   # went through setup() at all for this invocation.
-  if [[ -n "$TARGET_OVERRIDE" ]]; then
+  #
+  # Gated on SAW_TARGET_OVERRIDE/SAW_REMOTE_DIR_OVERRIDE, NOT
+  # `-n "$TARGET_OVERRIDE"`/`-n "$REMOTE_DIR_OVERRIDE"` -- a bare
+  # `-T ""` sets TARGET_OVERRIDE to an empty string, which `-n` reads as
+  # "no override requested" and skips validating entirely, silently
+  # running against the configured default instead (confirmed live:
+  # `codersync -T "" --list-all` did exactly that, with no error). The
+  # SAW_* flags mean "this flag was given, value or not," so an empty
+  # value still reaches validate_ssh_target/validate_remote_dir below --
+  # both correctly reject an empty string (their patterns require at
+  # least one character) -- instead of being treated as if -T/
+  # --remote-dir were never mentioned at all.
+  if [[ "$SAW_TARGET_OVERRIDE" == 1 ]]; then
     if ! validate_ssh_target "$TARGET_OVERRIDE"; then
       echo "codersync: invalid -T/--target '${TARGET_OVERRIDE}': only letters, digits, and . _ - @ are allowed." >&2
       exit 1
@@ -689,7 +748,7 @@ load_config() {
     # otherbox at all).
     REMOTE_DIR="~"
   fi
-  if [[ -n "$REMOTE_DIR_OVERRIDE" ]]; then
+  if [[ "$SAW_REMOTE_DIR_OVERRIDE" == 1 ]]; then
     if ! validate_remote_dir "$REMOTE_DIR_OVERRIDE"; then
       echo "codersync: invalid --remote-dir '${REMOTE_DIR_OVERRIDE}': only letters, digits, and . _ - / ~ are allowed." >&2
       exit 1
@@ -3654,6 +3713,7 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       TARGET_OVERRIDE="$2"
+      SAW_TARGET_OVERRIDE=1
       shift 2
       ;;
     --remote-dir)
@@ -3662,6 +3722,7 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       REMOTE_DIR_OVERRIDE="$2"
+      SAW_REMOTE_DIR_OVERRIDE=1
       shift 2
       ;;
     *)
@@ -3696,8 +3757,15 @@ fi
 # already gone from "$@" by the time --setup's own arity check (and its
 # own separate positional [remote-dir] handling) ever ran, with no
 # error at all pointing at what happened to those two tokens.
+#
+# Checked via SAW_TARGET_OVERRIDE/SAW_REMOTE_DIR_OVERRIDE, NOT
+# `-n "$TARGET_OVERRIDE"` -- a bare `-T ""` sets TARGET_OVERRIDE to an
+# empty string, which `-n` reads as "not provided" and would let sail
+# straight through uncaught (confirmed live:
+# `codersync --setup host.example.com -T ""` used to succeed instead of
+# being rejected the same way a real -T value is here).
 if [[ ("${1:-}" == "--setup" || "${1:-}" == "-s" || "${1:-}" == "--local" || "${1:-}" == "-L") \
-      && (-n "$TARGET_OVERRIDE" || -n "$REMOTE_DIR_OVERRIDE") ]]; then
+      && ("$SAW_TARGET_OVERRIDE" == 1 || "$SAW_REMOTE_DIR_OVERRIDE" == 1) ]]; then
   echo "codersync: ${1:-} doesn't support -T/--target or --remote-dir -- it works with its own <ssh-target>/[remote-dir] arguments directly, not the current target." >&2
   exit 1
 fi
