@@ -1827,6 +1827,69 @@ setup() {
   [ -z "$(all_registry_targets)" ]
 }
 
+@test "all_registry_targets: skips an option-shaped poisoned target instead of emitting it" {
+  # Regression test: a normal restore_all/list_all_sessions run only
+  # ever touches the SINGLE currently-configured target, which was
+  # already validated once by --setup or by -T's own load_config check
+  # before ever reaching a real ssh call. --all-targets loops targets
+  # pulled straight out of the registry instead, with no such
+  # guarantee -- a poisoned or legacy-malformed line could have an
+  # option-shaped string like "-oProxyCommand=sh" as its target field,
+  # which would otherwise reach `ssh` as a bare positional argument and
+  # get read as ssh's OWN option instead of a hostname (confirmed live:
+  # this is exactly how a stale registry row turns into arbitrary
+  # remote command execution). The poisoned target must never appear in
+  # the ENUMERATED output (stdout, what callers actually loop over) --
+  # the warning naming it on stderr is fine, that's diagnostic text, not
+  # something fed back into another command.
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'boxA\t1-boxA-foo\n-oProxyCommand=sh\t2-bad-bar\n' > "$REGISTRY"
+  stdout_only="$(all_registry_targets 2>/dev/null)"
+  warning="$(all_registry_targets 2>&1 >/dev/null)"
+  [[ "$stdout_only" == *"boxA"* ]]
+  [[ "$stdout_only" != *"ProxyCommand"* ]]
+  [[ "$warning" == *"Skipping invalid/unsafe registry target"* ]]
+}
+
+@test "all_registry_targets: skips a target with an internal option-injection character" {
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'good.example.com\t1-good-foo\nbad=target\t2-bad-bar\n' > "$REGISTRY"
+  stdout_only="$(all_registry_targets 2>/dev/null)"
+  [[ "$stdout_only" == *"good.example.com"* ]]
+  [[ "$stdout_only" != *"bad=target"* ]]
+}
+
+@test "restore_all_all_targets: never passes a poisoned registry target to ssh" {
+  # End-to-end version of all_registry_targets's own poisoned-target
+  # tests above: confirms the injection vector is actually closed at
+  # the point that matters (ssh is never invoked with the bad value at
+  # all), not just that the enumerator's output looks right in
+  # isolation.
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  printf 'boxA\t1-boxA-foo\n-oProxyCommand=sh\t2-bad-bar\n' > "$REGISTRY"
+  SSH_TARGET="boxA"
+  TARGET_LABEL="boxa"
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all_all_targets below.
+  ssh() {
+    echo "ssh-called-with:$*" >> "$BATS_TEST_TMPDIR/ssh_calls"
+    [[ "$*" == *"list-sessions"* ]] && printf 'pair-1-boxA-foo\n'
+    return 0
+  }
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all_all_targets below.
+  remote_setup_tmux_mode() { :; }
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all_all_targets below.
+  open_tab_tmux_mode() { :; }
+  run restore_all_all_targets
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"boxA"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/ssh_calls" ] || [[ "$(cat "$BATS_TEST_TMPDIR/ssh_calls")" != *"ProxyCommand"* ]]
+  # The poisoned row is left in the registry untouched -- not pruned as
+  # "unreachable" (it was never even attempted), not silently dropped
+  # either.
+  [[ "$(cat "$REGISTRY")" == *"ProxyCommand"* ]]
+}
+
 @test "restore_all_all_targets: skips an unreachable target instead of pruning its entries" {
   # Regression test for the exact risk restore_all_all_targets exists to
   # avoid: restore_all itself treats an empty/failed live-session query
@@ -3255,6 +3318,64 @@ setup() {
   run "${BATS_TEST_DIRNAME}/../codersync" --setup host dir extra
   [ "$status" -eq 1 ]
   [[ "$output" == *"got extra"* ]]
+}
+
+@test "dispatch: --setup rejects --remote-dir instead of silently discarding it" {
+  # Regression test: --setup has its OWN positional [remote-dir]
+  # argument, syntactically unrelated to the new global --remote-dir
+  # flag -- but the global pre-pass plucks "--remote-dir <value>" out
+  # of "$@" for EVERY command, before the dispatch case (or --setup's
+  # own arity check) ever sees it. `codersync --setup host
+  # --remote-dir /work` used to silently write REMOTE_DIR=~ instead of
+  # /work: by the time --setup ran, "--remote-dir /work" was already
+  # gone from "$@", with no error pointing at what happened to those
+  # two tokens, and --setup's own "at most 2 arguments" check never
+  # even got a chance to catch the mismatch since the argument count
+  # had already been silently reduced (confirmed live). Checked before
+  # any network access, so this never touches a real box or config.
+  run "${BATS_TEST_DIRNAME}/../codersync" --setup host --remote-dir /work
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"doesn't support -T/--target or --remote-dir"* ]]
+}
+
+@test "dispatch: --setup rejects -T instead of silently discarding it" {
+  run "${BATS_TEST_DIRNAME}/../codersync" -T otherbox.example.com --setup host
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"doesn't support -T/--target or --remote-dir"* ]]
+}
+
+@test "dispatch: --local rejects --remote-dir instead of silently discarding it" {
+  # --local never touches SSH_TARGET/REMOTE_DIR at all (see
+  # local_setup's own comment) -- there's no remote-dir concept for it
+  # whatsoever, so silently swallowing this flag would be even more
+  # confusing than for --setup.
+  run "${BATS_TEST_DIRNAME}/../codersync" --local foo --remote-dir /work
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"doesn't support -T/--target or --remote-dir"* ]]
+}
+
+@test "dispatch: --local rejects -T instead of silently discarding it" {
+  run "${BATS_TEST_DIRNAME}/../codersync" -T otherbox.example.com --local foo
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"doesn't support -T/--target or --remote-dir"* ]]
+}
+
+@test "dispatch: --setup with no -T/--remote-dir at all still works normally" {
+  # Baseline: confirms the new rejection check doesn't fire on an
+  # ordinary --setup invocation that never mentioned either flag. ssh
+  # is stubbed to fail cleanly (no real network call) so this fails on
+  # connectivity instead, not on the new check -- distinguished by
+  # message content.
+  # shellcheck disable=SC2329 # invoked indirectly, by the subprocess below.
+  ssh() { return 1; }
+  export -f ssh
+  run bash -c '
+    set -euo pipefail
+    "'"${BATS_TEST_DIRNAME}"'/../codersync" --setup somehost.example.com
+  '
+  [ "$status" -eq 1 ]
+  [[ "$output" != *"doesn't support -T/--target or --remote-dir"* ]]
+  [[ "$output" == *"Could not reach"* ]]
 }
 
 @test "dispatch: --setup with no target shows usage with an example" {

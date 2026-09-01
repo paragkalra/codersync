@@ -1637,12 +1637,26 @@ merge_concurrent_registry_additions() {
   done < "$REGISTRY"
 }
 
-# Enumerates every DISTINCT target currently present in $REGISTRY, one
-# per line -- used by --all-targets (see restore_all_all_targets/
-# list_all_sessions_all_targets below) to know which boxes to loop
-# over, without needing any separate "list of known targets" file: the
-# registry already has this, since every entry is tagged with the
-# target it belongs to.
+# Enumerates every DISTINCT, VALID target currently present in
+# $REGISTRY, one per line -- used by --all-targets (see
+# restore_all_all_targets/list_all_sessions_all_targets below) to know
+# which boxes to loop over, without needing any separate "list of known
+# targets" file: the registry already has this, since every entry is
+# tagged with the target it belongs to.
+#
+# validate_ssh_target-checked here, unlike a normal restore_all/
+# list_all_sessions run against the single currently-configured target
+# -- THAT target was already validated once, either by --setup or by
+# -T's own load_config check, before ever reaching a real ssh call. A
+# target pulled straight out of the registry has no such guarantee: a
+# poisoned or legacy-malformed line (hand-edited, or written by a much
+# older version of this script with looser validation) could contain an
+# option-shaped string like "-oProxyCommand=sh" as its target field,
+# which --all-targets would otherwise pass straight to `ssh` as a bare
+# positional argument -- ssh reads a leading-dash argument as ITS OWN
+# option, not a hostname, turning a stale registry row into arbitrary
+# remote command execution. Invalid targets are skipped (with a
+# warning) rather than ever being handed to ssh at all.
 all_registry_targets() {
   touch "$REGISTRY"
   local line seen=$'\n'
@@ -1653,6 +1667,10 @@ all_registry_targets() {
       *$'\n'"$ENTRY_TARGET"$'\n'*) continue ;;
     esac
     seen+="$ENTRY_TARGET"$'\n'
+    if ! validate_ssh_target "$ENTRY_TARGET"; then
+      echo "Skipping invalid/unsafe registry target: $ENTRY_TARGET" >&2
+      continue
+    fi
     printf '%s\n' "$ENTRY_TARGET"
   done < "$REGISTRY"
 }
@@ -3664,6 +3682,24 @@ if [[ ${#DISPATCH_ARGS[@]} -gt 0 ]]; then
   set -- "${DISPATCH_ARGS[@]}"
 else
   set --
+fi
+
+# --setup and --local don't have a "current target" concept at all --
+# --setup IS what defines a target in the first place (via its own
+# positional <ssh-target>/[remote-dir] arguments, not these flags), and
+# --local never touches SSH_TARGET/REMOTE_DIR by design (see
+# local_setup's own comment). Rejected explicitly here, rather than
+# letting the pre-pass above silently strip -T/--target/--remote-dir
+# and have these commands just not notice -- confirmed live: `codersync
+# --setup devbox.example.com --remote-dir /work` used to silently write
+# REMOTE_DIR=~ instead of /work, because "--remote-dir /work" was
+# already gone from "$@" by the time --setup's own arity check (and its
+# own separate positional [remote-dir] handling) ever ran, with no
+# error at all pointing at what happened to those two tokens.
+if [[ ("${1:-}" == "--setup" || "${1:-}" == "-s" || "${1:-}" == "--local" || "${1:-}" == "-L") \
+      && (-n "$TARGET_OVERRIDE" || -n "$REMOTE_DIR_OVERRIDE") ]]; then
+  echo "codersync: ${1:-} doesn't support -T/--target or --remote-dir -- it works with its own <ssh-target>/[remote-dir] arguments directly, not the current target." >&2
+  exit 1
 fi
 
 case "${1:-}" in

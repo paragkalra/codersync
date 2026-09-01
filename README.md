@@ -192,7 +192,7 @@ that one invocation, without touching the default:
 codersync --setup coder.pkbox              # coder.pkbox is now the default
 codersync myproject                        # creates/attaches on coder.pkbox
 codersync -T otherbox.example.com otherjob # one-off, on a DIFFERENT box
-codersync myproject -T otherbox.example.com --list-all  # works in any position
+codersync --list-all -T otherbox.example.com  # -T works in any position
 ```
 
 Works with every command except `--setup`/`--local` (which don't have a
