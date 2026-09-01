@@ -636,6 +636,100 @@ setup() {
   [ "$REMOTE_DIR" = "~/repos" ]
 }
 
+@test "load_config: TARGET_OVERRIDE (-T) replaces SSH_TARGET and resets REMOTE_DIR to ~" {
+  # -T lets a single command reach a DIFFERENT box than the one --setup
+  # configured as the default, without overwriting that default. A box
+  # reached this way was never --setup, so it has no persisted
+  # remote-dir of its own -- REMOTE_DIR resets to the same bare `~`
+  # --setup itself defaults to, rather than reusing the CONFIGURED
+  # DEFAULT target's own remote-dir against a totally different box.
+  CONFIG_FILE="$BATS_TEST_TMPDIR/config"
+  printf 'SSH_TARGET=devbox.example.com\nREMOTE_DIR=~/custom\n' > "$CONFIG_FILE"
+  TARGET_OVERRIDE="otherbox.example.com"
+  REMOTE_DIR_OVERRIDE=""
+  load_config
+  # shellcheck disable=SC2031 # set by load_config above, not visible
+  # statically to this checker.
+  [ "$SSH_TARGET" = "otherbox.example.com" ]
+  [ "$REMOTE_DIR" = "~" ]
+  [ "$TARGET_LABEL" = "otherbox-example-com" ]
+}
+
+@test "load_config: REMOTE_DIR_OVERRIDE (--remote-dir) wins over the -T default of ~" {
+  CONFIG_FILE="$BATS_TEST_TMPDIR/config"
+  printf 'SSH_TARGET=devbox.example.com\n' > "$CONFIG_FILE"
+  TARGET_OVERRIDE="otherbox.example.com"
+  # shellcheck disable=SC2088 # intentional: literal `~`, expanded later
+  # by the REMOTE shell, not by this one -- same as REMOTE_DIR itself.
+  REMOTE_DIR_OVERRIDE="~/otherdir"
+  load_config
+  # shellcheck disable=SC2031 # set by load_config above, not visible
+  # statically to this checker.
+  [ "$SSH_TARGET" = "otherbox.example.com" ]
+  # shellcheck disable=SC2031,SC2088 # SC2031: set by load_config above,
+  # not visible statically to this checker. SC2088: intentional literal.
+  [ "$REMOTE_DIR" = "~/otherdir" ]
+}
+
+@test "load_config: --remote-dir alone (no -T) overrides just the remote-dir for this run" {
+  CONFIG_FILE="$BATS_TEST_TMPDIR/config"
+  # shellcheck disable=SC2088 # intentional: testing the literal string.
+  printf 'SSH_TARGET=devbox.example.com\nREMOTE_DIR=~/original\n' > "$CONFIG_FILE"
+  TARGET_OVERRIDE=""
+  # shellcheck disable=SC2088 # intentional literal, see above.
+  REMOTE_DIR_OVERRIDE="~/onceoff"
+  load_config
+  # shellcheck disable=SC2031 # set by load_config above, not visible
+  # statically to this checker.
+  [ "$SSH_TARGET" = "devbox.example.com" ]
+  # shellcheck disable=SC2031,SC2088 # SC2031: set by load_config above,
+  # not visible statically to this checker. SC2088: intentional literal.
+  [ "$REMOTE_DIR" = "~/onceoff" ]
+}
+
+@test "load_config: rejects an invalid TARGET_OVERRIDE before any network call" {
+  CONFIG_FILE="$BATS_TEST_TMPDIR/config"
+  printf 'SSH_TARGET=devbox.example.com\n' > "$CONFIG_FILE"
+  TARGET_OVERRIDE="bad;target"
+  # shellcheck disable=SC2034 # read by load_config below, not visible
+  # statically to this checker.
+  REMOTE_DIR_OVERRIDE=""
+  run load_config
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"invalid -T/--target"* ]]
+}
+
+@test "load_config: rejects an invalid REMOTE_DIR_OVERRIDE" {
+  CONFIG_FILE="$BATS_TEST_TMPDIR/config"
+  printf 'SSH_TARGET=devbox.example.com\n' > "$CONFIG_FILE"
+  # shellcheck disable=SC2034 # read by load_config below, not visible
+  # statically to this checker.
+  TARGET_OVERRIDE=""
+  REMOTE_DIR_OVERRIDE='bad;dir'
+  run load_config
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"invalid --remote-dir"* ]]
+}
+
+@test "load_config: with no override at all, behaves exactly as before" {
+  CONFIG_FILE="$BATS_TEST_TMPDIR/config"
+  # shellcheck disable=SC2088 # intentional: testing the literal string.
+  printf 'SSH_TARGET=devbox.example.com\nREMOTE_DIR=~/repos\n' > "$CONFIG_FILE"
+  # shellcheck disable=SC2034 # read by load_config below, not visible
+  # statically to this checker.
+  TARGET_OVERRIDE=""
+  # shellcheck disable=SC2034 # read by load_config below, not visible
+  # statically to this checker.
+  REMOTE_DIR_OVERRIDE=""
+  load_config
+  # shellcheck disable=SC2031 # set by load_config above, not visible
+  # statically to this checker.
+  [ "$SSH_TARGET" = "devbox.example.com" ]
+  # shellcheck disable=SC2031,SC2088 # SC2031: set by load_config above,
+  # not visible statically to this checker. SC2088: intentional literal.
+  [ "$REMOTE_DIR" = "~/repos" ]
+}
+
 # --- sanitize_label -------------------------------------------------------
 
 @test "sanitize_label: leaves a plain hostname unchanged" {
@@ -1714,6 +1808,143 @@ setup() {
   [ "$status" -ne 0 ]
   [ ! -d "$CONFIG_DIR/id.lock" ]
   chmod 644 "$REGISTRY"
+}
+
+# --- all_registry_targets / restore_all_all_targets ----------------------
+
+@test "all_registry_targets: enumerates each distinct target exactly once" {
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'boxA\t1-boxA-foo\nboxB\t2-boxB-bar\nboxA\t3-boxA-baz\n' > "$REGISTRY"
+  result="$(all_registry_targets)"
+  [ "$(printf '%s\n' "$result" | wc -l | tr -d ' ')" -eq 2 ]
+  [[ "$result" == *"boxA"* ]]
+  [[ "$result" == *"boxB"* ]]
+}
+
+@test "all_registry_targets: empty registry yields nothing" {
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  [ -z "$(all_registry_targets)" ]
+}
+
+@test "restore_all_all_targets: skips an unreachable target instead of pruning its entries" {
+  # Regression test for the exact risk restore_all_all_targets exists to
+  # avoid: restore_all itself treats an empty/failed live-session query
+  # the same as "genuinely no live sessions" -- correct for a single
+  # actively-configured target, but looping over every box in history
+  # makes an unreachable (not dead) box far more likely. Without the
+  # reachability pre-check, boxB's entry here would have been silently
+  # pruned just because the box couldn't be reached this run.
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  printf 'boxA\t1-boxA-foo\nboxB\t2-boxB-bar\n' > "$REGISTRY"
+  SSH_TARGET="boxA"
+  TARGET_LABEL="boxa"
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all_all_targets below.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      [[ "$*" == *"boxA"* ]] && printf 'pair-1-boxA-foo\n'
+      return 0
+    fi
+    [[ "$*" == *"boxB"* ]] && return 1
+    return 0
+  }
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all_all_targets below.
+  remote_setup_tmux_mode() { echo "remote_setup_tmux_mode:$1"; }
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all_all_targets below.
+  open_tab_tmux_mode() { echo "open_tab_tmux_mode:$1"; }
+  run restore_all_all_targets
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Skipping boxB: unreachable."* ]]
+  [[ "$output" == *"=== boxA ==="* ]]
+  [[ "$output" == *"remote_setup_tmux_mode:1-boxA-foo"* ]]
+  # The unreachable target's entry survives untouched -- not pruned.
+  [[ "$(cat "$REGISTRY")" == *"boxB"* ]]
+}
+
+@test "restore_all_all_targets: restores an already-reachable target normally" {
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  printf 'boxA\t1-boxA-foo\n' > "$REGISTRY"
+  SSH_TARGET="boxA"
+  TARGET_LABEL="boxa"
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all_all_targets below.
+  ssh() {
+    [[ "$*" == *"list-sessions"* ]] && printf 'pair-1-boxA-foo\n'
+    return 0
+  }
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all_all_targets below.
+  remote_setup_tmux_mode() { :; }
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all_all_targets below.
+  open_tab_tmux_mode() { :; }
+  run restore_all_all_targets
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"=== boxA ==="* ]]
+  [[ "$output" == *"Restored 1 session(s)."* ]]
+}
+
+@test "restore_all_all_targets: restores SSH_TARGET/TARGET_LABEL after looping" {
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  printf 'boxA\t1-boxA-foo\n' > "$REGISTRY"
+  SSH_TARGET="original.example.com"
+  TARGET_LABEL="original-example-com"
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all_all_targets below.
+  ssh() {
+    [[ "$*" == *"list-sessions"* ]] && printf 'pair-1-boxA-foo\n'
+    return 0
+  }
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all_all_targets below.
+  remote_setup_tmux_mode() { :; }
+  # shellcheck disable=SC2329 # invoked indirectly, by restore_all_all_targets below.
+  open_tab_tmux_mode() { :; }
+  restore_all_all_targets >/dev/null
+  [ "$SSH_TARGET" = "original.example.com" ]
+  [ "$TARGET_LABEL" = "original-example-com" ]
+}
+
+@test "restore_all_all_targets: reports clearly when the registry has no known targets" {
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  SSH_TARGET="boxA"
+  TARGET_LABEL="boxa"
+  run restore_all_all_targets
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"No known targets in the registry yet."* ]]
+}
+
+# --- list_all_sessions_all_targets ----------------------------------------
+
+@test "list_all_sessions_all_targets: skips an unreachable target" {
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  CONFIG_DIR="$BATS_TEST_TMPDIR"
+  printf 'boxA\t1-boxA-foo\nboxB\t2-boxB-bar\n' > "$REGISTRY"
+  SSH_TARGET="boxA"
+  TARGET_LABEL="boxa"
+  # shellcheck disable=SC2329 # invoked indirectly, by list_all_sessions_all_targets below.
+  ssh() {
+    if [[ "$*" == *"list-sessions"* ]]; then
+      [[ "$*" == *"boxA"* ]] && printf 'pair-1-boxA-foo\n'
+      return 0
+    fi
+    [[ "$*" == *"boxB"* ]] && return 1
+    return 0
+  }
+  run list_all_sessions_all_targets
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Skipping boxB: unreachable."* ]]
+  [[ "$output" == *"=== boxA ==="* ]]
+  [[ "$output" == *"tmux"*"foo"* ]]
+}
+
+@test "list_all_sessions_all_targets: reports clearly when the registry has no known targets" {
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  SSH_TARGET="boxA"
+  TARGET_LABEL="boxa"
+  run list_all_sessions_all_targets
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"No known targets in the registry yet."* ]]
 }
 
 # --- attach_session -----------------------------------------------------
@@ -3063,8 +3294,24 @@ setup() {
   [[ "$output" == *"got extra"* ]]
 }
 
+@test "dispatch: --restore-all --all-targets rejects extra trailing arguments" {
+  # --all-targets is consumed as ITS OWN recognized flag, not just
+  # counted against the arity limit -- confirms a genuine extra
+  # argument AFTER --all-targets is still rejected, not silently
+  # absorbed the same way --all-targets itself is.
+  run "${BATS_TEST_DIRNAME}/../codersync" --restore-all --all-targets extra
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
+}
+
 @test "dispatch: --list-all rejects extra trailing arguments" {
   run "${BATS_TEST_DIRNAME}/../codersync" --list-all extra
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
+}
+
+@test "dispatch: --list-all --all-targets rejects extra trailing arguments" {
+  run "${BATS_TEST_DIRNAME}/../codersync" --list-all --all-targets extra
   [ "$status" -eq 1 ]
   [[ "$output" == *"got extra"* ]]
 }
@@ -3225,4 +3472,125 @@ setup() {
   [ "$status" -eq 1 ]
   [[ "$output" == *"got extra"* ]]
   [[ "$output" == *"-d"* ]]
+}
+
+# --- dispatch: -T/--target, --remote-dir, --check-dependencies ----------
+
+@test "dispatch: -T requires a value" {
+  run "${BATS_TEST_DIRNAME}/../codersync" -T
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"-T requires a value"* ]]
+}
+
+@test "dispatch: --target requires a value, doesn't swallow the next flag as its value" {
+  # Same "swallowing" bug class already guarded against for --tools/
+  # --split-mode elsewhere in this file: without the `"$2" == -*` check,
+  # `--target --list-all` would treat "--list-all" as -T's OWN value
+  # instead of erroring, leaving no subcommand at all.
+  run "${BATS_TEST_DIRNAME}/../codersync" --target --list-all
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"--target requires a value"* ]]
+}
+
+@test "dispatch: --remote-dir requires a value" {
+  run "${BATS_TEST_DIRNAME}/../codersync" --remote-dir
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"--remote-dir requires a value"* ]]
+}
+
+@test "dispatch: -T overrides the target regardless of position (before the subcommand)" {
+  # FAKE_HOME, not CONFIG_DIR/CONFIG_FILE/REGISTRY directly -- unlike
+  # the sourced-function tests elsewhere in this file, codersync here
+  # runs as a genuinely separate PROCESS (not sourced), and its own
+  # `CONFIG_DIR="$HOME/.config/codersync"` (etc.) at the top of the
+  # script unconditionally re-derives those paths from $HOME every time
+  # it starts -- pre-setting CONFIG_DIR itself in the subshell below has
+  # no effect on the child process at all (confirmed: first attempt at
+  # this test silently read the REAL ~/.config/codersync/config instead
+  # of the fake one, and only "passed" by coincidence since -T's
+  # override masks whatever the config file says anyway).
+  FAKE_HOME="$BATS_TEST_TMPDIR/home"
+  mkdir -p "$FAKE_HOME/.config/codersync"
+  printf 'SSH_TARGET=devbox.example.com\n' > "$FAKE_HOME/.config/codersync/config"
+  : > "$FAKE_HOME/.codersync_sessions"
+  # shellcheck disable=SC2329 # invoked indirectly, by the subprocess below.
+  ssh() { echo "ssh-called-with:$*" >> "$BATS_TEST_TMPDIR/ssh_calls"; }
+  export -f ssh
+  run bash -c '
+    set -euo pipefail
+    HOME="'"$FAKE_HOME"'"
+    "'"${BATS_TEST_DIRNAME}"'/../codersync" -T otherbox.example.com --list-all
+  '
+  [ "$status" -eq 0 ]
+  [[ "$(cat "$BATS_TEST_TMPDIR/ssh_calls")" == *"otherbox.example.com"* ]]
+  [[ "$(cat "$BATS_TEST_TMPDIR/ssh_calls")" != *"devbox.example.com"* ]]
+}
+
+@test "dispatch: -T overrides the target regardless of position (after the subcommand)" {
+  # Same as above but with -T placed AFTER --list-all -- this is the
+  # main reason for plucking -T out in a pre-pass before the dispatch
+  # case even looks at \$1, rather than teaching each subcommand's own
+  # arg parser about it individually. See the previous test's own
+  # comment for why this uses FAKE_HOME rather than CONFIG_DIR directly.
+  FAKE_HOME="$BATS_TEST_TMPDIR/home"
+  mkdir -p "$FAKE_HOME/.config/codersync"
+  printf 'SSH_TARGET=devbox.example.com\n' > "$FAKE_HOME/.config/codersync/config"
+  : > "$FAKE_HOME/.codersync_sessions"
+  # shellcheck disable=SC2329 # invoked indirectly, by the subprocess below.
+  ssh() { echo "ssh-called-with:$*" >> "$BATS_TEST_TMPDIR/ssh_calls"; }
+  export -f ssh
+  run bash -c '
+    set -euo pipefail
+    HOME="'"$FAKE_HOME"'"
+    "'"${BATS_TEST_DIRNAME}"'/../codersync" --list-all -T otherbox.example.com
+  '
+  [ "$status" -eq 0 ]
+  [[ "$(cat "$BATS_TEST_TMPDIR/ssh_calls")" == *"otherbox.example.com"* ]]
+  [[ "$(cat "$BATS_TEST_TMPDIR/ssh_calls")" != *"devbox.example.com"* ]]
+}
+
+@test "dispatch: without -T, the configured default target is used as before" {
+  # See the -T test above for why this uses FAKE_HOME rather than
+  # CONFIG_DIR directly.
+  FAKE_HOME="$BATS_TEST_TMPDIR/home"
+  mkdir -p "$FAKE_HOME/.config/codersync"
+  printf 'SSH_TARGET=devbox.example.com\n' > "$FAKE_HOME/.config/codersync/config"
+  : > "$FAKE_HOME/.codersync_sessions"
+  # shellcheck disable=SC2329 # invoked indirectly, by the subprocess below.
+  ssh() { echo "ssh-called-with:$*" >> "$BATS_TEST_TMPDIR/ssh_calls"; }
+  export -f ssh
+  run bash -c '
+    set -euo pipefail
+    HOME="'"$FAKE_HOME"'"
+    "'"${BATS_TEST_DIRNAME}"'/../codersync" --list-all
+  '
+  [ "$status" -eq 0 ]
+  [[ "$(cat "$BATS_TEST_TMPDIR/ssh_calls")" == *"devbox.example.com"* ]]
+}
+
+@test "dispatch: --check-dependencies rejects extra trailing arguments" {
+  run "${BATS_TEST_DIRNAME}/../codersync" --check-dependencies extra
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"got extra"* ]]
+}
+
+@test "dispatch: --check-dependencies works with -T, without touching the configured default" {
+  # See the -T test above for why this uses FAKE_HOME rather than
+  # CONFIG_DIR directly.
+  FAKE_HOME="$BATS_TEST_TMPDIR/home"
+  mkdir -p "$FAKE_HOME/.config/codersync"
+  printf 'SSH_TARGET=devbox.example.com\n' > "$FAKE_HOME/.config/codersync/config"
+  # shellcheck disable=SC2329 # invoked indirectly, by the subprocess below.
+  ssh() { return 0; }
+  export -f ssh
+  run bash -c '
+    set -euo pipefail
+    HOME="'"$FAKE_HOME"'"
+    "'"${BATS_TEST_DIRNAME}"'/../codersync" -T otherbox.example.com --check-dependencies
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"All dependency checks passed on otherbox.example.com."* ]]
+  # The default target on disk is untouched by a -T-scoped command.
+  [[ "$(cat "$FAKE_HOME/.config/codersync/config")" == *"devbox.example.com"* ]]
+  [[ "$(cat "$FAKE_HOME/.config/codersync/config")" != *"otherbox.example.com"* ]]
 }

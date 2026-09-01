@@ -171,6 +171,47 @@ you if that alias doesn't exist yet.
 
 Config lives at `~/.config/codersync/config`.
 
+### `codersync --check-dependencies`
+
+Runs the same reachability/`tmux`/`bash`/`base64` checklist `--setup`
+does, standalone, against the currently configured default box (or a
+secondary one via `-T`, below) -- without writing anything to config.
+Useful for validating a box before ever running `--setup` for it, or
+for re-checking the default after upgrading something there without
+redoing `--setup` from scratch. Unlike `--setup`, it doesn't attempt
+any `coder.*` workspace auto-configuration -- it assumes SSH access
+already works and just confirms it.
+
+### `-T`/`--target <ssh-target>` and `--remote-dir <dir>`
+
+`codersync` targets one box at a time -- `--setup` sets the *default*.
+`-T`/`--target` lets a single command reach a *different* box for just
+that one invocation, without touching the default:
+
+```bash
+codersync --setup coder.pkbox              # coder.pkbox is now the default
+codersync myproject                        # creates/attaches on coder.pkbox
+codersync -T otherbox.example.com otherjob # one-off, on a DIFFERENT box
+codersync myproject -T otherbox.example.com --list-all  # works in any position
+```
+
+Works with every command except `--setup`/`--local` (which don't have a
+"current target" concept in the first place) -- session creation,
+`--attach`, `--kill`, `--rename`, `--list-all`, `--restore-all`,
+`--kill-all`, `--adopt`, and `--check-dependencies` all honor it.
+
+A box reached via `-T` was never `--setup`, so it has no `remote-dir`
+of its own recorded anywhere -- it defaults to `~` (the same default
+`--setup` itself uses when `[remote-dir]` is omitted) unless
+`--remote-dir <dir>` is also given alongside `-T`. `--remote-dir` also
+works on its own, with no `-T`, to override just the remote-dir for one
+run against the current default target.
+
+`-T` doesn't replace `--setup` entirely -- codersync still needs a
+default box configured somewhere first; `-T` just means you don't have
+to re-run `--setup` (and switch your default) for every other box you
+touch occasionally.
+
 ### `codersync <session-name> [options]`
 
 Opens a new tab and sets up the two-agent split. Options:
@@ -228,7 +269,7 @@ number either, for the same reason a bare number is never read as a
 name: it would make the session unreachable by name afterward. Gets
 capital `-R` since lowercase `-r` is already taken by `--restore-all`.
 
-### `codersync --restore-all|-r`
+### `codersync --restore-all|-r [--all-targets]`
 
 Reopens a tab for every session that's still alive on the remote box,
 based on a local registry (`~/.codersync_sessions`) that every session
@@ -237,7 +278,15 @@ closed: nothing on the remote box was ever lost, this just recreates the
 local tabs. Stale entries (sessions no longer alive) are pruned
 automatically.
 
-### `codersync --list-all|-l`
+With `--all-targets`, loops every box that has ever shown up in the
+registry -- not just the current one -- printing a `=== <target> ===`
+header per box. A box that's unreachable this run is skipped with a
+clear message and its entries are left untouched, not treated as dead
+and pruned: across a whole history of boxes, "temporarily unreachable"
+is far more likely than it would be for the one box you actively
+`--setup`'d, so this is deliberately conservative about the difference.
+
+### `codersync --list-all|-l [--all-targets]`
 
 Lists every codersync session still alive on the remote box AND
 recorded in your local registry (`~/.codersync_sessions`), with its
@@ -267,6 +316,11 @@ Its tmux session itself is completely unaffected. Run
 just ones from a different machine), or reattach to it directly with
 `ssh <ssh-target> -- tmux attach -t <session-name>` (get the exact
 name with `ssh <ssh-target> -- tmux list-sessions`).
+
+`--all-targets` works the same way here as on `--restore-all`/`-r`
+above: one table per box that's ever shown up in the registry, with
+unreachable boxes skipped and clearly noted rather than silently
+omitted.
 
 ### `codersync --kill|-k <ids>`
 

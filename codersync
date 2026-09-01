@@ -151,6 +151,15 @@ REGISTRY="$HOME/.codersync_sessions"
 NEXT_ID_FILE="$CONFIG_DIR/next_id"
 PENDING_FILE="$CONFIG_DIR/pending"
 
+# Set (non-empty) only when -T/--target or --remote-dir is given on the
+# command line -- see the dispatch case's own pre-pass comment for how
+# these get populated, and load_config()'s own comment for how they're
+# applied. Declared here (empty) so `set -u` doesn't choke on referencing
+# them before that pre-pass runs, e.g. when a test sources this file
+# directly without going through the dispatch case at all.
+TARGET_OVERRIDE=""
+REMOTE_DIR_OVERRIDE=""
+
 # How long a pending marker (see mark_pending below) is honored before
 # restore_all treats it as stale and prunable like any other dead entry.
 # Needs to comfortably cover a normal remote_setup/remote_setup_tmux_mode
@@ -215,40 +224,16 @@ validate_session_name() {
   [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]]
 }
 
-setup() {
-  local target="${1:-}"
-  local remote_dir="${2:-~}"
-
-  # `help`/`--help`/`-h` here is almost certainly someone reaching for
-  # `codersync --setup help` the way many CLIs support `<command> help`,
-  # not an actual hostname -- without this, "help" passes
-  # validate_ssh_target (it's just letters) and this tries a real SSH
-  # connection to a host literally named "help", failing with a
-  # connectivity error that explains nothing about --setup itself.
-  if [[ -z "$target" || "$target" == "help" || "$target" == "--help" || "$target" == "-h" ]]; then
-    echo "Usage: codersync --setup|-s <ssh-target> [remote-dir]" >&2
-    echo "  <ssh-target>  a hostname, user@host, or ~/.ssh/config alias (e.g. devbox.example.com)" >&2
-    echo "  [remote-dir]  where the agents start on that box (default: ~, your home directory there)" >&2
-    echo "Example: codersync --setup devbox.example.com" >&2
-    exit 1
-  fi
-
-  if ! validate_ssh_target "$target"; then
-    echo "Invalid ssh-target '${target}': only letters, digits, and . _ - @ are allowed." >&2
-    exit 1
-  fi
-
-  if ! validate_remote_dir "$remote_dir"; then
-    echo "Invalid remote-dir '${remote_dir}': only letters, digits, and . _ - / ~ are allowed." >&2
-    exit 1
-  fi
-
-  if [[ "$target" == coder.* ]] && command -v coder >/dev/null 2>&1; then
-    if ! grep -q '^Host coder\.' "$HOME/.ssh/config" 2>/dev/null; then
-      echo "${target} looks like a coder workspace alias -- running 'coder config-ssh' to set up the proxy (you'll be asked to confirm)."
-      coder config-ssh
-    fi
-  fi
+# Runs the same four remote-dependency checks setup() has always run
+# before writing config -- extracted so --check-dependencies can run
+# them standalone (e.g. against a secondary box reached via -T, without
+# ever running a full --setup for it) instead of only as a side effect
+# of setup() itself. Each check still `exit 1`s directly with its own
+# specific message on failure, exactly as before this was pulled out --
+# a pure extraction, not a behavior change, so setup()'s own tests don't
+# need to change.
+check_remote_dependencies() {
+  local target="$1"
 
   echo "Checking connectivity to ${target}..."
   if ! ssh -o ConnectTimeout=10 -o BatchMode=yes "$target" -- true 2>/dev/null; then
@@ -306,6 +291,44 @@ setup() {
     echo "base64 on ${target} doesn't support the 'base64 -d' decode form codersync needs (or isn't installed at all). Install a compatible base64 (e.g. GNU coreutils) and re-run setup." >&2
     exit 1
   fi
+}
+
+setup() {
+  local target="${1:-}"
+  local remote_dir="${2:-~}"
+
+  # `help`/`--help`/`-h` here is almost certainly someone reaching for
+  # `codersync --setup help` the way many CLIs support `<command> help`,
+  # not an actual hostname -- without this, "help" passes
+  # validate_ssh_target (it's just letters) and this tries a real SSH
+  # connection to a host literally named "help", failing with a
+  # connectivity error that explains nothing about --setup itself.
+  if [[ -z "$target" || "$target" == "help" || "$target" == "--help" || "$target" == "-h" ]]; then
+    echo "Usage: codersync --setup|-s <ssh-target> [remote-dir]" >&2
+    echo "  <ssh-target>  a hostname, user@host, or ~/.ssh/config alias (e.g. devbox.example.com)" >&2
+    echo "  [remote-dir]  where the agents start on that box (default: ~, your home directory there)" >&2
+    echo "Example: codersync --setup devbox.example.com" >&2
+    exit 1
+  fi
+
+  if ! validate_ssh_target "$target"; then
+    echo "Invalid ssh-target '${target}': only letters, digits, and . _ - @ are allowed." >&2
+    exit 1
+  fi
+
+  if ! validate_remote_dir "$remote_dir"; then
+    echo "Invalid remote-dir '${remote_dir}': only letters, digits, and . _ - / ~ are allowed." >&2
+    exit 1
+  fi
+
+  if [[ "$target" == coder.* ]] && command -v coder >/dev/null 2>&1; then
+    if ! grep -q '^Host coder\.' "$HOME/.ssh/config" 2>/dev/null; then
+      echo "${target} looks like a coder workspace alias -- running 'coder config-ssh' to set up the proxy (you'll be asked to confirm)."
+      coder config-ssh
+    fi
+  fi
+
+  check_remote_dependencies "$target"
 
   # No existence check for [remote-dir] here (there used to be one, via
   # `cd`, since `tmux new-session -c <bad-dir>` doesn't actually fail on
@@ -642,6 +665,38 @@ load_config() {
     echo "Config at $CONFIG_FILE has an invalid REMOTE_DIR ('${REMOTE_DIR}'). Re-run: codersync --setup <ssh-target> [remote-dir]" >&2
     exit 1
   fi
+
+  # -T/--target and --remote-dir (see the dispatch case's pre-pass) are
+  # applied here, after the configured default is loaded above but
+  # before TARGET_LABEL is derived below, so this is the ONE place every
+  # command needs to honor them -- every dispatch arm that needs a
+  # target already calls load_config() first. Validated the same way
+  # setup() validates a brand-new target/remote-dir, since these never
+  # went through setup() at all for this invocation.
+  if [[ -n "$TARGET_OVERRIDE" ]]; then
+    if ! validate_ssh_target "$TARGET_OVERRIDE"; then
+      echo "codersync: invalid -T/--target '${TARGET_OVERRIDE}': only letters, digits, and . _ - @ are allowed." >&2
+      exit 1
+    fi
+    SSH_TARGET="$TARGET_OVERRIDE"
+    # A box reached via -T was never --setup, so it has no persisted
+    # remote-dir of its own -- resets to the same bare `~` --setup
+    # itself defaults to when no [remote-dir] is given, rather than
+    # reusing the CONFIGURED DEFAULT target's remote-dir against a
+    # totally different box (confirmed live: without this reset,
+    # `-T otherbox foo` tried to start otherbox's session in the
+    # default target's own remote-dir, which has no reason to exist on
+    # otherbox at all).
+    REMOTE_DIR="~"
+  fi
+  if [[ -n "$REMOTE_DIR_OVERRIDE" ]]; then
+    if ! validate_remote_dir "$REMOTE_DIR_OVERRIDE"; then
+      echo "codersync: invalid --remote-dir '${REMOTE_DIR_OVERRIDE}': only letters, digits, and . _ - / ~ are allowed." >&2
+      exit 1
+    fi
+    REMOTE_DIR="$REMOTE_DIR_OVERRIDE"
+  fi
+
   TARGET_LABEL="$(sanitize_label "$SSH_TARGET")"
 }
 
@@ -1582,6 +1637,26 @@ merge_concurrent_registry_additions() {
   done < "$REGISTRY"
 }
 
+# Enumerates every DISTINCT target currently present in $REGISTRY, one
+# per line -- used by --all-targets (see restore_all_all_targets/
+# list_all_sessions_all_targets below) to know which boxes to loop
+# over, without needing any separate "list of known targets" file: the
+# registry already has this, since every entry is tagged with the
+# target it belongs to.
+all_registry_targets() {
+  touch "$REGISTRY"
+  local line seen=$'\n'
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    parse_registry_line "$line"
+    case "$seen" in
+      *$'\n'"$ENTRY_TARGET"$'\n'*) continue ;;
+    esac
+    seen+="$ENTRY_TARGET"$'\n'
+    printf '%s\n' "$ENTRY_TARGET"
+  done < "$REGISTRY"
+}
+
 # Reopens a tab for every registry entry that belongs to the currently
 # configured target and still has a live tmux session there, and prunes
 # entries that don't. Each entry might be either split mode -- detected
@@ -1804,6 +1879,47 @@ restore_all() {
     echo "Dropped ${skipped_unsafe} unsafe registry entry/entries (see warnings above)."
   fi
   echo "Restored ${restored} session(s)."
+}
+
+# --all-targets form of --restore-all: loops every target currently
+# known to the registry (see all_registry_targets) and runs the normal
+# restore_all against each, instead of just the currently configured
+# one.
+#
+# Checks reachability with a cheap, quick ssh call BEFORE calling
+# restore_all for that target -- NOT just letting restore_all itself
+# run against an unreachable box. restore_all treats an empty/failed
+# `tmux list-sessions` the same as "genuinely no live sessions", which
+# is a reasonable inference for a single target that's actively
+# configured (and was reachable as of --setup), but here we're looping
+# over every box in this machine's ENTIRE codersync history, most of
+# which are far more likely to be temporarily unreachable (VPN down,
+# box off, decommissioned) than a single actively-configured target
+# ever was. Without this check, one unreachable box in the loop would
+# have every one of its registry entries silently pruned, since
+# restore_all can't distinguish "confirmed dead" from "couldn't check"
+# -- unreachable targets are skipped with a clear message instead,
+# leaving their entries untouched for a later run to try again.
+restore_all_all_targets() {
+  local target saw_any=0
+  local orig_target="$SSH_TARGET" orig_label="$TARGET_LABEL"
+  while IFS= read -r target || [[ -n "$target" ]]; do
+    [[ -z "$target" ]] && continue
+    saw_any=1
+    if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$target" -- true 2>/dev/null; then
+      echo "Skipping ${target}: unreachable."
+      continue
+    fi
+    echo "=== ${target} ==="
+    SSH_TARGET="$target"
+    TARGET_LABEL="$(sanitize_label "$SSH_TARGET")"
+    restore_all
+  done < <(all_registry_targets)
+  SSH_TARGET="$orig_target"
+  TARGET_LABEL="$orig_label"
+  if [[ "$saw_any" == 0 ]]; then
+    echo "No known targets in the registry yet."
+  fi
 }
 
 # Resolves <id-or-name> to the raw, registry-stored session name for
@@ -2273,6 +2389,35 @@ list_all_sessions() {
   printf '%s\n' "${rows[@]}" | sort -n | while IFS=$'\t' read -r _ id_display kind rest; do
     printf '%-6s %-8s %s\n' "$id_display" "$kind" "$rest"
   done
+}
+
+# --all-targets form of --list-all -- see restore_all_all_targets's own
+# comment for why unreachable targets are checked and skipped
+# explicitly rather than just letting list_all_sessions run against
+# them: list_all_sessions itself already prints "No sessions on X" for
+# an empty/failed query, which doesn't distinguish "confirmed empty"
+# from "couldn't check" -- worth being explicit about that here, across
+# a whole history of boxes rather than one actively-configured target.
+list_all_sessions_all_targets() {
+  local target saw_any=0
+  local orig_target="$SSH_TARGET" orig_label="$TARGET_LABEL"
+  while IFS= read -r target || [[ -n "$target" ]]; do
+    [[ -z "$target" ]] && continue
+    saw_any=1
+    if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$target" -- true 2>/dev/null; then
+      echo "Skipping ${target}: unreachable."
+      continue
+    fi
+    echo "=== ${target} ==="
+    SSH_TARGET="$target"
+    TARGET_LABEL="$(sanitize_label "$SSH_TARGET")"
+    list_all_sessions
+  done < <(all_registry_targets)
+  SSH_TARGET="$orig_target"
+  TARGET_LABEL="$orig_label"
+  if [[ "$saw_any" == 0 ]]; then
+    echo "No known targets in the registry yet."
+  fi
 }
 
 # Kills one remote tmux session by its exact name, safely regardless of
@@ -3154,12 +3299,13 @@ print_help() {
   cat <<'HELP'
 Usage:
   codersync --setup|-s <ssh-target> [remote-dir]            One-time setup
+  codersync --check-dependencies                            Validate tmux/bash/base64 on a box
   codersync <session-name> [--split-mode|-m iterm|tmux] [--tools|-t t1,t2] [--safe-mode|-s]
                                                              Open a tab
   codersync --attach|-a <id-or-name>                        Reconnect to one existing session
   codersync --rename|-R <id-or-name> <new-name>             Rename one existing session
-  codersync --restore-all|-r                                Reopen all live sessions
-  codersync --list-all|-l                                   List live sessions with their IDs
+  codersync --restore-all|-r [--all-targets]                Reopen all live sessions
+  codersync --list-all|-l [--all-targets]                   List live sessions with their IDs
   codersync --kill|-k <ids>                                 Kill sessions by ID (e.g. 1,2,4 or 1-4)
   codersync --kill-all|-K                                   Kill every codersync session (asks to confirm)
   codersync --paste-image|-p                                Upload a clipboard image, copy its remote path
@@ -3167,6 +3313,11 @@ Usage:
   codersync --local|-L <session-name>                       Start a session directly on this machine, no ssh
   codersync --adopt|-d                                      Register sessions started via --local into this registry
   codersync --help|-h                                       Show this help
+
+  Any command above except --setup/--local also takes -T|--target
+  <ssh-target> (and optionally --remote-dir <dir>) to run against a box
+  OTHER than the one --setup configured as the default, for that one
+  invocation only -- see -T/--target below.
 
 <ssh-target> is a hostname, user@host, or an alias from ~/.ssh/config --
 restricted to letters, digits, and . _ - @ (narrower than everything ssh
@@ -3186,6 +3337,41 @@ parsed in two entirely separate contexts (top-level dispatch decides
 --setup-vs-a-session-name first; --safe-mode only exists within a
 session-name invocation's own options), so there's no ambiguity in
 practice, only in a skim of this text.
+
+-T/--target <ssh-target> [--remote-dir <dir>]: runs the command it's
+attached to against a DIFFERENT box than the one --setup configured as
+the default, without changing that default -- e.g. `codersync -T
+otherbox.example.com --list-all` or `codersync foo -T
+otherbox.example.com` (works in any position, before or after the rest
+of the command). A box reached this way was never --setup, so it has no
+remote-dir of its own recorded anywhere -- defaults to `~` (same as
+--setup itself with no [remote-dir] given) unless --remote-dir is also
+given alongside -T. --remote-dir also works on its own, with no -T, to
+override just the remote-dir for one run against the current default
+target. Requires a --setup'd default to already exist (for at least one
+box) -- codersync still needs that one-time setup somewhere; -T only
+means you don't need to repeat it for every other box you touch.
+
+--check-dependencies: runs the same reachability/tmux/bash/base64
+checklist --setup does, standalone -- against the current default (no
+-T) or a secondary box (-T <ssh-target>), without writing any config.
+Useful for validating a box before ever running --setup for it, or for
+re-checking the default after upgrading something there without redoing
+--setup from scratch. Unlike --setup, doesn't attempt any coder.*
+workspace auto-configuration -- it assumes SSH access already works and
+just confirms it.
+
+--all-targets (only on --restore-all/-r and --list-all/-l): loops every
+target that has ever shown up in the local registry (~/.codersync_sessions),
+not just the current one, printing a `=== <target> ===` header per box.
+A target that's unreachable this run is skipped with a clear message
+and its entries are left untouched -- NOT treated as dead and pruned,
+since --restore-all/-r can't tell "confirmed gone" apart from "just
+couldn't check" for a box it was never actively pointed at. Not
+available on --kill-all/-K: a single confirmation prompt covering
+destructive action across multiple boxes at once is a blast-radius risk
+not worth taking on; run --kill-all/-K once per box instead (with -T if
+needed).
 
 --split-mode/-m tmux (default): one tmux session with two panes split
 server-side, and the local side just opens a tab and attaches once. Uses
@@ -3431,6 +3617,55 @@ parse_run_args() {
 # Guarded so the tests (tests/*.bats) can `source` this file to test the
 # functions above in isolation without actually running the CLI dispatch.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+
+# Plucks -T/--target and --remote-dir out of the argument list wherever
+# they appear (before or after the subcommand), leaving everything else
+# in its original relative order for the dispatch case below to handle
+# exactly as it always has -- neither that case's own arms nor any of
+# the per-command arg parsers (parse_run_args, local_setup, etc.) ever
+# see these two flags directly. This is what lets a single command
+# reach a target OTHER than the one --setup configured as the default,
+# without overwriting that default -- see load_config()'s own comment
+# for where TARGET_OVERRIDE/REMOTE_DIR_OVERRIDE actually get applied.
+declare -a DISPATCH_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -T|--target)
+      if [[ $# -lt 2 || "$2" == -* ]]; then
+        echo "codersync: $1 requires a value (an ssh-target)" >&2
+        exit 1
+      fi
+      TARGET_OVERRIDE="$2"
+      shift 2
+      ;;
+    --remote-dir)
+      if [[ $# -lt 2 || "$2" == -* ]]; then
+        echo "codersync: --remote-dir requires a value" >&2
+        exit 1
+      fi
+      REMOTE_DIR_OVERRIDE="$2"
+      shift 2
+      ;;
+    *)
+      DISPATCH_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+# Guarded rather than a bare `set -- "${DISPATCH_ARGS[@]}"` -- expanding
+# a COMPLETELY EMPTY array under `set -u` is a fatal "unbound variable"
+# in real bash 3.2 (macOS's shipped /bin/bash), even though the same
+# expansion is harmless on bash 4.4+. Hit (and fixed) this exact class
+# of bug several times already in this file for other arrays; `set --`
+# with no arguments is the bash-3.2-safe equivalent of "clear the
+# positional parameters" when DISPATCH_ARGS ended up empty (e.g. a bare
+# `codersync -T somehost` with nothing else).
+if [[ ${#DISPATCH_ARGS[@]} -gt 0 ]]; then
+  set -- "${DISPATCH_ARGS[@]}"
+else
+  set --
+fi
+
 case "${1:-}" in
   --setup|-s)
     # This mutates local config, so an extra trailing argument (a typo'd
@@ -3444,16 +3679,43 @@ case "${1:-}" in
     setup "${2:-}" "${3:-}"
     exit 0
     ;;
-  --restore-all|-r)
-    # Opens tabs and rewrites the registry, so treated the same as the
-    # other mutating commands above: an extra trailing argument is
-    # rejected rather than silently ignored.
+  --check-dependencies)
+    # Runs setup()'s own reachability/tmux/bash/base64 checklist
+    # standalone, against either the configured default (no -T) or a
+    # secondary box (-T <target>) -- e.g. to validate a box reached via
+    # -T before ever running a full --setup for it, or to re-check the
+    # default after upgrading something there without redoing --setup
+    # from scratch. Deliberately does NOT run the coder.* auto-config
+    # step setup() does -- this assumes SSH access already works and
+    # just validates it, rather than trying to configure anything.
     if [[ $# -gt 1 ]]; then
       echo "codersync: $1 takes no arguments -- got extra: ${*:2}" >&2
       exit 1
     fi
     load_config
-    restore_all
+    check_remote_dependencies "$SSH_TARGET"
+    echo "All dependency checks passed on ${SSH_TARGET}."
+    exit 0
+    ;;
+  --restore-all|-r)
+    # Opens tabs and rewrites the registry, so treated the same as the
+    # other mutating commands above: an extra trailing argument is
+    # rejected rather than silently ignored.
+    all_targets=0
+    if [[ "${2:-}" == "--all-targets" ]]; then
+      all_targets=1
+      shift
+    fi
+    if [[ $# -gt 1 ]]; then
+      echo "codersync: $1 takes no arguments (or --all-targets) -- got extra: ${*:2}" >&2
+      exit 1
+    fi
+    load_config
+    if [[ "$all_targets" == 1 ]]; then
+      restore_all_all_targets
+    else
+      restore_all
+    fi
     exit 0
     ;;
   --attach|-a)
@@ -3492,12 +3754,21 @@ case "${1:-}" in
     exit 0
     ;;
   --list-all|-l)
+    all_targets=0
+    if [[ "${2:-}" == "--all-targets" ]]; then
+      all_targets=1
+      shift
+    fi
     if [[ $# -gt 1 ]]; then
-      echo "codersync: $1 takes no arguments -- got extra: ${*:2}" >&2
+      echo "codersync: $1 takes no arguments (or --all-targets) -- got extra: ${*:2}" >&2
       exit 1
     fi
     load_config
-    list_all_sessions
+    if [[ "$all_targets" == 1 ]]; then
+      list_all_sessions_all_targets
+    else
+      list_all_sessions
+    fi
     exit 0
     ;;
   --kill|-k)
