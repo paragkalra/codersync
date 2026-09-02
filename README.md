@@ -118,6 +118,15 @@ session also gets a small numeric ID prefixed on the remote side (e.g.
 `3-devbox-example-com-my-feature`) so you can refer to it later with
 `--list-all` / `--attach` / `--kill` instead of typing the full name.
 
+Session names only allow letters, digits, `-`, and `_`. A quoted name
+with spaces (`codersync "my feature"`) has its spaces automatically
+folded into dashes (`my-feature`) instead of being rejected -- watch
+for the "using '...' as the session name" notice to see what it
+actually got named. This applies to `--attach`/`--kill`/`--rename`
+lookups and `--local`/`--rename`'s new-name argument too, so you can
+keep typing a name with spaces consistently everywhere. Any other
+disallowed character (`.`, `/`, `;`, etc.) still errors out.
+
 ## Usage
 
 ```

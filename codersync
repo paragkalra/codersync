@@ -245,6 +245,29 @@ validate_session_name() {
   [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]]
 }
 
+# Folds whitespace in a raw, just-typed session name into '-' before
+# validate_session_name ever sees it, so `codersync "This is a test"`
+# becomes the session name "This-is-a-test" instead of a confusing
+# character-class error -- a quoted multi-word argument is the natural
+# way to type a descriptive name, and demanding the user pre-hyphenate
+# it themselves is needless friction validate_session_name's charset
+# check can't tell apart from an actually-invalid character. Uses
+# `read -ra` rather than `tr`/parameter-substitution: word-splitting on
+# the default (whitespace) IFS both collapses repeated
+# spaces/tabs/newlines into a single separator and drops leading/
+# trailing whitespace in one step, so "  a   b  " becomes "a-b", not
+# "-a---b-" or "-a-b-". Anything that isn't whitespace (including every
+# character validate_session_name already rejects) passes through
+# untouched -- this only ever removes reasons a *space-containing*
+# name would fail, never loosens the charset check itself.
+normalize_session_name_spaces() {
+  local input="$1"
+  local -a words
+  read -ra words <<<"$input"
+  local IFS='-'
+  printf '%s' "${words[*]}"
+}
+
 # Runs the same four remote-dependency checks setup() has always run
 # before writing config -- extracted so --check-dependencies can run
 # them standalone (e.g. against a secondary box reached via -T, without
@@ -2017,7 +2040,8 @@ restore_all_all_targets() {
 # THIS registry (different machine, cleared registry) won't be found
 # here.
 resolve_registered_session() {
-  local arg="$1"
+  local arg
+  arg="$(normalize_session_name_spaces "$1")"
   touch "$REGISTRY"
 
   local found=0 entry_name=""
@@ -2224,10 +2248,14 @@ attach_session() {
 # immediately after creating a session -- so renaming something before
 # ever looking at it once is exceedingly unlikely.
 rename_session() {
-  local arg="$1" new_name="$2"
+  local arg="$1" new_name
+  new_name="$(normalize_session_name_spaces "$2")"
   local old_entry_name
   old_entry_name="$(resolve_registered_session "$arg")" || exit 1
 
+  if [[ "$new_name" != "$2" ]]; then
+    echo "codersync: using '${new_name}' (replaced spaces with '-') as the new session name."
+  fi
   if ! validate_session_name "$new_name"; then
     echo "codersync: '${new_name}' isn't a valid session name -- only letters, digits, '-', and '_' are allowed, and it can't start with '-'." >&2
     exit 1
@@ -3012,8 +3040,12 @@ sync_skills() {
 # mode is inherently Mac+iTerm2-driven and meaningless to invoke
 # directly on the remote box itself, so there's no --split-mode here.
 local_setup() {
-  local name="$1"
+  local raw_name="$1" name
+  name="$(normalize_session_name_spaces "$raw_name")"
   shift
+  if [[ "$name" != "$raw_name" ]]; then
+    echo "codersync: using '${name}' (replaced spaces with '-') as the session name."
+  fi
   if ! validate_session_name "$name"; then
     echo "Invalid session name '${name}': only letters, digits, '-', and '_' are allowed, and it can't start with '-'." >&2
     exit 1
@@ -3639,7 +3671,11 @@ tools_split_is_valid() {
 # bad input. Pulled out as its own function so it's unit-testable via
 # bats' `run` without going through the full dispatch/network calls.
 parse_run_args() {
-  RAW_NAME="$1"
+  local raw_arg="$1"
+  RAW_NAME="$(normalize_session_name_spaces "$raw_arg")"
+  if [[ "$RAW_NAME" != "$raw_arg" ]]; then
+    echo "codersync: using '${RAW_NAME}' (replaced spaces with '-') as the session name."
+  fi
   if ! validate_session_name "$RAW_NAME"; then
     echo "Invalid session name '${RAW_NAME}': only letters, digits, '-', and '_' are allowed, and it can't start with '-' (if you meant to pass a flag, check it's spelled right and comes with a session name)." >&2
     exit 1

@@ -1015,6 +1015,29 @@ setup() {
   [[ "$output" == *"Invalid session name"* ]]
 }
 
+@test "parse_run_args: replaces spaces in the session name with dashes instead of rejecting it" {
+  parse_run_args "This is a test session name"
+  [ "$RAW_NAME" = "This-is-a-test-session-name" ]
+}
+
+@test "parse_run_args: prints a notice when it substitutes spaces in the session name" {
+  run parse_run_args "This is a test session name"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"using 'This-is-a-test-session-name'"* ]]
+}
+
+@test "parse_run_args: does not print a substitution notice when the name has no spaces" {
+  run parse_run_args "mysession"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"replaced spaces"* ]]
+}
+
+@test "parse_run_args: a name that is only whitespace is rejected, not silently emptied" {
+  run parse_run_args "   "
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Invalid session name"* ]]
+}
+
 # --- input validation (session-name/remote-dir/ssh-target injection) ----
 
 @test "validate_session_name: accepts letters, digits, dash, underscore" {
@@ -1043,6 +1066,38 @@ setup() {
 
 @test "validate_session_name: still accepts a dash later in the name" {
   validate_session_name "my-feature"
+}
+
+@test "normalize_session_name_spaces: replaces a single space with a dash" {
+  [ "$(normalize_session_name_spaces "This is a test session name")" = "This-is-a-test-session-name" ]
+}
+
+@test "normalize_session_name_spaces: collapses runs of whitespace into one dash" {
+  [ "$(normalize_session_name_spaces "a   b")" = "a-b" ]
+}
+
+@test "normalize_session_name_spaces: trims leading and trailing whitespace instead of turning it into a leading/trailing dash" {
+  [ "$(normalize_session_name_spaces "  a b  ")" = "a-b" ]
+}
+
+@test "normalize_session_name_spaces: folds a tab the same as a space" {
+  local tabbed
+  tabbed="$(printf 'a\tb')"
+  [ "$(normalize_session_name_spaces "$tabbed")" = "a-b" ]
+}
+
+@test "normalize_session_name_spaces: leaves an already-valid name unchanged" {
+  [ "$(normalize_session_name_spaces "already-fine_123")" = "already-fine_123" ]
+}
+
+@test "normalize_session_name_spaces: does not touch characters validate_session_name still rejects" {
+  # A dot has no whitespace to fold -- normalization must not mask or
+  # otherwise alter an actually-invalid character.
+  [ "$(normalize_session_name_spaces 'my.session')" = 'my.session' ]
+}
+
+@test "normalize_session_name_spaces: an all-whitespace input normalizes to empty" {
+  [ "$(normalize_session_name_spaces "   ")" = "" ]
 }
 
 @test "validate_remote_dir: accepts a normal path" {
@@ -2249,6 +2304,26 @@ setup() {
   [[ "$output" == *"remote_setup_tmux_mode:my-local-feature"* ]]
 }
 
+@test "attach_session: matches a name by typing it with spaces the same as it was created with" {
+  # resolve_registered_session normalizes its lookup argument the same
+  # way session creation does, so `--attach "my local feature"` finds a
+  # session actually named my-local-feature without the caller needing
+  # to remember it was auto-hyphenated at creation time.
+  SSH_TARGET="devbox.example.com"
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\tmy-local-feature\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf 'pair-my-local-feature\n'; }
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  remote_setup_tmux_mode() { echo "remote_setup_tmux_mode:$1"; }
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  open_tab_tmux_mode() { echo "open_tab_tmux_mode:$1"; }
+  run attach_session "my local feature"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"remote_setup_tmux_mode:my-local-feature"* ]]
+}
+
 @test "attach_session: a labeled match still wins over a same-named label-less fallback" {
   SSH_TARGET="devbox.example.com"
   TARGET_LABEL="devbox-example-com"
@@ -2364,6 +2439,27 @@ setup() {
   run rename_session "1" "42"
   [ "$status" -eq 1 ]
   [[ "$output" == *"can't be a plain number"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
+}
+
+@test "rename_session: replaces spaces in the new name with dashes instead of rejecting it" {
+  # The registry's existing entry already matches what "my new name"
+  # normalizes to, so this reaches the fast, network-free
+  # already-named-that exit right after the substitution notice prints,
+  # keeping this test in the argument-validation-only style used
+  # throughout this section.
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by rename_session below, to build
+  # the candidate new_entry_name it then compares against old_entry_name.
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-my-new-name\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by rename_session below.
+  ssh() { echo "unexpected: $*" >> "$BATS_TEST_TMPDIR/unexpected_ssh_calls"; }
+  run rename_session "1" "my new name"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"using 'my-new-name'"* ]]
+  [[ "$output" == *"already named 'my-new-name'"* ]]
   [ ! -e "$BATS_TEST_TMPDIR/unexpected_ssh_calls" ]
 }
 
@@ -2637,6 +2733,15 @@ setup() {
   run local_setup "42"
   [ "$status" -eq 1 ]
   [[ "$output" == *"can't be a plain number"* ]]
+}
+
+@test "local_setup: replaces spaces in the session name with dashes instead of rejecting it" {
+  # --tools with no value errors before any real tmux call, so this
+  # stays within the argument-validation-only scope of this section
+  # while still exercising the notice + normalized name.
+  run local_setup "my session" --tools
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"using 'my-session'"* ]]
 }
 
 @test "local_setup: --tools requires a value" {
