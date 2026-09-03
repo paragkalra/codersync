@@ -1068,36 +1068,84 @@ setup() {
   validate_session_name "my-feature"
 }
 
+# NOTE: every test below uses `run`, not bare `[ "$(normalize_session_name_spaces ...)" = ... ]`,
+# specifically so a crash inside the function is actually caught.
+# Regression test for a real gap: an earlier `read -ra`-based
+# implementation crashed on real bash 3.2 for empty/all-whitespace
+# input (`words[*]: unbound variable`, an empty array under this
+# script's `set -u` -- confirmed live). The bare `[ "$(...)" = "" ]`
+# form used here originally did NOT catch that crash: a crashing
+# command substitution still produces empty stdout (nothing was
+# printed before it died), which happens to equal the expected ""
+# result for that one case, so the assertion passed anyway with the
+# function's actual failure silently swallowed. `run` captures the
+# real exit status as well as the output, closing that gap.
+
 @test "normalize_session_name_spaces: replaces a single space with a dash" {
-  [ "$(normalize_session_name_spaces "This is a test session name")" = "This-is-a-test-session-name" ]
+  run normalize_session_name_spaces "This is a test session name"
+  [ "$status" -eq 0 ]
+  [ "$output" = "This-is-a-test-session-name" ]
 }
 
 @test "normalize_session_name_spaces: collapses runs of whitespace into one dash" {
-  [ "$(normalize_session_name_spaces "a   b")" = "a-b" ]
+  run normalize_session_name_spaces "a   b"
+  [ "$status" -eq 0 ]
+  [ "$output" = "a-b" ]
 }
 
 @test "normalize_session_name_spaces: trims leading and trailing whitespace instead of turning it into a leading/trailing dash" {
-  [ "$(normalize_session_name_spaces "  a b  ")" = "a-b" ]
+  run normalize_session_name_spaces "  a b  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "a-b" ]
 }
 
 @test "normalize_session_name_spaces: folds a tab the same as a space" {
   local tabbed
   tabbed="$(printf 'a\tb')"
-  [ "$(normalize_session_name_spaces "$tabbed")" = "a-b" ]
+  run normalize_session_name_spaces "$tabbed"
+  [ "$status" -eq 0 ]
+  [ "$output" = "a-b" ]
+}
+
+@test "normalize_session_name_spaces: folds an embedded newline the same as any other whitespace" {
+  # Regression test: an earlier `read -ra`-based implementation used
+  # `read`, which always stops at the first newline no matter what --
+  # $'safe\nother' silently truncated to just "safe" instead of folding
+  # the newline into '-' like every other whitespace character.
+  # Confirmed live as a real risk, not just cosmetic: `codersync
+  # --attach $'safe\nother'` resolved (and attached) the WRONG/existing
+  # session "safe", silently discarding "other" instead of erroring or
+  # matching on the full text.
+  local newlined
+  newlined="$(printf 'safe\nother')"
+  run normalize_session_name_spaces "$newlined"
+  [ "$status" -eq 0 ]
+  [ "$output" = "safe-other" ]
 }
 
 @test "normalize_session_name_spaces: leaves an already-valid name unchanged" {
-  [ "$(normalize_session_name_spaces "already-fine_123")" = "already-fine_123" ]
+  run normalize_session_name_spaces "already-fine_123"
+  [ "$status" -eq 0 ]
+  [ "$output" = "already-fine_123" ]
 }
 
 @test "normalize_session_name_spaces: does not touch characters validate_session_name still rejects" {
   # A dot has no whitespace to fold -- normalization must not mask or
   # otherwise alter an actually-invalid character.
-  [ "$(normalize_session_name_spaces 'my.session')" = 'my.session' ]
+  run normalize_session_name_spaces "my.session"
+  [ "$status" -eq 0 ]
+  [ "$output" = "my.session" ]
 }
 
-@test "normalize_session_name_spaces: an all-whitespace input normalizes to empty" {
-  [ "$(normalize_session_name_spaces "   ")" = "" ]
+@test "normalize_session_name_spaces: an all-whitespace input normalizes to empty without crashing" {
+  # Regression test: an earlier `read -ra`-based implementation
+  # crashed here specifically on real bash 3.2 (`words[*]: unbound
+  # variable` -- an empty array reference under this script's
+  # `set -u`), rather than cleanly producing an empty string for
+  # validate_session_name to then reject as an invalid name.
+  run normalize_session_name_spaces "   "
+  [ "$status" -eq 0 ]
+  [ "$output" = "" ]
 }
 
 @test "validate_remote_dir: accepts a normal path" {
@@ -2322,6 +2370,28 @@ setup() {
   run attach_session "my local feature"
   [ "$status" -eq 0 ]
   [[ "$output" == *"remote_setup_tmux_mode:my-local-feature"* ]]
+}
+
+@test "attach_session: does not silently attach the wrong session when the lookup argument has an embedded newline" {
+  # Regression test for the reviewer-reported repro: `codersync --attach
+  # $'safe\nother'` used to attach whatever session was actually named
+  # "safe", silently discarding "other" instead of folding the newline
+  # into '-' (like every other whitespace char) and looking up
+  # "safe-other" -- a real risk of resolving/mutating the wrong
+  # session, not just a cosmetic truncation. A registry with a "safe"
+  # entry but NOT a "safe-other" one, looked up with the newline-joined
+  # name, must fail to match "safe" rather than silently succeeding.
+  SSH_TARGET="devbox.example.com"
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\tsafe\n' > "$REGISTRY"
+  # shellcheck disable=SC2329 # invoked indirectly, by attach_session below.
+  ssh() { [[ "$*" == *"list-sessions"* ]] && printf 'pair-safe\n'; }
+  local arg
+  arg="$(printf 'safe\nother')"
+  run attach_session "$arg"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no session named 'safe-other'"* ]]
 }
 
 @test "attach_session: a labeled match still wins over a same-named label-less fallback" {

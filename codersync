@@ -251,21 +251,37 @@ validate_session_name() {
 # character-class error -- a quoted multi-word argument is the natural
 # way to type a descriptive name, and demanding the user pre-hyphenate
 # it themselves is needless friction validate_session_name's charset
-# check can't tell apart from an actually-invalid character. Uses
-# `read -ra` rather than `tr`/parameter-substitution: word-splitting on
-# the default (whitespace) IFS both collapses repeated
-# spaces/tabs/newlines into a single separator and drops leading/
-# trailing whitespace in one step, so "  a   b  " becomes "a-b", not
-# "-a---b-" or "-a-b-". Anything that isn't whitespace (including every
-# character validate_session_name already rejects) passes through
-# untouched -- this only ever removes reasons a *space-containing*
-# name would fail, never loosens the charset check itself.
+# check can't tell apart from an actually-invalid character. Anything
+# that isn't whitespace (including every character
+# validate_session_name already rejects) passes through untouched --
+# this only ever removes reasons a *space-containing* name would fail,
+# never loosens the charset check itself.
+#
+# Deliberately NOT `read -ra` word-splitting into an array (an earlier
+# version of this function): `read` stops at the first newline no
+# matter what, so a name containing one (confirmed live:
+# codersync --attach $'safe\nother') silently truncated to the text
+# before it instead of folding the newline into '-' like every other
+# whitespace character -- a lookup/rename argument matching or
+# mutating the wrong session, not just a cosmetic difference. Bash
+# parameter-expansion trimming plus `tr -s` both process the whole
+# string, newlines included. An empty array also crashes under this
+# script's `set -u` on real bash 3.2 specifically (`words[*]: unbound
+# variable` -- confirmed live) whenever the input is empty or
+# all-whitespace; the plain-scalar approach here never creates an
+# array, so there's nothing to be empty.
 normalize_session_name_spaces() {
-  local input="$1"
-  local -a words
-  read -ra words <<<"$input"
-  local IFS='-'
-  printf '%s' "${words[*]}"
+  local s="$1"
+  # Trim leading/trailing whitespace (standard bash idiom): find the
+  # longest leading/trailing run that is ALL whitespace, then strip
+  # exactly that. Works even when $s is empty or entirely whitespace --
+  # unlike the array approach this replaces, nothing here can be
+  # "unset", only an empty string, which `set -u` doesn't object to.
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  # Squeeze any remaining (i.e. strictly internal) run of whitespace --
+  # space, tab, newline, or otherwise -- down to a single '-'.
+  printf '%s' "$s" | tr -s '[:space:]' '-'
 }
 
 # Runs the same four remote-dependency checks setup() has always run
