@@ -4170,18 +4170,23 @@ case "${1:-}" in
     load_config
     # A digits-only first argument can mean an existing session's ID
     # (connect to it, like --attach) or a session literally named that
-    # -- see resolve_positional_numeric for how that's decided.
-    if [[ "$1" =~ ^[0-9]+$ ]]; then
-      positional_action="$(resolve_positional_numeric "$1")" || exit 1
+    # -- see resolve_positional_numeric for how that's decided. Checked
+    # on the space-normalized form, the same one run_session would
+    # end up using: checking the raw "$1" let `codersync " 3 "` skip
+    # this entirely, then get trimmed to "3" inside run_session and
+    # create a brand-new session NAMED "3" even with ID 3 registered.
+    positional_arg="$(normalize_session_name_spaces "${1:-}")"
+    if [[ "$positional_arg" =~ ^[0-9]+$ ]]; then
+      positional_action="$(resolve_positional_numeric "$positional_arg")" || exit 1
       if [[ "$positional_action" == "attach" ]]; then
         # Run flags only shape a NEW session; an existing one keeps
         # whatever it was created with. Rejected rather than silently
         # ignored, same as every other command's extra arguments.
         if [[ $# -gt 1 ]]; then
-          echo "codersync: '$1' is an existing session's ID, so ${*:2} can't apply (those only affect creating a new session). Drop them to connect to ID $1, or use codersync --name $1 ... to create a session literally named '$1'." >&2
+          echo "codersync: '${positional_arg}' is an existing session's ID, so ${*:2} can't apply (those only affect creating a new session). Drop them to connect to ID ${positional_arg}, or use codersync --name ${positional_arg} ... to create a session literally named '${positional_arg}'." >&2
           exit 1
         fi
-        attach_session "$1"
+        attach_session "$positional_arg"
         exit 0
       fi
     fi

@@ -4222,3 +4222,21 @@ STUB
   run "${BATS_TEST_DIRNAME}/../codersync" -n 3
   grep -qF $'devbox.example.com\t4-devbox-example-com-3' "$HOME/.codersync_sessions"
 }
+
+@test "dispatch: a whitespace-padded known ID still attaches, never creates a new numeric-named session" {
+  _numeric_dispatch_env $'devbox.example.com\t3-devbox-example-com-foo\n'
+  printf '4\n' > "$HOME/.config/codersync/next_id"
+  run "${BATS_TEST_DIRNAME}/../codersync" " 3 "
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"'3-devbox-example-com-foo' is registered but not alive"* ]]
+  run ! grep -qF -- '-devbox-example-com-3' "$HOME/.codersync_sessions"
+}
+
+@test "dispatch: a whitespace-padded unknown number errors instead of creating a session" {
+  _numeric_dispatch_env ""
+  run "${BATS_TEST_DIRNAME}/../codersync" $'\t3\n'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"codersync --name 3"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/ssh_calls" ]
+  [ ! -s "$HOME/.codersync_sessions" ]
+}
