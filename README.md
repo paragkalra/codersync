@@ -118,6 +118,16 @@ session also gets a small numeric ID prefixed on the remote side (e.g.
 `3-devbox-example-com-my-feature`) so you can refer to it later with
 `--list-all` / `--attach` / `--kill` instead of typing the full name.
 
+You can also reconnect by ID directly: `codersync 3` connects to the
+session with ID 3, same as `codersync --attach 3`. Because a
+digits-only argument is read as an ID, it never creates a new session
+-- if no ID 3 exists, it errors. To create a session whose name is just
+a number, say so explicitly with `codersync --name 3` (`-n`). A session
+already registered under a numeric name keeps working with plain
+`codersync 3`; if "3" is both one session's name and a different
+session's ID, codersync refuses to guess and asks you to use
+`--attach 3` (the ID) or `--name 3` (the name).
+
 Session names only allow letters, digits, `-`, and `_`. A quoted name
 with spaces (`codersync "my feature"`) has its spaces automatically
 folded into dashes (`my-feature`) instead of being rejected -- watch
@@ -133,6 +143,8 @@ disallowed character (`.`, `/`, `;`, etc.) still errors out.
 ```
 codersync --setup|-s <ssh-target> [remote-dir]
 codersync <session-name> [--split-mode|-m iterm|tmux] [--tools|-t t1,t2] [--safe-mode|-s]
+codersync <id>
+codersync --name|-n <session-name> [--split-mode|-m iterm|tmux] [--tools|-t t1,t2] [--safe-mode|-s]
 codersync --attach|-a <id-or-name>
 codersync --rename|-R <id-or-name> <new-name>
 codersync --restore-all|-r

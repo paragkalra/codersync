@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Usage: codersync --setup|-s <ssh-target> [remote-dir]
 #        codersync <session-name> [--split-mode|-m iterm|tmux] [--tools|-t t1,t2] [--safe-mode|-s]
+#        codersync <id>
+#        codersync --name|-n <session-name> [same flags as above]
 #        codersync --attach|-a <id-or-name>
 #        codersync --rename|-R <id-or-name> <new-name>
 #        codersync --restore-all|-r
@@ -2055,19 +2057,32 @@ restore_all_all_targets() {
 # --list-all/--kill/--kill-all: a session alive on the box but not in
 # THIS registry (different machine, cleared registry) won't be found
 # here.
+#
+# Optional second argument `as` overrides how a numeric <arg> is read:
+# "name" forces the name branch even for a digits-only argument (used by
+# bare `codersync <N>`'s dispatch to check whether a session literally
+# NAMED <N> exists, alongside the ID lookup -- see
+# resolve_positional_numeric). Optional third argument "quiet"
+# suppresses the "no such session" message for a plain miss, so that
+# same dispatch can probe both readings without printing a spurious
+# error for whichever one didn't match. Return codes: 0 found, 2 not
+# found (a plain miss, including an ID that can never exist, like 0),
+# 1 any other error (unsafe or ambiguous registry entries) -- always
+# reported to stderr, quiet or not, since those need the user's
+# attention either way.
 resolve_registered_session() {
-  local arg
+  local arg as="${2:-}" quiet="${3:-}"
   arg="$(normalize_session_name_spaces "$1")"
   touch "$REGISTRY"
 
   local found=0 entry_name=""
   local line
 
-  if [[ "$arg" =~ ^[0-9]+$ ]]; then
+  if [[ "$arg" =~ ^[0-9]+$ && "$as" != "name" ]]; then
     local canon
     if ! canon="$(canonicalize_session_id "$arg")"; then
-      echo "codersync: '${arg}' isn't a valid session ID -- IDs start at 1, 0 is never assigned." >&2
-      return 1
+      [[ "$quiet" == "quiet" ]] || echo "codersync: '${arg}' isn't a valid session ID -- IDs start at 1, 0 is never assigned." >&2
+      return 2
     fi
     local -a id_matches=()
     local id_seen=$'\n'
@@ -2117,8 +2132,8 @@ resolve_registered_session() {
       entry_name="${id_matches[0]}"
     fi
     if [[ "$found" == 0 ]]; then
-      echo "codersync: no session with ID ${canon} on ${SSH_TARGET}. Run codersync --list-all to see what's available." >&2
-      return 1
+      [[ "$quiet" == "quiet" ]] || echo "codersync: no session with ID ${canon} on ${SSH_TARGET}. Run codersync --list-all to see what's available." >&2
+      return 2
     fi
   else
     if ! validate_session_name "$arg"; then
@@ -2192,8 +2207,8 @@ resolve_registered_session() {
       done < "$REGISTRY"
     fi
     if [[ "$found" == 0 ]]; then
-      echo "codersync: no session named '${arg}' on ${SSH_TARGET}. Run codersync --list-all to see what's available." >&2
-      return 1
+      [[ "$quiet" == "quiet" ]] || echo "codersync: no session named '${arg}' on ${SSH_TARGET}. Run codersync --list-all to see what's available." >&2
+      return 2
     fi
   fi
 
@@ -3427,6 +3442,8 @@ Usage:
   codersync --check-dependencies                            Validate tmux/bash/base64 on a box
   codersync <session-name> [--split-mode|-m iterm|tmux] [--tools|-t t1,t2] [--safe-mode|-s]
                                                              Open a tab
+  codersync <id>                                            Reconnect to an existing session by ID
+  codersync --name|-n <session-name> [...]                  Like <session-name>, but never read as an ID
   codersync --attach|-a <id-or-name>                        Reconnect to one existing session
   codersync --rename|-R <id-or-name> <new-name>             Rename one existing session
   codersync --restore-all|-r [--all-targets]                Reopen all live sessions
@@ -3455,6 +3472,14 @@ Every session also gets a leading numeric ID (e.g. `1-devbox-example-com-foo`),
 shown by --list-all/-l and used by --kill/-k -- a short handle so you don't
 have to type the full name to look up or kill a session. Re-running
 `codersync foo` reuses foo's existing ID rather than minting a new one.
+
+A bare number -- `codersync 3` -- reconnects to the session with ID 3
+(same as `--attach 3`), and never creates a new session: if there's no
+ID 3 it errors instead. If a session literally NAMED "3" is already
+registered, `codersync 3` keeps reconnecting to that one as before (and
+errors if "3" is both one session's name and a different session's ID
+-- pick with `--attach 3` or `--name 3`). To CREATE a session with a
+digits-only name, use `codersync --name 3`.
 
 Every flag below has the single-letter short form shown next to it.
 --setup/-s and --safe-mode/-s deliberately share the letter "s" -- they're
@@ -3743,6 +3768,131 @@ parse_run_args() {
   fi
 }
 
+# Creates (or reuses, if one by this name is already registered) the
+# session named by "$1", with "$@"'s remaining run flags -- the body of
+# plain `codersync <name>` and `codersync --name <name>`. Expects
+# load_config to have already run. SESSION is left global on purpose:
+# the EXIT traps below reference it by name, after this function's own
+# frame would otherwise be gone.
+run_session() {
+  parse_run_args "$@"
+  split_tools "$TOOLS"
+  if ! tools_split_is_valid "$TOOLS"; then
+    echo "codersync: --tools '${TOOLS}' is malformed -- expected two comma-separated values (e.g. claude,codex) or a single value to use for both: no empty slot on either side of the comma, and no more than one comma total (a literal command can't contain a comma -- codersync only ever runs two tools, left and right)." >&2
+    exit 1
+  fi
+  # --split-mode iterm has no fallback (unlike tmux mode, which prints
+  # the attach command when iTerm2 isn't available) -- checked here,
+  # before any remote work at all, not left to open_tab() to discover
+  # after the fact. Without this, remote_setup already created live
+  # tmux sessions and launch scripts by the time open_tab's osascript
+  # call failed locally, leaving that remote state behind with no
+  # local tab ever opened (confirmed live, on a machine without
+  # iTerm2 installed).
+  if [[ "$SPLIT_MODE" == "iterm" ]] && ! iterm2_available; then
+    echo "codersync: --split-mode iterm requires iTerm2 (and osascript control of it) -- none detected. Use --split-mode tmux instead, or install iTerm2 and try again." >&2
+    exit 1
+  fi
+  # The (sanitized) ssh-target is folded into the session name by
+  # default (e.g. `codersync foo` on target `devbox.example.com` becomes
+  # session `devbox.example.com-foo`), so tmux session names/tab titles/
+  # registry entries stay unambiguous if you ever use codersync against
+  # more than one box. A leading numeric ID is folded in too (e.g.
+  # `1-devbox.example.com-foo`), reused across repeat invocations of
+  # the same name so re-running doesn't mint a duplicate session --
+  # see --list-all/--kill for what the ID is actually for.
+  #
+  # ID lookup/allocation + the registry write that reserves it are
+  # locked and done UP FRONT, before the slow remote SSH setup below --
+  # so a second concurrent invocation for the SAME name sees this one's
+  # reservation already in the registry and reuses it, without holding
+  # the lock through the network round-trip (which would otherwise
+  # serialize every codersync invocation against every other one, even
+  # for unrelated names).
+  acquire_id_lock || exit 1
+  trap 'release_id_lock' EXIT
+  SESSION_SUFFIX="${TARGET_LABEL}-${RAW_NAME}"
+  SESSION="$(find_or_assign_id "$SSH_TARGET" "$SESSION_SUFFIX")"
+  register_session "$SESSION"
+  # Marks the registry entry just written above as still-being-created
+  # (see mark_pending) -- written BEFORE id.lock is released, not
+  # after, so there's no window where the entry is registered but not
+  # yet marked pending for restore_all/kill_all_sessions to race into
+  # (confirmed live: writing the marker after releasing id.lock let
+  # --restore-all delete the entry in that exact gap). mark_pending
+  # takes its own separate pending.lock internally rather than
+  # id.lock -- mkdir-based locks aren't reentrant, and id.lock is
+  # still held here. If mark_pending's own write fails, it returns
+  # non-zero WITHOUT touching this trap (see its own comment for why
+  # it can't safely arm one of its own here) -- `set -e` then exits
+  # right here, and the `release_id_lock` trap armed just above is
+  # still exactly what fires.
+  mark_pending "$SESSION"
+  # `clear_pending "$SESSION" || true` -- NOT a bare
+  # `clear_pending "$SESSION"` -- because this whole string runs as
+  # ONE trap action: if clear_pending itself failed (and, like
+  # mark_pending, it deliberately doesn't arm its own trap here) and
+  # `set -e` re-triggers partway through evaluating this trap string,
+  # bash abandons the REST of that same string too, skipping
+  # release_id_lock entirely and leaving id.lock behind (confirmed:
+  # a plain `false; echo never_runs` as a trap body never prints
+  # never_runs under set -e). The `|| true` absorbs clear_pending's
+  # own exit status right here so release_id_lock is unconditionally
+  # reached -- clear_pending has already done its own best-effort
+  # pending.lock release internally by the time it returns either way.
+  trap 'clear_pending "$SESSION" || true; release_id_lock' EXIT
+  release_id_lock
+  if [[ "$SPLIT_MODE" == "tmux" ]]; then
+    remote_setup_tmux_mode "$SESSION" "$TOOL1" "$TOOL2" "$SAFE_MODE"
+    open_tab_tmux_mode "$SESSION"
+  else
+    remote_setup "$SESSION" "$TOOL1" "$TOOL2" "$SAFE_MODE"
+    open_tab "$SESSION"
+  fi
+  trap - EXIT
+  clear_pending "$SESSION"
+}
+
+# Decides what bare `codersync <N>` means for a digits-only <N> -- an
+# ID (as shown by --list-all) or a session literally NAMED <N> (what
+# `codersync <N>` always meant before IDs were accepted here). Prints
+# "attach" (connect to ID <N>, same as --attach <N>) or "name" (the
+# normal create-or-reuse-by-name path) on stdout; returns 1 after
+# explaining on stderr otherwise. In order:
+#   - ID <N> and name <N> both registered, as DIFFERENT sessions:
+#     ambiguous, error rather than guess -- `--attach <N>` picks the ID,
+#     `--name <N>` picks the name.
+#   - a session named <N> registered (whether or not it's also ID <N>):
+#     "name", so anyone who already has a numeric-named session keeps
+#     reconnecting to it exactly as before.
+#   - only ID <N> registered: "attach".
+#   - neither: error, never create -- a bare number is far more likely
+#     a mistyped/stale ID than a request for a brand-new session named
+#     "3", and creating one by accident is exactly what --attach exists
+#     to avoid. `--name <N>` is the explicit way to create that.
+resolve_positional_numeric() {
+  local arg="$1" id_entry="" name_entry="" id_rc=0 name_rc=0
+  id_entry="$(resolve_registered_session "$arg" "" quiet)" || id_rc=$?
+  name_entry="$(resolve_registered_session "$arg" name quiet)" || name_rc=$?
+  if [[ "$id_rc" == 1 || "$name_rc" == 1 ]]; then
+    return 1
+  fi
+  if [[ "$id_rc" == 0 && "$name_rc" == 0 && "$id_entry" != "$name_entry" ]]; then
+    echo "codersync: '${arg}' is ambiguous on ${SSH_TARGET} -- it's both the ID of '${id_entry}' and the name of '${name_entry}'. Use codersync --attach ${arg} for the ID, or codersync --name ${arg} for the name." >&2
+    return 1
+  fi
+  if [[ "$name_rc" == 0 ]]; then
+    echo "name"
+    return 0
+  fi
+  if [[ "$id_rc" == 0 ]]; then
+    echo "attach"
+    return 0
+  fi
+  echo "codersync: no session with ID ${arg} (or named '${arg}') on ${SSH_TARGET}. Run codersync --list-all to see what's available, or codersync --name ${arg} to create a new session literally named '${arg}'." >&2
+  return 1
+}
+
 # Guarded so the tests (tests/*.bats) can `source` this file to test the
 # functions above in isolation without actually running the CLI dispatch.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
@@ -3998,88 +4148,44 @@ case "${1:-}" in
     exit 0
     ;;
   "")
-    echo "Usage: codersync --setup|-s <ssh-target> [remote-dir] | codersync <session-name> | codersync --attach|-a <id-or-name> | codersync --rename|-R <id-or-name> <new-name> | codersync --restore-all|-r | codersync --list-all|-l | codersync --kill|-k <ids> | codersync --kill-all|-K | codersync --paste-image|-p | codersync --sync-skills|-y | codersync --local|-L <session-name> | codersync --adopt|-d" >&2
+    echo "Usage: codersync --setup|-s <ssh-target> [remote-dir] | codersync <session-name> | codersync <id> | codersync --name|-n <session-name> | codersync --attach|-a <id-or-name> | codersync --rename|-R <id-or-name> <new-name> | codersync --restore-all|-r | codersync --list-all|-l | codersync --kill|-k <ids> | codersync --kill-all|-K | codersync --paste-image|-p | codersync --sync-skills|-y | codersync --local|-L <session-name> | codersync --adopt|-d" >&2
     echo "Run 'codersync --help' for more." >&2
     exit 1
     ;;
+  --name|-n)
+    # Forces <session-name> to be read as a NAME, even when it's
+    # digits-only -- a bare `codersync 3` is read as ID 3 first (see
+    # resolve_positional_numeric), so this is the only way to CREATE a
+    # session literally named "3". Otherwise identical to plain
+    # `codersync <session-name>`, run flags included.
+    if [[ -z "${2:-}" ]]; then
+      echo "Usage: codersync --name|-n <session-name> [--split-mode|-m iterm|tmux] [--tools|-t t1,t2] [--safe-mode|-s]" >&2
+      exit 1
+    fi
+    shift
+    load_config
+    run_session "$@"
+    ;;
   *)
     load_config
-    parse_run_args "$@"
-    split_tools "$TOOLS"
-    if ! tools_split_is_valid "$TOOLS"; then
-      echo "codersync: --tools '${TOOLS}' is malformed -- expected two comma-separated values (e.g. claude,codex) or a single value to use for both: no empty slot on either side of the comma, and no more than one comma total (a literal command can't contain a comma -- codersync only ever runs two tools, left and right)." >&2
-      exit 1
+    # A digits-only first argument can mean an existing session's ID
+    # (connect to it, like --attach) or a session literally named that
+    # -- see resolve_positional_numeric for how that's decided.
+    if [[ "$1" =~ ^[0-9]+$ ]]; then
+      positional_action="$(resolve_positional_numeric "$1")" || exit 1
+      if [[ "$positional_action" == "attach" ]]; then
+        # Run flags only shape a NEW session; an existing one keeps
+        # whatever it was created with. Rejected rather than silently
+        # ignored, same as every other command's extra arguments.
+        if [[ $# -gt 1 ]]; then
+          echo "codersync: '$1' is an existing session's ID, so ${*:2} can't apply (those only affect creating a new session). Drop them to connect to ID $1, or use codersync --name $1 ... to create a session literally named '$1'." >&2
+          exit 1
+        fi
+        attach_session "$1"
+        exit 0
+      fi
     fi
-    # --split-mode iterm has no fallback (unlike tmux mode, which prints
-    # the attach command when iTerm2 isn't available) -- checked here,
-    # before any remote work at all, not left to open_tab() to discover
-    # after the fact. Without this, remote_setup already created live
-    # tmux sessions and launch scripts by the time open_tab's osascript
-    # call failed locally, leaving that remote state behind with no
-    # local tab ever opened (confirmed live, on a machine without
-    # iTerm2 installed).
-    if [[ "$SPLIT_MODE" == "iterm" ]] && ! iterm2_available; then
-      echo "codersync: --split-mode iterm requires iTerm2 (and osascript control of it) -- none detected. Use --split-mode tmux instead, or install iTerm2 and try again." >&2
-      exit 1
-    fi
-    # The (sanitized) ssh-target is folded into the session name by
-    # default (e.g. `codersync foo` on target `devbox.example.com` becomes
-    # session `devbox.example.com-foo`), so tmux session names/tab titles/
-    # registry entries stay unambiguous if you ever use codersync against
-    # more than one box. A leading numeric ID is folded in too (e.g.
-    # `1-devbox.example.com-foo`), reused across repeat invocations of
-    # the same name so re-running doesn't mint a duplicate session --
-    # see --list-all/--kill for what the ID is actually for.
-    #
-    # ID lookup/allocation + the registry write that reserves it are
-    # locked and done UP FRONT, before the slow remote SSH setup below --
-    # so a second concurrent invocation for the SAME name sees this one's
-    # reservation already in the registry and reuses it, without holding
-    # the lock through the network round-trip (which would otherwise
-    # serialize every codersync invocation against every other one, even
-    # for unrelated names).
-    acquire_id_lock || exit 1
-    trap 'release_id_lock' EXIT
-    SESSION_SUFFIX="${TARGET_LABEL}-${RAW_NAME}"
-    SESSION="$(find_or_assign_id "$SSH_TARGET" "$SESSION_SUFFIX")"
-    register_session "$SESSION"
-    # Marks the registry entry just written above as still-being-created
-    # (see mark_pending) -- written BEFORE id.lock is released, not
-    # after, so there's no window where the entry is registered but not
-    # yet marked pending for restore_all/kill_all_sessions to race into
-    # (confirmed live: writing the marker after releasing id.lock let
-    # --restore-all delete the entry in that exact gap). mark_pending
-    # takes its own separate pending.lock internally rather than
-    # id.lock -- mkdir-based locks aren't reentrant, and id.lock is
-    # still held here. If mark_pending's own write fails, it returns
-    # non-zero WITHOUT touching this trap (see its own comment for why
-    # it can't safely arm one of its own here) -- `set -e` then exits
-    # right here, and the `release_id_lock` trap armed just above is
-    # still exactly what fires.
-    mark_pending "$SESSION"
-    # `clear_pending "$SESSION" || true` -- NOT a bare
-    # `clear_pending "$SESSION"` -- because this whole string runs as
-    # ONE trap action: if clear_pending itself failed (and, like
-    # mark_pending, it deliberately doesn't arm its own trap here) and
-    # `set -e` re-triggers partway through evaluating this trap string,
-    # bash abandons the REST of that same string too, skipping
-    # release_id_lock entirely and leaving id.lock behind (confirmed:
-    # a plain `false; echo never_runs` as a trap body never prints
-    # never_runs under set -e). The `|| true` absorbs clear_pending's
-    # own exit status right here so release_id_lock is unconditionally
-    # reached -- clear_pending has already done its own best-effort
-    # pending.lock release internally by the time it returns either way.
-    trap 'clear_pending "$SESSION" || true; release_id_lock' EXIT
-    release_id_lock
-    if [[ "$SPLIT_MODE" == "tmux" ]]; then
-      remote_setup_tmux_mode "$SESSION" "$TOOL1" "$TOOL2" "$SAFE_MODE"
-      open_tab_tmux_mode "$SESSION"
-    else
-      remote_setup "$SESSION" "$TOOL1" "$TOOL2" "$SAFE_MODE"
-      open_tab "$SESSION"
-    fi
-    trap - EXIT
-    clear_pending "$SESSION"
+    run_session "$@"
     ;;
 esac
 fi

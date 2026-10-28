@@ -4043,3 +4043,182 @@ setup() {
   [[ "$(cat "$FAKE_HOME/.config/codersync/config")" == *"devbox.example.com"* ]]
   [[ "$(cat "$FAKE_HOME/.config/codersync/config")" != *"otherbox.example.com"* ]]
 }
+
+# --- resolve_positional_numeric (bare `codersync <N>`) -----------------
+
+@test "resolve_registered_session: 'name' mode reads a numeric arg as a literal name" {
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by resolve_registered_session below.
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-3\n' > "$REGISTRY"
+  run resolve_registered_session "3" name
+  [ "$status" -eq 0 ]
+  [ "$output" = "1-devbox-example-com-3" ]
+}
+
+@test "resolve_registered_session: a plain miss returns 2, and 'quiet' silences it" {
+  SSH_TARGET="devbox.example.com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  run resolve_registered_session "3"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"no session with ID 3"* ]]
+  run resolve_registered_session "3" "" quiet
+  [ "$status" -eq 2 ]
+  [ -z "$output" ]
+}
+
+@test "resolve_positional_numeric: only ID registered -> attach" {
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by resolve_registered_session.
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t3-devbox-example-com-foo\n' > "$REGISTRY"
+  run resolve_positional_numeric "3"
+  [ "$status" -eq 0 ]
+  [ "$output" = "attach" ]
+}
+
+@test "resolve_positional_numeric: leading-zero ID still resolves -> attach" {
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by resolve_registered_session.
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t3-devbox-example-com-foo\n' > "$REGISTRY"
+  run resolve_positional_numeric "03"
+  [ "$status" -eq 0 ]
+  [ "$output" = "attach" ]
+}
+
+@test "resolve_positional_numeric: existing numeric-named session keeps winning -> name" {
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by resolve_registered_session.
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-3\n' > "$REGISTRY"
+  run resolve_positional_numeric "3"
+  [ "$status" -eq 0 ]
+  [ "$output" = "name" ]
+}
+
+@test "resolve_positional_numeric: ID and name pointing at the SAME session isn't ambiguous" {
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by resolve_registered_session.
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t3-devbox-example-com-3\n' > "$REGISTRY"
+  run resolve_positional_numeric "3"
+  [ "$status" -eq 0 ]
+  [ "$output" = "name" ]
+}
+
+@test "resolve_positional_numeric: ID and name pointing at DIFFERENT sessions errors" {
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by resolve_registered_session.
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t1-devbox-example-com-3\ndevbox.example.com\t3-devbox-example-com-foo\n' > "$REGISTRY"
+  run resolve_positional_numeric "3"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"ambiguous"* ]]
+  [[ "$output" == *"--attach 3"* ]]
+  [[ "$output" == *"--name 3"* ]]
+}
+
+@test "resolve_positional_numeric: neither registered errors and points at --name" {
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by resolve_registered_session.
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'some-other-box\t3-some-other-box-foo\n' > "$REGISTRY"
+  run resolve_positional_numeric "3"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no session with ID 3"* ]]
+  [[ "$output" == *"codersync --name 3"* ]]
+}
+
+@test "resolve_positional_numeric: 0 (never a valid ID) with no name match errors cleanly" {
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by resolve_registered_session.
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  : > "$REGISTRY"
+  run resolve_positional_numeric "0"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"codersync --name 0"* ]]
+}
+
+@test "resolve_positional_numeric: an unsafe ID-matched entry still surfaces its error" {
+  SSH_TARGET="devbox.example.com"
+  # shellcheck disable=SC2034 # read by resolve_registered_session.
+  TARGET_LABEL="devbox-example-com"
+  REGISTRY="$BATS_TEST_TMPDIR/registry"
+  printf 'devbox.example.com\t3-devbox-example-com-x;rm\n' > "$REGISTRY"
+  run resolve_positional_numeric "3"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"unsafe characters"* ]]
+}
+
+# --- dispatch: `codersync <N>` / `codersync --name <N>` -----------------
+
+# Sets up a throwaway HOME with a config + registry, and an `ssh` stub on
+# PATH that logs every call -- so these run the real script end to end
+# without touching any real box.
+_numeric_dispatch_env() {
+  export HOME="$BATS_TEST_TMPDIR/home"
+  mkdir -p "$HOME/.config/codersync" "$BATS_TEST_TMPDIR/bin"
+  printf 'SSH_TARGET=devbox.example.com\nREMOTE_DIR=~\n' > "$HOME/.config/codersync/config"
+  printf '%s' "$1" > "$HOME/.codersync_sessions"
+  cat > "$BATS_TEST_TMPDIR/bin/ssh" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$BATS_TEST_TMPDIR/ssh_calls"
+exit 1
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/ssh"
+  export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+}
+
+@test "dispatch: bare unknown number errors without creating anything or touching ssh" {
+  _numeric_dispatch_env ""
+  run "${BATS_TEST_DIRNAME}/../codersync" 3
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"codersync --name 3"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/ssh_calls" ]
+  [ ! -s "$HOME/.codersync_sessions" ]
+}
+
+@test "dispatch: bare known ID goes down the --attach path" {
+  _numeric_dispatch_env $'devbox.example.com\t3-devbox-example-com-foo\n'
+  run "${BATS_TEST_DIRNAME}/../codersync" 3
+  # The ssh stub reports no live sessions, so attach_session's own
+  # "registered but not alive" error is the proof it took that path
+  # (the create path would have registered a new entry instead).
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"'3-devbox-example-com-foo' is registered but not alive"* ]]
+  [ "$(wc -l < "$HOME/.codersync_sessions" | tr -d ' ')" = "1" ]
+}
+
+@test "dispatch: bare known ID with run flags is rejected, not silently ignored" {
+  _numeric_dispatch_env $'devbox.example.com\t3-devbox-example-com-foo\n'
+  run "${BATS_TEST_DIRNAME}/../codersync" 3 --tools claude,claude
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"existing session's ID"* ]]
+  [ ! -e "$BATS_TEST_TMPDIR/ssh_calls" ]
+}
+
+@test "dispatch: --name with no value prints usage" {
+  _numeric_dispatch_env ""
+  run "${BATS_TEST_DIRNAME}/../codersync" --name
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Usage: codersync --name|-n <session-name>"* ]]
+}
+
+@test "dispatch: -n <N> takes the create path even when ID N exists" {
+  _numeric_dispatch_env $'devbox.example.com\t3-devbox-example-com-foo\n'
+  printf '4\n' > "$HOME/.config/codersync/next_id"
+  # Fails later at the (stubbed) remote setup -- what matters is that it
+  # registered a NEW session named "3" first, rather than attaching to ID 3.
+  run "${BATS_TEST_DIRNAME}/../codersync" -n 3
+  grep -qF $'devbox.example.com\t4-devbox-example-com-3' "$HOME/.codersync_sessions"
+}
